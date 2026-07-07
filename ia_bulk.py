@@ -162,6 +162,22 @@ def load_prior_successes(log_path: str | Path) -> set[str]:
     return successes
 
 
+def check_live_safety(rows: list[dict], live: bool) -> list[str]:
+    if live:
+        return []
+
+    errors: list[str] = []
+    for offset, row in enumerate(rows):
+        row_number = offset + 2
+        identifier = row.get("identifier", "").strip()
+        if identifier and not identifier.startswith(TEST_IDENTIFIER_PREFIX):
+            errors.append(
+                f"row {row_number}: identifier '{identifier}' is not prefixed with "
+                f"'{TEST_IDENTIFIER_PREFIX}' (required unless --live is passed)"
+            )
+    return errors
+
+
 def cmd_validate(args) -> int:
     rows = read_rows(args.csv)
     registry = load_registry(args.registry)

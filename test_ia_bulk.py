@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ia_bulk import read_rows, load_registry, check_identifier, validate_rows, RowValidation
+from ia_bulk import read_rows, load_registry, check_identifier, validate_rows, RowValidation, check_live_safety
 
 
 def write_csv(path, fieldnames, rows):
@@ -328,3 +328,28 @@ def test_load_prior_successes_returns_only_successful_identifiers(tmp_path):
     successes = load_prior_successes(log_path)
 
     assert successes == {"lcps-astoriaphotos-00001"}
+
+
+def test_check_live_safety_passes_when_live_flag_set():
+    rows = [{"identifier": "lcps-astoriaphotos-00001"}]
+
+    errors = check_live_safety(rows, live=True)
+
+    assert errors == []
+
+
+def test_check_live_safety_passes_when_not_live_and_all_test_prefixed():
+    rows = [{"identifier": "zztest-astoriaphotos-00001"}]
+
+    errors = check_live_safety(rows, live=False)
+
+    assert errors == []
+
+
+def test_check_live_safety_fails_when_not_live_and_real_identifier_present():
+    rows = [{"identifier": "lcps-astoriaphotos-00001"}]
+
+    errors = check_live_safety(rows, live=False)
+
+    assert len(errors) == 1
+    assert "zztest-" in errors[0]
