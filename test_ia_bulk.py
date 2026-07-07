@@ -1,5 +1,6 @@
 import json
 import csv
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -265,3 +266,65 @@ def test_cmd_validate_returns_one_when_a_row_fails(tmp_path, capsys):
 
     assert exit_code == 1
     assert "0/1 rows passed" in capsys.readouterr().out
+
+
+def test_chunk_rows_splits_into_groups_of_chunk_size():
+    from ia_bulk import chunk_rows
+
+    rows = [{"n": i} for i in range(1250)]
+
+    chunks = list(chunk_rows(rows, chunk_size=500))
+
+    assert [len(c) for c in chunks] == [500, 500, 250]
+    assert chunks[0][0] == {"n": 0}
+    assert chunks[2][-1] == {"n": 1249}
+
+
+def test_chunk_rows_handles_empty_list():
+    from ia_bulk import chunk_rows
+
+    assert list(chunk_rows([], chunk_size=500)) == []
+
+
+def test_open_log_creates_log_dir_and_returns_timestamped_path(tmp_path):
+    from ia_bulk import open_log
+
+    log_dir = tmp_path / "logs"
+
+    log_path = open_log(log_dir, "upload")
+
+    assert log_dir.is_dir()
+    assert log_path.parent == log_dir
+    assert log_path.name.startswith("upload-")
+    assert log_path.suffix == ".jsonl"
+
+
+def test_log_result_appends_one_json_line(tmp_path):
+    from ia_bulk import log_result
+
+    log_path = tmp_path / "upload-test.jsonl"
+
+    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success")
+    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", error="timeout")
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    assert first["identifier"] == "lcps-astoriaphotos-00001"
+    assert first["status"] == "success"
+    assert first["error"] is None
+    second = json.loads(lines[1])
+    assert second["status"] == "failure"
+    assert second["error"] == "timeout"
+
+
+def test_load_prior_successes_returns_only_successful_identifiers(tmp_path):
+    from ia_bulk import log_result, load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success")
+    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", error="timeout")
+
+    successes = load_prior_successes(log_path)
+
+    assert successes == {"lcps-astoriaphotos-00001"}

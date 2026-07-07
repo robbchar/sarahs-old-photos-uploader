@@ -6,14 +6,21 @@ from __future__ import annotations
 import csv
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title", "date")
 CHUNK_SIZE = 500
 TEST_COLLECTION = "test_collection"
 TEST_IDENTIFIER_PREFIX = "zztest-"
+
+
+def chunk_rows(rows: list[dict], chunk_size: int = CHUNK_SIZE) -> "Iterator[list[dict]]":
+    for start in range(0, len(rows), chunk_size):
+        yield rows[start : start + chunk_size]
 
 
 def read_rows(csv_path: str | Path) -> list[dict[str, str]]:
@@ -115,6 +122,44 @@ def format_report(results: list[RowValidation]) -> str:
     lines.append("")
     lines.append(f"{passed}/{len(results)} rows passed")
     return "\n".join(lines)
+
+
+def open_log(log_dir: str | Path, command_name: str) -> Path:
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    return log_dir / f"{command_name}-{timestamp}.jsonl"
+
+
+def log_result(
+    log_path: str | Path,
+    identifier: str,
+    file_value: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    entry = {
+        "identifier": identifier,
+        "file": file_value,
+        "status": status,
+        "error": error,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def load_prior_successes(log_path: str | Path) -> set[str]:
+    successes: set[str] = set()
+    with open(log_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("status") == "success":
+                successes.add(entry["identifier"])
+    return successes
 
 
 def cmd_validate(args) -> int:
