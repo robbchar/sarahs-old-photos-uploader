@@ -1,0 +1,102 @@
+"""Bulk validate/upload/sync-metadata CLI for Internet Archive, driven by a CSV
+exported from the LCPS Google Sheet. See docs/ARCHITECTURE.md for the CSV
+schema and identifier scheme this script assumes."""
+from __future__ import annotations
+
+import csv
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
+REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title", "date")
+CHUNK_SIZE = 500
+TEST_COLLECTION = "test_collection"
+TEST_IDENTIFIER_PREFIX = "zztest-"
+
+
+def read_rows(csv_path: str | Path) -> list[dict[str, str]]:
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def load_registry(registry_path: str | Path) -> dict:
+    with open(registry_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def check_identifier(
+    identifier: str,
+    row_number: int,
+    registry: dict,
+    seen_identifiers: dict[str, int],
+) -> list[str]:
+    identifier = identifier.strip()
+    if not identifier:
+        return ["missing required column 'identifier'"]
+
+    errors: list[str] = []
+    if not IDENTIFIER_RE.match(identifier):
+        errors.append(
+            f"identifier '{identifier}' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
+        )
+    else:
+        collection_key, project_id, _number = identifier.split("-")
+        # Test-collection identifiers use the literal "zztest" in place of
+        # the real collection_key (see TEST_IDENTIFIER_PREFIX), keeping the
+        # real PROJECTID — e.g. zztest-astoriaphotos-00001.
+        is_real_prefix = collection_key == registry.get("collection_key")
+        is_test_prefix = collection_key == TEST_IDENTIFIER_PREFIX.rstrip("-")
+        known_prefix = (is_real_prefix or is_test_prefix) and project_id in registry.get(
+            "projects", {}
+        )
+        if not known_prefix:
+            errors.append(
+                f"identifier prefix '{collection_key}-{project_id}' not found in project registry"
+            )
+
+    if identifier in seen_identifiers:
+        errors.append(f"identifier '{identifier}' duplicates row {seen_identifiers[identifier]}")
+    else:
+        seen_identifiers[identifier] = row_number
+
+    return errors
+
+
+@dataclass
+class RowValidation:
+    row_number: int
+    identifier: str
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.errors
+
+
+def validate_rows(rows: list[dict[str, str]], files_dir: str | Path, registry: dict) -> list[RowValidation]:
+    seen_identifiers: dict[str, int] = {}
+    results: list[RowValidation] = []
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2  # header is row 1
+        identifier = row.get("identifier", "").strip()
+        errors: list[str] = []
+
+        for column in REQUIRED_UPLOAD_COLUMNS:
+            if not row.get(column, "").strip():
+                errors.append(f"missing required column '{column}'")
+
+        if identifier:
+            errors.extend(check_identifier(identifier, row_number, registry, seen_identifiers))
+
+        file_value = row.get("file", "").strip()
+        if file_value:
+            file_path = Path(files_dir) / file_value
+            if not file_path.is_file():
+                errors.append(f"file not found: {file_path}")
+
+        results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
+
+    return results
