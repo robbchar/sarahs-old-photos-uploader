@@ -100,3 +100,26 @@ def validate_rows(rows: list[dict[str, str]], files_dir: str | Path, registry: d
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
     return results
+
+
+def format_report(results: list[RowValidation]) -> str:
+    lines: list[str] = []
+    for result in results:
+        status = "PASS" if result.is_valid else "FAIL"
+        label = result.identifier or f"(row {result.row_number})"
+        lines.append(f"[{status}] row {result.row_number} {label}")
+        for error in result.errors:
+            lines.append(f"    - {error}")
+
+    passed = sum(1 for r in results if r.is_valid)
+    lines.append("")
+    lines.append(f"{passed}/{len(results)} rows passed")
+    return "\n".join(lines)
+
+
+def cmd_validate(args) -> int:
+    rows = read_rows(args.csv)
+    registry = load_registry(args.registry)
+    results = validate_rows(rows, args.files_dir, registry)
+    print(format_report(results))
+    return 0 if all(r.is_valid for r in results) else 1

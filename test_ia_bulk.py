@@ -1,5 +1,6 @@
 import json
 import csv
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,84 @@ def test_validate_rows_row_numbers_start_at_2_for_header():
     results = validate_rows(rows, files_dir="/tmp", registry=make_registry())
 
     assert results[0].row_number == 2
+
+
+def test_format_report_shows_pass_and_fail_with_summary():
+    from ia_bulk import format_report
+
+    results = [
+        RowValidation(row_number=2, identifier="lcps-astoriaphotos-00001", errors=[]),
+        RowValidation(
+            row_number=3,
+            identifier="lcps-astoriaphotos-00002",
+            errors=["file not found: /tmp/missing.jpg"],
+        ),
+    ]
+
+    report = format_report(results)
+
+    assert "[PASS] row 2 lcps-astoriaphotos-00001" in report
+    assert "[FAIL] row 3 lcps-astoriaphotos-00002" in report
+    assert "file not found: /tmp/missing.jpg" in report
+    assert "1/2 rows passed" in report
+
+
+def test_cmd_validate_returns_zero_when_all_rows_valid(tmp_path, capsys):
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    args = Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+
+    exit_code = cmd_validate(args)
+
+    assert exit_code == 0
+    assert "1/1 rows passed" in capsys.readouterr().out
+
+
+def test_cmd_validate_returns_one_when_a_row_fails(tmp_path, capsys):
+    from ia_bulk import cmd_validate
+
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "missing.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    args = Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+
+    exit_code = cmd_validate(args)
+
+    assert exit_code == 1
+    assert "0/1 rows passed" in capsys.readouterr().out
