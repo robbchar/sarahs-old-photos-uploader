@@ -25,9 +25,11 @@ they go in the `identifier-bib` metadata field instead.
   changed fields only) — fully decoupled from upload, safe to run repeatedly.
 - IA batch limits: 500 items per upload run, 5000/day — always chunk CSVs
   accordingly, never submit the full set in one call.
-- Testing: use `collection:test_collection` (IA's sandbox, auto-expires
-  ~30 days) with identifiers prefixed `zztest-` — never real identifiers,
-  never real collection, during testing.
+- Testing: `ia_bulk.py` targets `collection:test_collection` (IA's sandbox,
+  auto-expires ~30 days) by default, and automatically prepends `zztest-`
+  to the real identifier for every network call unless `--live` is passed.
+  The CSV always holds real, permanent identifiers — never author a
+  `zztest-` identifier by hand in the CSV itself.
 
 ## Source of truth
 Canonical metadata lives in a Google Sheet (replacing the old emailed-CSV

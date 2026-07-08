@@ -9,7 +9,7 @@ this pipeline — see `projects_registry.json`.
 ## CSV schemas
 
 ### `validate` / `upload`
-Required columns: `identifier`, `file`, `mediatype`, `title`, `date`.
+Required columns: `identifier`, `file`, `mediatype`, `title`.
 All other columns pass through untouched as IA item metadata.
 
 - `identifier`: pre-assigned in the Sheet, permanent, never generated or
@@ -17,7 +17,11 @@ All other columns pass through untouched as IA item metadata.
   lowercase, hyphen-separated, 5-digit zero-padded NUMBER.
 - `file`: filename (optionally with a relative subpath), resolved against
   `--files-dir`.
-- `mediatype`, `title`, `date`: required, non-empty.
+- `mediatype`, `title`: required, non-empty.
+- `date`: optional and free-form — IA doesn't enforce a date format.
+  `upload` fills a blank `date` cell with `[n.d.]` (the standard archival
+  "no date" abbreviation) rather than omitting the field, so every IA item
+  ends up with a date value either way.
 
 ### `sync-metadata`
 Only requires an `identifier` column plus whichever metadata columns
@@ -29,11 +33,10 @@ registry rationale. `projects_registry.json` holds the known
 `collection_key` and `PROJECTID` values; `validate` and `sync-metadata`
 reject any identifier whose prefix isn't registered there.
 
-Test-collection identifiers replace `COLLECTIONKEY` with the literal
-`zztest`, keeping the real `PROJECTID` — e.g. `zztest-astoriaphotos-00001`,
-not `zztest-lcps-00001`. `check_identifier` accepts either the real
-`collection_key` or `zztest` as the first segment, as long as the
-`PROJECTID` segment is registered.
+The CSV's `identifier` column always holds the real, permanent identifier
+— `check_identifier` only accepts the registry's actual `collection_key`
+as the first segment. There is no separate "test" identifier form in the
+CSV; see "Safety rail" below for how test runs are kept safe instead.
 
 ## Chunking
 All `upload`/`sync-metadata` runs process rows in batches of 500 (IA's
@@ -42,20 +45,51 @@ boundary, not a literal separate CSV file per chunk — each row is
 uploaded individually through the `internetarchive` Python library so
 outcomes are captured per-row.
 
+## Progress output
+`upload`/`sync-metadata` print a `[position/total] ...` line to stdout
+before each row, plus a `X uploaded successfully, Y error(s)` summary line
+before the final `log written to <path>` line, so a run is never silently
+quiet. `upload_row` also passes `verbose=True` through to
+`internetarchive.upload()`, which prints its own `tqdm` byte-progress bar
+per file — that's IA's own upload status, not something this tool
+fabricates. It also passes `checksum=True`, so re-running `upload` against
+a CSV whose files haven't changed skips re-uploading (and re-triggering
+IA's `derive` task) for anything already present with a matching MD5.
+
 ## Logging and resume
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:
-`{identifier, file, status, error, timestamp}`.
+`{identifier, file, status, error, uploaded_as, timestamp}`. `identifier`
+is always the real CSV identifier — used for `--resume-from` matching, so
+resuming works the same regardless of `--live`. `uploaded_as` is the
+identifier actually sent to IA for that row (see "Safety rail" below), so
+you can see exactly what landed on the site.
 
-`--resume-from <log>` reads identifiers marked `"status": "success"` from
-a prior log and skips them. The new run still writes its own complete
-log (carrying forward the skipped identifiers as pre-recorded successes),
-so each log is a self-contained record of what happened by that point.
+`--resume-from <log>` reads identifiers marked `"status": "success"` or
+`"status": "unchanged"` from a prior log and skips them. The new run still
+writes its own complete log (carrying forward the skipped identifiers as
+pre-recorded successes), so each log is a self-contained record of what
+happened by that point.
+
+## `sync-metadata`'s "unchanged" status
+IA's metadata-update endpoint returns an HTTP 400 with
+`{"error": "no changes to _meta.xml"}` when every field in the request
+already matches what's on the item — i.e. nothing was wrong, there was
+just nothing to do. `update_metadata_row` detects that specific error and
+raises `MetadataUnchanged` instead of `RuntimeError`; `cmd_sync_metadata`
+catches it separately, logs the row as `"status": "unchanged"` (not
+`"failure"`), and reports it in its own summary bucket
+(`X updated successfully, Y unchanged, Z error(s)`) so a CSV row that's
+already correct doesn't inflate the error count or flip the exit code.
 
 ## Safety rail
 Default target is `test_collection`; `--live` is required to target the
-real collection. When not `--live`, every identifier in the CSV must be
-prefixed `zztest-`, checked before any network call.
+real collection and use the real identifier as-is. When not `--live`,
+`effective_identifier()` prepends `zztest-` to the real identifier for
+every network call (`zztest-lcps-sarahsoldphotos-00001`) — this happens
+automatically, in code, rather than requiring the CSV to already contain
+test-prefixed identifiers. The CSV itself never needs to change between a
+test run and a `--live` run.
 
 ## Known gaps
 `projects_registry.json`'s `collection_key` value (`lcps`) is a placeholder

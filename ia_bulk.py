@@ -16,10 +16,11 @@ from typing import Iterator
 import internetarchive
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
-REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title", "date")
+REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
 CHUNK_SIZE = 500
 TEST_COLLECTION = "test_collection"
 TEST_IDENTIFIER_PREFIX = "zztest-"
+UNDATED_PLACEHOLDER = "[n.d.]"
 
 
 def chunk_rows(rows: list[dict], chunk_size: int = CHUNK_SIZE) -> "Iterator[list[dict]]":
@@ -54,12 +55,7 @@ def check_identifier(
         )
     else:
         collection_key, project_id, _number = identifier.split("-")
-        # Test-collection identifiers use the literal "zztest" in place of
-        # the real collection_key (see TEST_IDENTIFIER_PREFIX), keeping the
-        # real PROJECTID — e.g. zztest-astoriaphotos-00001.
-        is_real_prefix = collection_key == registry.get("collection_key")
-        is_test_prefix = collection_key == TEST_IDENTIFIER_PREFIX.rstrip("-")
-        known_prefix = (is_real_prefix or is_test_prefix) and project_id in registry.get(
+        known_prefix = collection_key == registry.get("collection_key") and project_id in registry.get(
             "projects", {}
         )
         if not known_prefix:
@@ -141,12 +137,14 @@ def log_result(
     file_value: str,
     status: str,
     error: str | None = None,
+    uploaded_as: str | None = None,
 ) -> None:
     entry = {
         "identifier": identifier,
         "file": file_value,
         "status": status,
         "error": error,
+        "uploaded_as": uploaded_as,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     with open(log_path, "a", encoding="utf-8") as f:
@@ -161,61 +159,60 @@ def load_prior_successes(log_path: str | Path) -> set[str]:
             if not line:
                 continue
             entry = json.loads(line)
-            if entry.get("status") == "success":
+            if entry.get("status") in ("success", "unchanged"):
                 successes.add(entry["identifier"])
     return successes
 
 
-def check_live_safety(rows: list[dict], live: bool) -> list[str]:
-    if live:
-        return []
-
-    errors: list[str] = []
-    for offset, row in enumerate(rows):
-        row_number = offset + 2
-        identifier = row.get("identifier", "").strip()
-        if identifier and not identifier.startswith(TEST_IDENTIFIER_PREFIX):
-            errors.append(
-                f"row {row_number}: identifier '{identifier}' is not prefixed with "
-                f"'{TEST_IDENTIFIER_PREFIX}' (required unless --live is passed)"
-            )
-    return errors
+def effective_identifier(identifier: str, live: bool) -> str:
+    return identifier if live else f"{TEST_IDENTIFIER_PREFIX}{identifier}"
 
 
-def upload_row(row: dict, collection: str, files_dir: str | Path) -> None:
-    identifier = row["identifier"].strip()
+def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
     file_path = Path(files_dir) / row["file"].strip()
     metadata = {
         key: value.strip()
         for key, value in row.items()
         if key not in ("identifier", "file") and value.strip()
     }
+    metadata["date"] = row.get("date", "").strip() or UNDATED_PLACEHOLDER
     metadata["collection"] = collection
 
     responses = internetarchive.upload(
-        identifier,
+        target_identifier,
         files=[str(file_path)],
         metadata=metadata,
+        verbose=True,
+        checksum=True,
     )
     for response in responses:
         if not response.ok:
             raise RuntimeError(
-                f"upload of '{identifier}' failed with status {response.status_code}: {response.text}"
+                f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}"
             )
 
 
-def update_metadata_row(row: dict) -> None:
-    identifier = row["identifier"].strip()
+class MetadataUnchanged(Exception):
+    pass
+
+
+def update_metadata_row(row: dict, target_identifier: str) -> None:
     metadata = {
         key: value.strip()
         for key, value in row.items()
         if key != "identifier" and value.strip()
     }
 
-    response = internetarchive.modify_metadata(identifier, metadata=metadata)
+    response = internetarchive.modify_metadata(target_identifier, metadata=metadata)
     if not response.ok:
+        try:
+            error_message = json.loads(response.text).get("error", "")
+        except (ValueError, AttributeError):
+            error_message = ""
+        if error_message == "no changes to _meta.xml":
+            raise MetadataUnchanged(target_identifier)
         raise RuntimeError(
-            f"metadata update of '{identifier}' failed with status {response.status_code}: {response.text}"
+            f"metadata update of '{target_identifier}' failed with status {response.status_code}: {response.text}"
         )
 
 
@@ -253,12 +250,6 @@ def cmd_upload(args) -> int:
         )
         return 1
 
-    safety_errors = check_live_safety(rows, args.live)
-    if safety_errors:
-        for error in safety_errors:
-            print(error, file=sys.stderr)
-        return 1
-
     collection = args.collection if args.live else TEST_COLLECTION
 
     skip_identifiers: set[str] = set()
@@ -269,22 +260,31 @@ def cmd_upload(args) -> int:
     for identifier in skip_identifiers:
         log_result(log_path, identifier, "", "success", error="carried over from resumed log")
 
-    had_failure = False
-    for chunk in chunk_rows(rows):
+    to_upload = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+    total = len(to_upload)
+    success_count = 0
+    failure_count = 0
+    position = 0
+    for chunk in chunk_rows(to_upload):
         for row in chunk:
+            position += 1
             identifier = row["identifier"].strip()
-            if identifier in skip_identifiers:
-                continue
             file_value = row["file"].strip()
+            target_identifier = effective_identifier(identifier, args.live)
+            print(f"[{position}/{total}] uploading {target_identifier} ({file_value})")
             try:
-                upload_row(row, collection, args.files_dir)
-                log_result(log_path, identifier, file_value, "success")
+                upload_row(row, target_identifier, collection, args.files_dir)
+                success_count += 1
+                log_result(log_path, identifier, file_value, "success", uploaded_as=target_identifier)
             except Exception as exc:
-                had_failure = True
-                log_result(log_path, identifier, file_value, "failure", error=str(exc))
+                failure_count += 1
+                log_result(
+                    log_path, identifier, file_value, "failure", error=str(exc), uploaded_as=target_identifier
+                )
 
+    print(f"{success_count} file(s) uploaded successfully, {failure_count} error(s)")
     print(f"log written to {log_path}")
-    return 1 if had_failure else 0
+    return 1 if failure_count else 0
 
 
 def cmd_sync_metadata(args) -> int:
@@ -297,12 +297,6 @@ def cmd_sync_metadata(args) -> int:
         print("identifier validation failed; fix the errors above before syncing", file=sys.stderr)
         return 1
 
-    safety_errors = check_live_safety(rows, args.live)
-    if safety_errors:
-        for error in safety_errors:
-            print(error, file=sys.stderr)
-        return 1
-
     skip_identifiers: set[str] = set()
     if args.resume_from:
         skip_identifiers = load_prior_successes(args.resume_from)
@@ -311,21 +305,32 @@ def cmd_sync_metadata(args) -> int:
     for identifier in skip_identifiers:
         log_result(log_path, identifier, "", "success", error="carried over from resumed log")
 
-    had_failure = False
-    for chunk in chunk_rows(rows):
+    to_sync = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+    total = len(to_sync)
+    success_count = 0
+    unchanged_count = 0
+    failure_count = 0
+    position = 0
+    for chunk in chunk_rows(to_sync):
         for row in chunk:
+            position += 1
             identifier = row["identifier"].strip()
-            if identifier in skip_identifiers:
-                continue
+            target_identifier = effective_identifier(identifier, args.live)
+            print(f"[{position}/{total}] updating metadata for {target_identifier}")
             try:
-                update_metadata_row(row)
-                log_result(log_path, identifier, "", "success")
+                update_metadata_row(row, target_identifier)
+                success_count += 1
+                log_result(log_path, identifier, "", "success", uploaded_as=target_identifier)
+            except MetadataUnchanged:
+                unchanged_count += 1
+                log_result(log_path, identifier, "", "unchanged", uploaded_as=target_identifier)
             except Exception as exc:
-                had_failure = True
-                log_result(log_path, identifier, "", "failure", error=str(exc))
+                failure_count += 1
+                log_result(log_path, identifier, "", "failure", error=str(exc), uploaded_as=target_identifier)
 
+    print(f"{success_count} item(s) updated successfully, {unchanged_count} unchanged, {failure_count} error(s)")
     print(f"log written to {log_path}")
-    return 1 if had_failure else 0
+    return 1 if failure_count else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,8 +1,8 @@
 {
   "collection_key": "lcps",
   "projects": {
-    "astoriaphotos": {
-      "description": "Astoria historical photos donated collection (Sarah's old photos)"
+    "sarahsoldphotos": {
+      "description": "Sarah's donated collection of historical Astoria photos"
     }
   }
 }
