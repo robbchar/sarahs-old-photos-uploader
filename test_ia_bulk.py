@@ -733,6 +733,70 @@ def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, 
     assert exit_code == 0
 
 
+def test_cmd_sync_metadata_blocks_real_identifiers_without_live_flag(tmp_path, monkeypatch):
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "title"],
+        [{"identifier": "lcps-astoriaphotos-00001", "title": "Corrected title"}],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+
+    update_calls = []
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row: update_calls.append(row))
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(registry_path),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    exit_code = cmd_sync_metadata(args)
+
+    assert exit_code == 1
+    assert update_calls == []
+
+
+def test_cmd_sync_metadata_fails_identifier_validation_before_touching_network(tmp_path, monkeypatch):
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "title"],
+        [{"identifier": "zztest-unregisteredproject-00001", "title": "Corrected title"}],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+
+    update_calls = []
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row: update_calls.append(row))
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(registry_path),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    exit_code = cmd_sync_metadata(args)
+
+    assert exit_code == 1
+    assert update_calls == []
+
+
 def test_build_parser_validate_subcommand_defaults():
     parser = build_parser()
     args = parser.parse_args(["validate", "items.csv"])

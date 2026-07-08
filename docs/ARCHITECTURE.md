@@ -63,3 +63,24 @@ prefixed `zztest-`, checked before any network call.
 `--live` run. A wrong value here doesn't cause data loss (validation would
 just reject every real identifier), but it needs to be right before real
 uploads can pass `validate`.
+
+`upload`'s `--collection` flag also defaults to `"lcps"` (see `build_parser`
+in `ia_bulk.py`) and is used as-is on `--live` runs. Unlike the
+`collection_key` placeholder above, nothing validates this value — a wrong
+or stale `--collection` on a `--live` run will silently push real files to
+the wrong IA collection instead of failing. Double-check `--collection`
+by hand before every `--live upload` run. The default is intentionally left
+as `"lcps"` (matches the original plan); this is a documentation warning,
+not a call to change the CLI's behavior.
+
+The production CSV export from the LCPS Google Sheet
+(`data/LCPS Digital Archive Metadata Spreadsheet - Sheet1.csv`) does not
+match the schema this tool requires: its headers are capitalized
+(`File on Array`, `Identifier`, `Title`, `Date`, `Theme`, ...) rather than
+the lowercase `identifier`/`file`/`mediatype`/`title`/`date` columns listed
+under "CSV schemas" above, and it has no `mediatype` column at all. Running
+`validate`/`upload` directly against the raw export will fail every row.
+The raw export must be transformed by hand into a CSV matching the exact
+required schema — including adding a `mediatype` column — before it's
+passed to this tool. That transformation is a deliberate, explicit step a
+human performs, not something this CLI does automatically.
