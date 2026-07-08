@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterator
 
 import internetarchive
+import requests
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
@@ -209,6 +210,15 @@ def upload_row(row: dict, target_identifier: str, collection: str, files_dir: st
         checksum=True,
     )
     for response in responses:
+        # internetarchive.upload() is typed to return Request | Response;
+        # a Request is only ever returned when debug=True, which we never
+        # pass, so this always holds at runtime. Narrowing it explicitly
+        # keeps response.ok/.status_code/.text type-checker-clean.
+        if isinstance(response, requests.Request):
+            raise RuntimeError(
+                f"upload of '{target_identifier}' returned an unprepared Request instead of "
+                "a Response - this should be unreachable since debug is never passed"
+            )
         if not response.ok:
             raise RuntimeError(
                 f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}"
@@ -234,6 +244,14 @@ def update_metadata_row(row: dict, target_identifier: str) -> None:
     }
 
     response = internetarchive.modify_metadata(target_identifier, metadata=metadata)
+    # See the matching narrowing comment in upload_row(): modify_metadata()
+    # is typed to return Request | Response, but a Request is only ever
+    # returned when debug=True, which we never pass.
+    if isinstance(response, requests.Request):
+        raise RuntimeError(
+            f"metadata update of '{target_identifier}' returned an unprepared Request instead of "
+            "a Response - this should be unreachable since debug is never passed"
+        )
     if not response.ok:
         try:
             error_message = json.loads(response.text).get("error", "")

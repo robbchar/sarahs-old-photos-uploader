@@ -1,2 +1,4 @@
 internetarchive>=5.0
 pytest>=8.0
+ruff>=0.15
+pyright>=1.1

@@ -1,8 +1,6 @@
 import json
 import csv
-import time
 from argparse import Namespace
-from pathlib import Path
 
 import internetarchive
 import pytest

@@ -112,3 +112,14 @@ This is a deliberate manual step, not something this CLI automates.
 ```bash
 python -m pytest test_ia_bulk.py -v
 ```
+
+## Linting and type checking
+
+```bash
+python -m ruff check .        # style/lint (unused imports, bug-prone patterns, ...)
+python -m pyright ia_bulk.py test_ia_bulk.py   # static type checking (same engine as VS Code's Pylance)
+```
+
+`pyright` is the command-line engine behind the Pylance VS Code extension —
+running it here gives the same diagnostics Pylance would show in the editor,
+without needing VS Code open.
