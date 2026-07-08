@@ -4,9 +4,17 @@ import time
 from argparse import Namespace
 from pathlib import Path
 
+import internetarchive
 import pytest
 
 from ia_bulk import read_rows, load_registry, check_identifier, validate_rows, RowValidation, check_live_safety
+
+
+class FakeResponse:
+    def __init__(self, ok, status_code=200, text=""):
+        self.ok = ok
+        self.status_code = status_code
+        self.text = text
 
 
 def write_csv(path, fieldnames, rows):
@@ -353,3 +361,119 @@ def test_check_live_safety_fails_when_not_live_and_real_identifier_present():
 
     assert len(errors) == 1
     assert "zztest-" in errors[0]
+
+
+def test_upload_row_succeeds_when_library_returns_ok_responses(tmp_path, monkeypatch):
+    from ia_bulk import upload_row
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {
+        "identifier": "zztest-astoriaphotos-00001",
+        "file": "photo1.jpg",
+        "mediatype": "image",
+        "title": "First photo",
+        "date": "1958",
+    }
+    captured = {}
+
+    def fake_upload(identifier, files, metadata, **kwargs):
+        captured["identifier"] = identifier
+        captured["files"] = files
+        captured["metadata"] = metadata
+        return [FakeResponse(ok=True)]
+
+    monkeypatch.setattr(internetarchive, "upload", fake_upload)
+
+    upload_row(row, collection="test_collection", files_dir=tmp_path)
+
+    assert captured["identifier"] == "zztest-astoriaphotos-00001"
+    assert captured["files"] == [str(tmp_path / "photo1.jpg")]
+    assert captured["metadata"]["mediatype"] == "image"
+    assert captured["metadata"]["collection"] == "test_collection"
+
+
+def test_upload_row_raises_when_library_returns_failed_response(tmp_path, monkeypatch):
+    from ia_bulk import upload_row
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {
+        "identifier": "zztest-astoriaphotos-00001",
+        "file": "photo1.jpg",
+        "mediatype": "image",
+        "title": "First photo",
+        "date": "1958",
+    }
+
+    def fake_upload(identifier, files, metadata, **kwargs):
+        return [FakeResponse(ok=False, status_code=503, text="Service Unavailable")]
+
+    monkeypatch.setattr(internetarchive, "upload", fake_upload)
+
+    with pytest.raises(RuntimeError, match="503"):
+        upload_row(row, collection="test_collection", files_dir=tmp_path)
+
+
+def test_update_metadata_row_succeeds_when_library_returns_ok_response(monkeypatch):
+    from ia_bulk import update_metadata_row
+
+    row = {"identifier": "zztest-astoriaphotos-00001", "title": "Updated title"}
+    captured = {}
+
+    def fake_modify_metadata(identifier, metadata, **kwargs):
+        captured["identifier"] = identifier
+        captured["metadata"] = metadata
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", fake_modify_metadata)
+
+    update_metadata_row(row)
+
+    assert captured["identifier"] == "zztest-astoriaphotos-00001"
+    assert captured["metadata"] == {"title": "Updated title"}
+
+
+def test_update_metadata_row_raises_when_library_returns_failed_response(monkeypatch):
+    from ia_bulk import update_metadata_row
+
+    row = {"identifier": "zztest-astoriaphotos-00001", "title": "Updated title"}
+
+    def fake_modify_metadata(identifier, metadata, **kwargs):
+        return FakeResponse(ok=False, status_code=400, text="Bad Request")
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", fake_modify_metadata)
+
+    with pytest.raises(RuntimeError, match="400"):
+        update_metadata_row(row)
+
+
+def test_validate_identifiers_passes_valid_unique_identifiers():
+    from ia_bulk import validate_identifiers
+
+    rows = [
+        {"identifier": "lcps-astoriaphotos-00001", "title": "New title"},
+        {"identifier": "lcps-astoriaphotos-00002", "title": "Another title"},
+    ]
+
+    results = validate_identifiers(rows, registry=make_registry())
+
+    assert all(r.is_valid for r in results)
+
+
+def test_validate_identifiers_does_not_require_file_or_mediatype():
+    from ia_bulk import validate_identifiers
+
+    rows = [{"identifier": "lcps-astoriaphotos-00001", "title": "New title"}]
+
+    results = validate_identifiers(rows, registry=make_registry())
+
+    assert results[0].is_valid
+
+
+def test_validate_identifiers_flags_bad_scheme():
+    from ia_bulk import validate_identifiers
+
+    rows = [{"identifier": "not-a-valid-id", "title": "New title"}]
+
+    results = validate_identifiers(rows, registry=make_registry())
+
+    assert not results[0].is_valid

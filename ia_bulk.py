@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+import internetarchive
+
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title", "date")
 CHUNK_SIZE = 500
@@ -176,6 +178,56 @@ def check_live_safety(rows: list[dict], live: bool) -> list[str]:
                 f"'{TEST_IDENTIFIER_PREFIX}' (required unless --live is passed)"
             )
     return errors
+
+
+def upload_row(row: dict, collection: str, files_dir: str | Path) -> None:
+    identifier = row["identifier"].strip()
+    file_path = Path(files_dir) / row["file"].strip()
+    metadata = {
+        key: value.strip()
+        for key, value in row.items()
+        if key not in ("identifier", "file") and value.strip()
+    }
+    metadata["collection"] = collection
+
+    responses = internetarchive.upload(
+        identifier,
+        files=[str(file_path)],
+        metadata=metadata,
+    )
+    for response in responses:
+        if not response.ok:
+            raise RuntimeError(
+                f"upload of '{identifier}' failed with status {response.status_code}: {response.text}"
+            )
+
+
+def update_metadata_row(row: dict) -> None:
+    identifier = row["identifier"].strip()
+    metadata = {
+        key: value.strip()
+        for key, value in row.items()
+        if key != "identifier" and value.strip()
+    }
+
+    response = internetarchive.modify_metadata(identifier, metadata=metadata)
+    if not response.ok:
+        raise RuntimeError(
+            f"metadata update of '{identifier}' failed with status {response.status_code}: {response.text}"
+        )
+
+
+def validate_identifiers(rows: list[dict[str, str]], registry: dict) -> list[RowValidation]:
+    seen_identifiers: dict[str, int] = {}
+    results: list[RowValidation] = []
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2
+        identifier = row.get("identifier", "").strip()
+        errors = check_identifier(identifier, row_number, registry, seen_identifiers)
+        results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
+
+    return results
 
 
 def cmd_validate(args) -> int:
