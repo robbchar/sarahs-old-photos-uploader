@@ -26,6 +26,13 @@ All other columns pass through untouched as IA item metadata.
 ### `sync-metadata`
 Only requires an `identifier` column plus whichever metadata columns
 changed. Does not require `file`, `mediatype`, `title`, or `date`.
+A blank cell means "leave this field alone" — `update_metadata_row` drops
+blank cells from the request entirely rather than sending an empty string,
+since the whole point of this CSV shape is to list only what changed. To
+actually delete an existing field on the IA item, put the literal value
+`REMOVE_TAG` in that cell: the `internetarchive` library (and the official
+`ia` CLI's `--modify field:REMOVE_TAG`) treats that exact string as a
+delete sentinel and issues a metadata "remove" op for the field.
 
 ## Identifier scheme
 See `.claude/Claude.md` for the full identifier scheme and project
@@ -59,17 +66,33 @@ IA's `derive` task) for anything already present with a matching MD5.
 ## Logging and resume
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:
-`{identifier, file, status, error, uploaded_as, timestamp}`. `identifier`
-is always the real CSV identifier — used for `--resume-from` matching, so
-resuming works the same regardless of `--live`. `uploaded_as` is the
+`{identifier, file, status, error, uploaded_as, live, timestamp}`.
+`identifier` is always the real CSV identifier. `uploaded_as` is the
 identifier actually sent to IA for that row (see "Safety rail" below), so
-you can see exactly what landed on the site.
+you can see exactly what landed on the site. `live` records which mode
+(test vs. `--live`) produced that row's result.
 
 `--resume-from <log>` reads identifiers marked `"status": "success"` or
-`"status": "unchanged"` from a prior log and skips them. The new run still
-writes its own complete log (carrying forward the skipped identifiers as
-pre-recorded successes), so each log is a self-contained record of what
-happened by that point.
+`"status": "unchanged"` from a prior log **written in the same mode as the
+current run** and skips them; `load_prior_successes(log_path, live)` filters
+on the log's `live` field before matching. This is deliberate, not
+incidental: since the CSV's `identifier` column is identical for a test run
+and a `--live` run of the same file (only `uploaded_as` differs), a success
+recorded in `test_collection` says nothing about whether the real item
+exists — treating it as interchangeable with a `--live` success would let a
+`--live --resume-from <test-run-log>` silently skip a real upload while
+still reporting it as successful. Log lines written before this `live`
+field existed have no mode recorded and are treated as matching neither
+mode, so old-format logs are simply not used to skip anything rather than
+skip in the wrong mode. The new run still writes its own complete log
+(carrying forward the skipped identifiers as pre-recorded successes), so
+each log is a self-contained record of what happened by that point.
+
+Rows carried over via `--resume-from` also skip re-validation in
+`validate_rows`/`validate_identifiers` (their identifiers already passed a
+prior run's checks) - `skip_identifiers` short-circuits the per-row
+checks but still records the identifier for duplicate detection, and row
+numbers stay aligned with the full CSV either way.
 
 ## `sync-metadata`'s "unchanged" status
 IA's metadata-update endpoint returns an HTTP 400 with

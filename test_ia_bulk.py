@@ -215,6 +215,36 @@ def test_validate_rows_row_numbers_start_at_2_for_header():
     assert results[0].row_number == 2
 
 
+def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers():
+    rows = [
+        {
+            # would otherwise fail every check - already validated + uploaded
+            # by a prior run, so re-checking it on --resume-from is wasted work
+            "identifier": "lcps-astoriaphotos-00001",
+            "file": "does-not-exist.jpg",
+            "mediatype": "",
+            "title": "",
+            "date": "",
+        },
+        {
+            "identifier": "lcps-astoriaphotos-00002",
+            "file": "does-not-exist.jpg",
+            "mediatype": "",
+            "title": "",
+            "date": "",
+        },
+    ]
+
+    results = validate_rows(
+        rows, files_dir="/tmp", registry=make_registry(), skip_identifiers=frozenset({"lcps-astoriaphotos-00001"})
+    )
+
+    assert results[0].is_valid
+    assert results[0].row_number == 2
+    assert not results[1].is_valid
+    assert results[1].row_number == 3
+
+
 def test_format_report_shows_pass_and_fail_with_summary():
     from ia_bulk import format_report
 
@@ -332,8 +362,8 @@ def test_log_result_appends_one_json_line(tmp_path):
 
     log_path = tmp_path / "upload-test.jsonl"
 
-    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success")
-    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", error="timeout")
+    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success", live=False)
+    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", live=False, error="timeout")
 
     lines = log_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
@@ -350,12 +380,36 @@ def test_load_prior_successes_returns_only_successful_identifiers(tmp_path):
     from ia_bulk import log_result, load_prior_successes
 
     log_path = tmp_path / "upload-test.jsonl"
-    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success")
-    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", error="timeout")
+    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success", live=False)
+    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "failure", live=False, error="timeout")
 
-    successes = load_prior_successes(log_path)
+    successes = load_prior_successes(log_path, live=False)
 
     assert successes == {"lcps-astoriaphotos-00001"}
+
+
+def test_load_prior_successes_ignores_entries_from_the_other_mode(tmp_path):
+    from ia_bulk import log_result, load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_result(log_path, "lcps-astoriaphotos-00001", "photo1.jpg", "success", live=False)
+    log_result(log_path, "lcps-astoriaphotos-00002", "photo2.jpg", "success", live=True)
+
+    assert load_prior_successes(log_path, live=False) == {"lcps-astoriaphotos-00001"}
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00002"}
+
+
+def test_load_prior_successes_ignores_pre_migration_entries_with_no_live_field(tmp_path):
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_path.write_text(
+        json.dumps({"identifier": "lcps-astoriaphotos-00001", "status": "success"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_prior_successes(log_path, live=False) == set()
+    assert load_prior_successes(log_path, live=True) == set()
 
 
 def test_effective_identifier_prepends_zztest_when_not_live():
@@ -444,6 +498,33 @@ def test_upload_row_defaults_blank_date_to_undated_placeholder(tmp_path, monkeyp
     assert captured["metadata"]["date"] == "[n.d.]"
 
 
+def test_upload_row_defaults_missing_date_key_to_undated_placeholder(tmp_path, monkeypatch):
+    """csv.DictReader sets a trailing column to None (not "") when a data
+    row is short that column entirely, e.g. a ragged hand-edited CSV row
+    that ends before the optional trailing 'date' cell."""
+    from ia_bulk import upload_row
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {
+        "identifier": "lcps-astoriaphotos-00001",
+        "file": "photo1.jpg",
+        "mediatype": "image",
+        "title": "First photo",
+        "date": None,
+    }
+    captured = {}
+
+    def fake_upload(identifier, files, metadata, **kwargs):
+        captured["metadata"] = metadata
+        return [FakeResponse(ok=True)]
+
+    monkeypatch.setattr(internetarchive, "upload", fake_upload)
+
+    upload_row(row, target_identifier="zztest-lcps-astoriaphotos-00001", collection="test_collection", files_dir=tmp_path)
+
+    assert captured["metadata"]["date"] == "[n.d.]"
+
+
 def test_upload_row_preserves_free_form_date_when_present(tmp_path, monkeypatch):
     from ia_bulk import upload_row
 
@@ -485,6 +566,45 @@ def test_update_metadata_row_succeeds_when_library_returns_ok_response(monkeypat
 
     assert captured["identifier"] == "zztest-lcps-astoriaphotos-00001"
     assert captured["metadata"] == {"title": "Updated title"}
+
+
+def test_update_metadata_row_drops_blank_cells_instead_of_clearing_the_field(monkeypatch):
+    """A blank cell must mean 'leave this field alone', not 'clear it',
+    since a sync-metadata CSV only lists the columns that changed."""
+    from ia_bulk import update_metadata_row
+
+    row = {"identifier": "lcps-astoriaphotos-00001", "title": "Updated title", "description": ""}
+    captured = {}
+
+    def fake_modify_metadata(identifier, metadata, **kwargs):
+        captured["metadata"] = metadata
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", fake_modify_metadata)
+
+    update_metadata_row(row, target_identifier="zztest-lcps-astoriaphotos-00001")
+
+    assert "description" not in captured["metadata"]
+
+
+def test_update_metadata_row_passes_remove_tag_through_to_clear_a_field(monkeypatch):
+    """REMOVE_TAG is the internetarchive library's (and the official `ia`
+    CLI's) sentinel value for deleting an existing metadata field - it must
+    not be filtered out the way a blank cell is."""
+    from ia_bulk import update_metadata_row
+
+    row = {"identifier": "lcps-astoriaphotos-00001", "description": "REMOVE_TAG"}
+    captured = {}
+
+    def fake_modify_metadata(identifier, metadata, **kwargs):
+        captured["metadata"] = metadata
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", fake_modify_metadata)
+
+    update_metadata_row(row, target_identifier="zztest-lcps-astoriaphotos-00001")
+
+    assert captured["metadata"]["description"] == "REMOVE_TAG"
 
 
 def test_update_metadata_row_raises_when_library_returns_failed_response(monkeypatch):
@@ -530,6 +650,24 @@ def test_validate_identifiers_passes_valid_unique_identifiers():
     results = validate_identifiers(rows, registry=make_registry())
 
     assert all(r.is_valid for r in results)
+
+
+def test_validate_identifiers_skips_checks_but_keeps_row_numbers_for_skip_identifiers():
+    from ia_bulk import validate_identifiers
+
+    rows = [
+        {"identifier": "lcps-unregisteredproject-00001", "title": "New title"},
+        {"identifier": "lcps-astoriaphotos-00002", "title": "Another title"},
+    ]
+
+    results = validate_identifiers(
+        rows, registry=make_registry(), skip_identifiers=frozenset({"lcps-unregisteredproject-00001"})
+    )
+
+    assert results[0].is_valid
+    assert results[0].row_number == 2
+    assert results[1].is_valid
+    assert results[1].row_number == 3
 
 
 def test_validate_identifiers_does_not_require_file_or_mediatype():
@@ -777,7 +915,7 @@ def test_cmd_upload_resume_from_skips_prior_successes(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     prior_log = tmp_path / "prior.jsonl"
-    log_result(prior_log, "lcps-astoriaphotos-00001", "photo1.jpg", "success")
+    log_result(prior_log, "lcps-astoriaphotos-00001", "photo1.jpg", "success", live=False)
 
     uploaded = []
     monkeypatch.setattr(
@@ -799,6 +937,58 @@ def test_cmd_upload_resume_from_skips_prior_successes(tmp_path, monkeypatch):
 
     assert exit_code == 0
     assert uploaded == ["lcps-astoriaphotos-00002"]
+
+
+def test_cmd_upload_resume_from_a_test_mode_log_does_not_skip_a_live_run(tmp_path, monkeypatch):
+    """A --resume-from log written by a non-live (test_collection) run only
+    proves the zztest-prefixed item landed in the sandbox, never the real
+    one - it must not be able to make a later --live run silently skip a
+    real upload."""
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    prior_log = tmp_path / "prior.jsonl"
+    log_result(prior_log, "lcps-astoriaphotos-00001", "photo1.jpg", "success", live=False)
+
+    uploaded = []
+    monkeypatch.setattr(
+        "ia_bulk.upload_row",
+        lambda row, target_identifier, collection, files_dir: uploaded.append(row["identifier"]),
+    )
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=True,
+        collection="lcps",
+        log_dir=str(tmp_path / "logs"),
+        resume_from=str(prior_log),
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 0
+    assert uploaded == ["lcps-astoriaphotos-00001"]
 
 
 def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not_live(tmp_path, monkeypatch):

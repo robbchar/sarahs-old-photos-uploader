@@ -82,23 +82,38 @@ class RowValidation:
         return not self.errors
 
 
-def validate_rows(rows: list[dict[str, str]], files_dir: str | Path, registry: dict) -> list[RowValidation]:
+def validate_rows(
+    rows: list[dict[str, str]],
+    files_dir: str | Path,
+    registry: dict,
+    skip_identifiers: frozenset[str] = frozenset(),
+) -> list[RowValidation]:
+    """skip_identifiers lets a --resume-from run skip re-validating rows a
+    prior run already validated and uploaded successfully - the identifier
+    is still tracked for duplicate detection, just without redoing the
+    regex/registry/disk-stat checks."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
     for offset, row in enumerate(rows):
         row_number = offset + 2  # header is row 1
-        identifier = row.get("identifier", "").strip()
+        identifier = (row.get("identifier") or "").strip()
+
+        if identifier in skip_identifiers:
+            seen_identifiers.setdefault(identifier, row_number)
+            results.append(RowValidation(row_number=row_number, identifier=identifier))
+            continue
+
         errors: list[str] = []
 
         for column in REQUIRED_UPLOAD_COLUMNS:
-            if not row.get(column, "").strip():
+            if not (row.get(column) or "").strip():
                 errors.append(f"missing required column '{column}'")
 
         if identifier:
             errors.extend(check_identifier(identifier, row_number, registry, seen_identifiers))
 
-        file_value = row.get("file", "").strip()
+        file_value = (row.get("file") or "").strip()
         if file_value:
             file_path = Path(files_dir) / file_value
             if not file_path.is_file():
@@ -136,6 +151,7 @@ def log_result(
     identifier: str,
     file_value: str,
     status: str,
+    live: bool,
     error: str | None = None,
     uploaded_as: str | None = None,
 ) -> None:
@@ -145,13 +161,20 @@ def log_result(
         "status": status,
         "error": error,
         "uploaded_as": uploaded_as,
+        "live": live,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def load_prior_successes(log_path: str | Path) -> set[str]:
+def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
+    """Identifiers logged as success/unchanged in the SAME mode (test vs
+    --live) as this run. A test-mode log entry only ever confirms that the
+    zztest-prefixed item landed in test_collection, never the real one, so
+    it must not be allowed to skip a real --live upload (and vice versa).
+    Logs from before the "live" field existed have no mode recorded and are
+    treated conservatively as not matching either mode."""
     successes: set[str] = set()
     with open(log_path, encoding="utf-8") as f:
         for line in f:
@@ -159,7 +182,7 @@ def load_prior_successes(log_path: str | Path) -> set[str]:
             if not line:
                 continue
             entry = json.loads(line)
-            if entry.get("status") in ("success", "unchanged"):
+            if entry.get("status") in ("success", "unchanged") and entry.get("live") == live:
                 successes.add(entry["identifier"])
     return successes
 
@@ -171,11 +194,11 @@ def effective_identifier(identifier: str, live: bool) -> str:
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
     file_path = Path(files_dir) / row["file"].strip()
     metadata = {
-        key: value.strip()
+        key: (value or "").strip()
         for key, value in row.items()
-        if key not in ("identifier", "file") and value.strip()
+        if key not in ("identifier", "file") and (value or "").strip()
     }
-    metadata["date"] = row.get("date", "").strip() or UNDATED_PLACEHOLDER
+    metadata["date"] = (row.get("date") or "").strip() or UNDATED_PLACEHOLDER
     metadata["collection"] = collection
 
     responses = internetarchive.upload(
@@ -197,10 +220,17 @@ class MetadataUnchanged(Exception):
 
 
 def update_metadata_row(row: dict, target_identifier: str) -> None:
+    """Blank cells are dropped entirely, not sent as empty strings - a
+    sync-metadata CSV only needs to list the columns that changed, so a
+    blank cell must mean "leave this field alone", not "clear it". To
+    actually delete an existing field on the IA item, put the literal
+    value REMOVE_TAG in that cell; the internetarchive library (and the
+    official `ia` CLI's `--modify field:REMOVE_TAG`) treats that string as
+    a delete sentinel and issues a metadata "remove" op for the field."""
     metadata = {
-        key: value.strip()
+        key: (value or "").strip()
         for key, value in row.items()
-        if key != "identifier" and value.strip()
+        if key != "identifier" and (value or "").strip()
     }
 
     response = internetarchive.modify_metadata(target_identifier, metadata=metadata)
@@ -216,13 +246,23 @@ def update_metadata_row(row: dict, target_identifier: str) -> None:
         )
 
 
-def validate_identifiers(rows: list[dict[str, str]], registry: dict) -> list[RowValidation]:
+def validate_identifiers(
+    rows: list[dict[str, str]],
+    registry: dict,
+    skip_identifiers: frozenset[str] = frozenset(),
+) -> list[RowValidation]:
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
     for offset, row in enumerate(rows):
         row_number = offset + 2
-        identifier = row.get("identifier", "").strip()
+        identifier = (row.get("identifier") or "").strip()
+
+        if identifier in skip_identifiers:
+            seen_identifiers.setdefault(identifier, row_number)
+            results.append(RowValidation(row_number=row_number, identifier=identifier))
+            continue
+
         errors = check_identifier(identifier, row_number, registry, seen_identifiers)
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
@@ -237,11 +277,56 @@ def cmd_validate(args) -> int:
     return 0 if all(r.is_valid for r in results) else 1
 
 
+def run_rows(
+    rows: list[dict],
+    log_path: str | Path,
+    live: bool,
+    action: str,
+    process_row,
+    describe,
+    file_value_for,
+) -> dict[str, int]:
+    """Shared chunk/progress/log-and-count loop for cmd_upload and
+    cmd_sync_metadata - they differ only in how a row is processed, how its
+    progress line reads, and what (if anything) goes in the log's file
+    field. process_row(row, target_identifier) may raise MetadataUnchanged
+    to count as "unchanged" rather than "failure"."""
+    total = len(rows)
+    counts = {"success": 0, "unchanged": 0, "failure": 0}
+    position = 0
+    for chunk in chunk_rows(rows):
+        for row in chunk:
+            position += 1
+            identifier = row["identifier"].strip()
+            target_identifier = effective_identifier(identifier, live)
+            file_value = file_value_for(row)
+            print(f"[{position}/{total}] {action} {describe(row, target_identifier)}")
+            try:
+                process_row(row, target_identifier)
+                counts["success"] += 1
+                log_result(log_path, identifier, file_value, "success", live, uploaded_as=target_identifier)
+            except MetadataUnchanged:
+                counts["unchanged"] += 1
+                log_result(log_path, identifier, file_value, "unchanged", live, uploaded_as=target_identifier)
+            except Exception as exc:
+                counts["failure"] += 1
+                log_result(
+                    log_path, identifier, file_value, "failure", live, error=str(exc), uploaded_as=target_identifier
+                )
+    return counts
+
+
 def cmd_upload(args) -> int:
     rows = read_rows(args.csv)
     registry = load_registry(args.registry)
 
-    validation_results = validate_rows(rows, args.files_dir, registry)
+    skip_identifiers: set[str] = set()
+    if args.resume_from:
+        skip_identifiers = load_prior_successes(args.resume_from, args.live)
+
+    to_upload = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+
+    validation_results = validate_rows(rows, args.files_dir, registry, frozenset(skip_identifiers))
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
         print(
@@ -252,85 +337,58 @@ def cmd_upload(args) -> int:
 
     collection = args.collection if args.live else TEST_COLLECTION
 
-    skip_identifiers: set[str] = set()
-    if args.resume_from:
-        skip_identifiers = load_prior_successes(args.resume_from)
-
     log_path = open_log(args.log_dir, "upload")
     for identifier in skip_identifiers:
-        log_result(log_path, identifier, "", "success", error="carried over from resumed log")
+        log_result(log_path, identifier, "", "success", args.live, error="carried over from resumed log")
 
-    to_upload = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
-    total = len(to_upload)
-    success_count = 0
-    failure_count = 0
-    position = 0
-    for chunk in chunk_rows(to_upload):
-        for row in chunk:
-            position += 1
-            identifier = row["identifier"].strip()
-            file_value = row["file"].strip()
-            target_identifier = effective_identifier(identifier, args.live)
-            print(f"[{position}/{total}] uploading {target_identifier} ({file_value})")
-            try:
-                upload_row(row, target_identifier, collection, args.files_dir)
-                success_count += 1
-                log_result(log_path, identifier, file_value, "success", uploaded_as=target_identifier)
-            except Exception as exc:
-                failure_count += 1
-                log_result(
-                    log_path, identifier, file_value, "failure", error=str(exc), uploaded_as=target_identifier
-                )
+    counts = run_rows(
+        to_upload,
+        log_path,
+        args.live,
+        action="uploading",
+        process_row=lambda row, target: upload_row(row, target, collection, args.files_dir),
+        describe=lambda row, target: f"{target} ({row['file'].strip()})",
+        file_value_for=lambda row: row["file"].strip(),
+    )
 
-    print(f"{success_count} file(s) uploaded successfully, {failure_count} error(s)")
+    print(f"{counts['success']} file(s) uploaded successfully, {counts['failure']} error(s)")
     print(f"log written to {log_path}")
-    return 1 if failure_count else 0
+    return 1 if counts["failure"] else 0
 
 
 def cmd_sync_metadata(args) -> int:
     rows = read_rows(args.csv)
     registry = load_registry(args.registry)
 
-    validation_results = validate_identifiers(rows, registry)
+    skip_identifiers: set[str] = set()
+    if args.resume_from:
+        skip_identifiers = load_prior_successes(args.resume_from, args.live)
+
+    to_sync = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+
+    validation_results = validate_identifiers(rows, registry, frozenset(skip_identifiers))
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
         print("identifier validation failed; fix the errors above before syncing", file=sys.stderr)
         return 1
 
-    skip_identifiers: set[str] = set()
-    if args.resume_from:
-        skip_identifiers = load_prior_successes(args.resume_from)
-
     log_path = open_log(args.log_dir, "sync-metadata")
     for identifier in skip_identifiers:
-        log_result(log_path, identifier, "", "success", error="carried over from resumed log")
+        log_result(log_path, identifier, "", "success", args.live, error="carried over from resumed log")
 
-    to_sync = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
-    total = len(to_sync)
-    success_count = 0
-    unchanged_count = 0
-    failure_count = 0
-    position = 0
-    for chunk in chunk_rows(to_sync):
-        for row in chunk:
-            position += 1
-            identifier = row["identifier"].strip()
-            target_identifier = effective_identifier(identifier, args.live)
-            print(f"[{position}/{total}] updating metadata for {target_identifier}")
-            try:
-                update_metadata_row(row, target_identifier)
-                success_count += 1
-                log_result(log_path, identifier, "", "success", uploaded_as=target_identifier)
-            except MetadataUnchanged:
-                unchanged_count += 1
-                log_result(log_path, identifier, "", "unchanged", uploaded_as=target_identifier)
-            except Exception as exc:
-                failure_count += 1
-                log_result(log_path, identifier, "", "failure", error=str(exc), uploaded_as=target_identifier)
+    counts = run_rows(
+        to_sync,
+        log_path,
+        args.live,
+        action="updating metadata for",
+        process_row=lambda row, target: update_metadata_row(row, target),
+        describe=lambda row, target: target,
+        file_value_for=lambda row: "",
+    )
 
-    print(f"{success_count} item(s) updated successfully, {unchanged_count} unchanged, {failure_count} error(s)")
+    print(f"{counts['success']} item(s) updated successfully, {counts['unchanged']} unchanged, {counts['failure']} error(s)")
     print(f"log written to {log_path}")
-    return 1 if failure_count else 0
+    return 1 if counts["failure"] else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

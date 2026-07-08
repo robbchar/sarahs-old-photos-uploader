@@ -13,8 +13,9 @@ rail.
 ## Identifier scheme
 `COLLECTIONKEY-PROJECTID-NUMBER` — all lowercase, hyphen-separated.
 - COLLECTIONKEY: LCPS's IA collection identifier (confirm before real runs)
-- PROJECTID: short project code, e.g. `astoriaphotos` (tracked in a small
-  project registry, not invented ad hoc per script run)
+- PROJECTID: short project code, e.g. `photosexample` (illustrative only —
+  see `projects_registry.json` for the actual registered codes; tracked in
+  a small project registry, not invented ad hoc per script run)
 - NUMBER: 5-digit zero-padded sequential number, unique per project
 Identifiers are permanent once uploaded — never reused, never renamed.
 Original filenames/donor folder structure are NOT part of the identifier;
@@ -41,7 +42,8 @@ Checks, per row:
 - `identifier` is unique in the CSV and matches the
   `COLLECTIONKEY-PROJECTID-NUMBER` scheme (lowercase, 5-digit zero-padded
   NUMBER), with the prefix registered in `projects_registry.json`
-- `mediatype`, `title`, `date` are present and non-empty
+- `mediatype`, `title` are present and non-empty; `date` is optional —
+  `upload` fills a blank `date` with `[n.d.]` rather than omitting it
 
 Prints a pass/fail report per row and exits non-zero if anything fails.
 Always run this before `upload`.
@@ -52,15 +54,15 @@ Always run this before `upload`.
 python ia_bulk.py upload items.csv --files-dir ./photos
 ```
 
-- Re-validates the CSV, then blocks on the safety rail (see below), before
-  any network call
+- Re-validates the CSV before any network call
 - Processes rows in chunks of 500 (Internet Archive's per-run batch limit)
 - Uploads each row via the `internetarchive` Python library (not the `ia`
   CLI), so per-row success/failure is captured directly
 - Writes a timestamped JSONL log to `logs/upload-<timestamp>.jsonl`, one
-  line per row: `{identifier, file, status, error, timestamp}`
-- `--resume-from <log>` skips identifiers already marked `"success"` in a
-  prior log, and still writes a complete log of its own
+  line per row: `{identifier, file, status, error, uploaded_as, live, timestamp}`
+- `--resume-from <log>` skips identifiers already marked `"success"` or
+  `"unchanged"` **in the same mode** (test vs. `--live`) as this run, and
+  still writes a complete log of its own
 
 ### `sync-metadata` — update metadata on already-uploaded items
 
@@ -70,15 +72,21 @@ python ia_bulk.py sync-metadata updates.csv
 
 Same chunking/logging/safety-rail behavior as `upload`, but only requires
 an `identifier` column plus whichever metadata columns changed — no
-`file`/`mediatype`/`title`/`date` needed.
+`file`/`mediatype`/`title`/`date` needed. A blank cell means "leave this
+field alone"; to actually delete an existing field on the IA item, put the
+literal value `REMOVE_TAG` in that cell (the same sentinel the official
+`ia` CLI's `--modify field:REMOVE_TAG` uses).
 
 ## Safety rail
 
-By default every command targets IA's `test_collection` sandbox, and
-`upload`/`sync-metadata` refuse to run unless every identifier in the CSV
-is prefixed `zztest-` (e.g. `zztest-astoriaphotos-00001`). Pass `--live` to
-target the real collection with real identifiers — do this deliberately,
-never as a default.
+By default every command targets IA's `test_collection` sandbox. The CSV's
+`identifier` column always holds the real, permanent identifier — never
+author a `zztest-` identifier by hand in the CSV. Instead, `upload` and
+`sync-metadata` automatically prepend `zztest-` to the real identifier for
+every network call (e.g. `lcps-astoriaphotos-00001` becomes
+`zztest-lcps-astoriaphotos-00001`) unless `--live` is passed. Pass `--live`
+to target the real collection with the real identifier as-is — do this
+deliberately, never as a default.
 
 ```bash
 python ia_bulk.py upload items.csv --live --collection lcps
