@@ -15,6 +15,8 @@ from ia_bulk import (
     RowValidation,
     check_live_safety,
     log_result,
+    build_parser,
+    main,
 )
 
 
@@ -729,3 +731,49 @@ def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, 
     exit_code = cmd_sync_metadata(args)
 
     assert exit_code == 0
+
+
+def test_build_parser_validate_subcommand_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["validate", "items.csv"])
+    assert args.command == "validate"
+    assert args.csv == "items.csv"
+    assert args.files_dir == "."
+    assert args.registry == "projects_registry.json"
+
+
+def test_build_parser_upload_subcommand_defaults_to_not_live():
+    parser = build_parser()
+    args = parser.parse_args(["upload", "items.csv"])
+    assert args.command == "upload"
+    assert args.live is False
+    assert args.collection == "lcps"
+    assert args.resume_from is None
+
+
+def test_build_parser_upload_subcommand_accepts_live_and_resume_from():
+    parser = build_parser()
+    args = parser.parse_args(["upload", "items.csv", "--live", "--resume-from", "logs/upload-x.jsonl"])
+    assert args.live is True
+    assert args.resume_from == "logs/upload-x.jsonl"
+
+
+def test_build_parser_sync_metadata_subcommand_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["sync-metadata", "updates.csv"])
+    assert args.command == "sync-metadata"
+    assert args.csv == "updates.csv"
+    assert args.live is False
+
+
+def test_main_dispatches_to_cmd_validate(monkeypatch, tmp_path):
+    csv_path = tmp_path / "items.csv"
+    csv_path.write_text("identifier,file,mediatype,title,date\n", encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr("ia_bulk.cmd_validate", lambda args: calls.append(args.csv) or 0)
+
+    exit_code = main(["validate", str(csv_path)])
+
+    assert exit_code == 0
+    assert calls == [str(csv_path)]

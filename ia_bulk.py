@@ -3,6 +3,7 @@ exported from the LCPS Google Sheet. See docs/ARCHITECTURE.md for the CSV
 schema and identifier scheme this script assumes."""
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
@@ -325,3 +326,53 @@ def cmd_sync_metadata(args) -> int:
 
     print(f"log written to {log_path}")
     return 1 if had_failure else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ia_bulk",
+        description="Validate, upload, and sync metadata for Internet Archive items from a CSV.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate", help="Validate a CSV without touching the network")
+    validate_parser.add_argument("csv", help="Path to the CSV to validate")
+    validate_parser.add_argument("--files-dir", default=".", help="Base directory the 'file' column is resolved against")
+    validate_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+
+    upload_parser = subparsers.add_parser("upload", help="Upload items from a validated CSV")
+    upload_parser.add_argument("csv", help="Path to the validated CSV")
+    upload_parser.add_argument("--files-dir", default=".", help="Base directory the 'file' column is resolved against")
+    upload_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    upload_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
+    upload_parser.add_argument("--collection", default="lcps", help="Collection to upload to when --live is passed")
+    upload_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
+    upload_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped")
+
+    sync_parser = subparsers.add_parser("sync-metadata", help="Update metadata on already-uploaded items")
+    sync_parser.add_argument("csv", help="Path to the CSV of identifier + changed metadata columns")
+    sync_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    sync_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
+    sync_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
+    sync_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "validate":
+        return cmd_validate(args)
+    if args.command == "upload":
+        return cmd_upload(args)
+    if args.command == "sync-metadata":
+        return cmd_sync_metadata(args)
+
+    parser.error(f"unknown command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
