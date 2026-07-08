@@ -24,7 +24,7 @@ Only requires an `identifier` column plus whichever metadata columns
 changed. Does not require `file`, `mediatype`, `title`, or `date`.
 
 ## Identifier scheme
-See `.claude/CLAUDE.md` for the full identifier scheme and project
+See `.claude/Claude.md` for the full identifier scheme and project
 registry rationale. `projects_registry.json` holds the known
 `collection_key` and `PROJECTID` values; `validate` and `sync-metadata`
 reject any identifier whose prefix isn't registered there.
@@ -56,3 +56,10 @@ so each log is a self-contained record of what happened by that point.
 Default target is `test_collection`; `--live` is required to target the
 real collection. When not `--live`, every identifier in the CSV must be
 prefixed `zztest-`, checked before any network call.
+
+## Known gaps
+`projects_registry.json`'s `collection_key` value (`lcps`) is a placeholder
+— confirm it against LCPS's actual IA collection identifier before any
+`--live` run. A wrong value here doesn't cause data loss (validation would
+just reject every real identifier), but it needs to be right before real
+uploads can pass `validate`.
