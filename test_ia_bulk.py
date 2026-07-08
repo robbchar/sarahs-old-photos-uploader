@@ -7,7 +7,15 @@ from pathlib import Path
 import internetarchive
 import pytest
 
-from ia_bulk import read_rows, load_registry, check_identifier, validate_rows, RowValidation, check_live_safety
+from ia_bulk import (
+    read_rows,
+    load_registry,
+    check_identifier,
+    validate_rows,
+    RowValidation,
+    check_live_safety,
+    log_result,
+)
 
 
 class FakeResponse:
@@ -477,3 +485,247 @@ def test_validate_identifiers_flags_bad_scheme():
     results = validate_identifiers(rows, registry=make_registry())
 
     assert not results[0].is_valid
+
+
+def test_cmd_upload_writes_success_log_and_returns_zero(tmp_path, monkeypatch):
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "zztest-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "zztest", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setattr("ia_bulk.upload_row", lambda row, collection, files_dir: None)
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(log_dir),
+        resume_from=None,
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 0
+    log_files = list(log_dir.glob("upload-*.jsonl"))
+    assert len(log_files) == 1
+    entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
+    assert entry["identifier"] == "zztest-astoriaphotos-00001"
+    assert entry["status"] == "success"
+
+
+def test_cmd_upload_fails_validation_before_touching_network(tmp_path, monkeypatch):
+    from ia_bulk import cmd_upload
+
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "zztest-astoriaphotos-00001",
+                "file": "missing.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "zztest", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+
+    upload_calls = []
+    monkeypatch.setattr("ia_bulk.upload_row", lambda row, collection, files_dir: upload_calls.append(row))
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 1
+    assert upload_calls == []
+
+
+def test_cmd_upload_blocks_real_identifiers_without_live_flag(tmp_path, monkeypatch):
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+
+    upload_calls = []
+    monkeypatch.setattr("ia_bulk.upload_row", lambda row, collection, files_dir: upload_calls.append(row))
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 1
+    assert upload_calls == []
+
+
+def test_cmd_upload_resume_from_skips_prior_successes(tmp_path, monkeypatch):
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    (tmp_path / "photo2.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "zztest-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            },
+            {
+                "identifier": "zztest-astoriaphotos-00002",
+                "file": "photo2.jpg",
+                "mediatype": "image",
+                "title": "Second photo",
+                "date": "1958",
+            },
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "zztest", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    prior_log = tmp_path / "prior.jsonl"
+    log_result(prior_log, "zztest-astoriaphotos-00001", "photo1.jpg", "success")
+
+    uploaded = []
+    monkeypatch.setattr(
+        "ia_bulk.upload_row", lambda row, collection, files_dir: uploaded.append(row["identifier"])
+    )
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(tmp_path / "logs"),
+        resume_from=str(prior_log),
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 0
+    assert uploaded == ["zztest-astoriaphotos-00002"]
+
+
+def test_cmd_sync_metadata_writes_success_log_and_returns_zero(tmp_path, monkeypatch):
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "zztest-astoriaphotos-00001", "title": "Corrected title"}])
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "zztest", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row: None)
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(registry_path),
+        live=False,
+        log_dir=str(log_dir),
+        resume_from=None,
+    )
+
+    exit_code = cmd_sync_metadata(args)
+
+    assert exit_code == 0
+    log_files = list(log_dir.glob("sync-metadata-*.jsonl"))
+    assert len(log_files) == 1
+    entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
+    assert entry["status"] == "success"
+
+
+def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, monkeypatch):
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "zztest-astoriaphotos-00001", "title": "Corrected title"}])
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "zztest", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row: None)
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(registry_path),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    exit_code = cmd_sync_metadata(args)
+
+    assert exit_code == 0

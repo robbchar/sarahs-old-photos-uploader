@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -236,3 +237,91 @@ def cmd_validate(args) -> int:
     results = validate_rows(rows, args.files_dir, registry)
     print(format_report(results))
     return 0 if all(r.is_valid for r in results) else 1
+
+
+def cmd_upload(args) -> int:
+    rows = read_rows(args.csv)
+    registry = load_registry(args.registry)
+
+    validation_results = validate_rows(rows, args.files_dir, registry)
+    if not all(r.is_valid for r in validation_results):
+        print(format_report(validation_results))
+        print(
+            "validation failed; run 'validate' and fix the errors above before uploading",
+            file=sys.stderr,
+        )
+        return 1
+
+    safety_errors = check_live_safety(rows, args.live)
+    if safety_errors:
+        for error in safety_errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    collection = args.collection if args.live else TEST_COLLECTION
+
+    skip_identifiers: set[str] = set()
+    if args.resume_from:
+        skip_identifiers = load_prior_successes(args.resume_from)
+
+    log_path = open_log(args.log_dir, "upload")
+    for identifier in skip_identifiers:
+        log_result(log_path, identifier, "", "success", error="carried over from resumed log")
+
+    had_failure = False
+    for chunk in chunk_rows(rows):
+        for row in chunk:
+            identifier = row["identifier"].strip()
+            if identifier in skip_identifiers:
+                continue
+            file_value = row["file"].strip()
+            try:
+                upload_row(row, collection, args.files_dir)
+                log_result(log_path, identifier, file_value, "success")
+            except Exception as exc:
+                had_failure = True
+                log_result(log_path, identifier, file_value, "failure", error=str(exc))
+
+    print(f"log written to {log_path}")
+    return 1 if had_failure else 0
+
+
+def cmd_sync_metadata(args) -> int:
+    rows = read_rows(args.csv)
+    registry = load_registry(args.registry)
+
+    validation_results = validate_identifiers(rows, registry)
+    if not all(r.is_valid for r in validation_results):
+        print(format_report(validation_results))
+        print("identifier validation failed; fix the errors above before syncing", file=sys.stderr)
+        return 1
+
+    safety_errors = check_live_safety(rows, args.live)
+    if safety_errors:
+        for error in safety_errors:
+            print(error, file=sys.stderr)
+        return 1
+
+    skip_identifiers: set[str] = set()
+    if args.resume_from:
+        skip_identifiers = load_prior_successes(args.resume_from)
+
+    log_path = open_log(args.log_dir, "sync-metadata")
+    for identifier in skip_identifiers:
+        log_result(log_path, identifier, "", "success", error="carried over from resumed log")
+
+    had_failure = False
+    for chunk in chunk_rows(rows):
+        for row in chunk:
+            identifier = row["identifier"].strip()
+            if identifier in skip_identifiers:
+                continue
+            try:
+                update_metadata_row(row)
+                log_result(log_path, identifier, "", "success")
+            except Exception as exc:
+                had_failure = True
+                log_result(log_path, identifier, "", "failure", error=str(exc))
+
+    print(f"log written to {log_path}")
+    return 1 if had_failure else 0
