@@ -48,11 +48,11 @@ class Suggestion:
 
 def suggest_standard_fields(field_names: Iterable[str]) -> list[Suggestion]:
     suggestions: list[Suggestion] = []
-    field_names_dict = dict.fromkeys(field_names)  # Preserves caller order, deduplicates
-    field_names_set = set(field_names)  # For O(1) membership checks
+    field_names_list = list(field_names)  # Materialize once to handle iterators
+    field_names_set = set(field_names_list)  # For O(1) membership checks
     suggested_standards: set[str] = set()
 
-    for field_name in field_names_dict:
+    for field_name in field_names_list:
         if field_name in IA_STANDARD_FIELDS:
             continue
 

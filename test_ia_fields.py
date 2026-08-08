@@ -95,3 +95,19 @@ def test_deterministic_ordering_names_first_field_in_caller_order():
     assert len(suggestions) == 1
     assert suggestions[0].field_name == "author"
     assert suggestions[0].standard == "creator"
+
+
+def test_collision_guard_works_with_generator_input():
+    """Collision guard must work regardless of whether input is list or generator."""
+    def gen_fields():
+        yield "title"
+        yield "title_alternate"
+
+    # List input: no suggestions (title_alternate would suggest title, but title is in input)
+    suggestions_from_list = suggest_standard_fields(["title", "title_alternate"])
+
+    # Generator input: must produce same result (materializing internally)
+    suggestions_from_gen = suggest_standard_fields(gen_fields())
+
+    assert suggestions_from_list == suggestions_from_gen
+    assert len(suggestions_from_list) == 0
