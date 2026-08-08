@@ -6,9 +6,18 @@ Google Sheet. Built for the Lower Columbia Preservation Society's (LCPS)
 Astoria historical photo archive, but kept generic to "a project" so a
 second LCPS project can reuse the same pipeline.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design —
-CSV schema, identifier scheme, chunking, logging/resume, and the safety
-rail.
+## Docs
+
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — runbook: how to run a batch,
+  pre-live checklist, resuming, batch limits. **Start here to run something.**
+- [`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) — turning the raw Sheet
+  export into the required schema, and the traps that don't fail loudly.
+- [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) — verified defects and gaps,
+  with reproductions.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — full design: CSV schema,
+  identifier scheme, chunking, logging/resume, safety rail.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — why it's built this way, including
+  designs that were tried and reversed.
 
 ## Identifier scheme
 `COLLECTIONKEY-PROJECTID-NUMBER` — all lowercase, hyphen-separated.
@@ -103,9 +112,14 @@ is validated automatically, and both default to placeholder values (see
 The raw CSV exported from the LCPS Google Sheet does not match the schema
 `validate`/`upload` require (capitalized headers, no `mediatype` column).
 It must be transformed by hand into the required lowercase schema before
-running this tool — see
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#known-gaps) for details.
-This is a deliberate manual step, not something this CLI automates.
+running this tool. This is a deliberate manual step, not something this
+CLI automates.
+
+**`validate` cannot catch a badly prepared CSV** — it inspects four columns
+and passes everything else through to IA untouched, so a malformed header
+row can shift every metadata field by one position and still report all rows
+passing. This is happening in the repo's own `data/upload.csv` today. Follow
+[`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) before any run.
 
 ## Tests
 

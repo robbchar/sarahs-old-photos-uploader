@@ -1,5 +1,11 @@
 # IA Bulk Upload CLI — Architecture
 
+This is the design reference. For running a batch see
+[`OPERATIONS.md`](OPERATIONS.md); for preparing the CSV see
+[`CSV-PREPARATION.md`](CSV-PREPARATION.md); for verified defects see
+[`KNOWN-ISSUES.md`](KNOWN-ISSUES.md); for rationale and reversed decisions see
+[`DECISIONS.md`](DECISIONS.md).
+
 ## Purpose
 Single-script CLI (`ia_bulk.py`) for validating, uploading, and syncing
 metadata for Internet Archive items from a CSV exported from the LCPS
@@ -115,6 +121,9 @@ test-prefixed identifiers. The CSV itself never needs to change between a
 test run and a `--live` run.
 
 ## Known gaps
+Verified defects with reproductions live in
+[`KNOWN-ISSUES.md`](KNOWN-ISSUES.md). The design-level gaps are below.
+
 `projects_registry.json`'s `collection_key` value (`lcps`) is a placeholder
 — confirm it against LCPS's actual IA collection identifier before any
 `--live` run. A wrong value here doesn't cause data loss (validation would
@@ -140,4 +149,13 @@ under "CSV schemas" above, and it has no `mediatype` column at all. Running
 The raw export must be transformed by hand into a CSV matching the exact
 required schema — including adding a `mediatype` column — before it's
 passed to this tool. That transformation is a deliberate, explicit step a
-human performs, not something this CLI does automatically.
+human performs, not something this CLI does automatically. See
+[`CSV-PREPARATION.md`](CSV-PREPARATION.md) for the procedure and the
+failure modes.
+
+Crucially, `validate` cannot backstop that transformation. It inspects only
+`identifier`/`file`/`mediatype`/`title` plus file existence; every other
+column is forwarded to IA unexamined. A CSV whose header row is malformed
+(e.g. an unquoted comma splitting one header into two) shifts every later
+column by a position and still passes validation — this is currently true of
+`data/upload.csv`. See [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1).
