@@ -80,3 +80,18 @@ def test_whole_word_substring_matching_prevents_false_positives():
     suggestions = suggest_standard_fields(["coverage_info"])
     assert len(suggestions) == 1
     assert suggestions[0].standard == "coverage"
+
+
+def test_deterministic_ordering_names_first_field_in_caller_order():
+    """When multiple fields map to one standard, suggestion names the first in caller order."""
+    # artist (1st) and author (2nd) both suggest creator; we should cite artist.
+    suggestions = suggest_standard_fields(["artist", "author"])
+    assert len(suggestions) == 1
+    assert suggestions[0].field_name == "artist"
+    assert suggestions[0].standard == "creator"
+
+    # Reverse order: author (1st) and artist (2nd); we should cite author.
+    suggestions = suggest_standard_fields(["author", "artist"])
+    assert len(suggestions) == 1
+    assert suggestions[0].field_name == "author"
+    assert suggestions[0].standard == "creator"
