@@ -18,6 +18,10 @@ import requests
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
+# Columns this script reads by exact lowercase name. A case variant of one of
+# these (a "Date" column from the raw Sheet export, say) is silently treated as
+# unrelated pass-through metadata, so check_header rejects it.
+KNOWN_LOWERCASE_COLUMNS = frozenset(REQUIRED_UPLOAD_COLUMNS) | {"date"}
 CHUNK_SIZE = 500
 TEST_COLLECTION = "test_collection"
 TEST_IDENTIFIER_PREFIX = "zztest-"
@@ -29,9 +33,22 @@ def chunk_rows(rows: list[dict], chunk_size: int = CHUNK_SIZE) -> "Iterator[list
         yield rows[start : start + chunk_size]
 
 
-def read_rows(csv_path: str | Path) -> list[dict[str, str]]:
+@dataclass
+class CsvData:
+    """Header and rows travel together because validating one without the
+    other is what let a malformed header slip through: check_row_shape can
+    only see a row/header field-count mismatch, and check_header can only see
+    the header text."""
+
+    fieldnames: list[str]
+    rows: list[dict[str, str]]
+
+
+def read_csv(csv_path: str | Path) -> CsvData:
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        return CsvData(fieldnames=list(reader.fieldnames or []), rows=rows)
 
 
 def load_registry(registry_path: str | Path) -> dict:
@@ -72,6 +89,77 @@ def check_identifier(
     return errors
 
 
+def check_header(fieldnames: list[str] | None) -> list[str]:
+    """Header text becomes the IA metadata field name verbatim, so a sloppy
+    header ships sloppy field names across the whole batch - and metadata on
+    an uploaded item is permanent enough to be worth failing loudly over.
+
+    These are rejected rather than silently cleaned up: stripping or
+    lowercasing a header on the user's behalf would quietly change which
+    field a value lands in, which is the very failure this check exists to
+    catch."""
+    if not fieldnames:
+        return ["CSV has no header row"]
+
+    errors: list[str] = []
+
+    for fieldname in fieldnames:
+        if fieldname != fieldname.strip():
+            errors.append(
+                f"column '{fieldname}' has leading/trailing whitespace - it would upload "
+                "as a metadata field name with that whitespace in it"
+            )
+
+    seen: set[str] = set()
+    for fieldname in fieldnames:
+        if fieldname in seen:
+            errors.append(f"duplicate column '{fieldname}'")
+        seen.add(fieldname)
+
+    for fieldname in fieldnames:
+        canonical = fieldname.strip().lower()
+        if canonical in KNOWN_LOWERCASE_COLUMNS and fieldname != canonical:
+            errors.append(
+                f"column '{fieldname}' must be lowercase '{canonical}' - as spelled it is "
+                "passed through as an unrelated metadata field"
+            )
+
+    return errors
+
+
+def check_row_shape(row: dict) -> list[str]:
+    """A CSV row must have exactly as many fields as the header. csv.DictReader
+    tolerates both mismatches silently, and both corrupt an upload:
+
+    - Surplus fields land in a list under the None restkey, which later blows
+      up upload_row's metadata comprehension with "'list' object has no
+      attribute 'strip'".
+    - Missing fields become None, which means the header and the data disagree
+      about column positions - so every value past the gap is uploaded under
+      the wrong field name. A header cell containing an unquoted comma
+      produces exactly this.
+
+    Note that an empty cell is "" and is perfectly fine; only None means the
+    field was absent from the row."""
+    errors: list[str] = []
+
+    surplus = row.get(None)
+    if surplus:
+        errors.append(
+            f"row has more fields than the header ({len(surplus)} extra: {surplus!r}) - "
+            "a header cell probably contains an unquoted comma"
+        )
+
+    missing = [key for key, value in row.items() if key is not None and value is None]
+    if missing:
+        errors.append(
+            f"row has fewer fields than the header (missing: {', '.join(missing)}) - "
+            "every value after the gap is attributed to the wrong column"
+        )
+
+    return errors
+
+
 @dataclass
 class RowValidation:
     row_number: int
@@ -105,7 +193,7 @@ def validate_rows(
             results.append(RowValidation(row_number=row_number, identifier=identifier))
             continue
 
-        errors: list[str] = []
+        errors: list[str] = check_row_shape(row)
 
         for column in REQUIRED_UPLOAD_COLUMNS:
             if not (row.get(column) or "").strip():
@@ -287,10 +375,20 @@ def validate_identifiers(
     return results
 
 
+def header_validation(fieldnames: list[str]) -> list[RowValidation]:
+    """Header problems are reported as row 1 - which is literally what the
+    header row is - so they flow through the same report and exit-code path
+    as row problems instead of needing a parallel channel."""
+    errors = check_header(fieldnames)
+    return [RowValidation(row_number=1, identifier="", errors=errors)] if errors else []
+
+
 def cmd_validate(args) -> int:
-    rows = read_rows(args.csv)
+    data = read_csv(args.csv)
     registry = load_registry(args.registry)
-    results = validate_rows(rows, args.files_dir, registry)
+    results = header_validation(data.fieldnames) + validate_rows(
+        data.rows, args.files_dir, registry
+    )
     print(format_report(results))
     return 0 if all(r.is_valid for r in results) else 1
 
@@ -335,16 +433,19 @@ def run_rows(
 
 
 def cmd_upload(args) -> int:
-    rows = read_rows(args.csv)
+    data = read_csv(args.csv)
+    rows = data.rows
     registry = load_registry(args.registry)
 
     skip_identifiers: set[str] = set()
     if args.resume_from:
         skip_identifiers = load_prior_successes(args.resume_from, args.live)
 
-    to_upload = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+    to_upload = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
-    validation_results = validate_rows(rows, args.files_dir, registry, frozenset(skip_identifiers))
+    validation_results = header_validation(data.fieldnames) + validate_rows(
+        rows, args.files_dir, registry, frozenset(skip_identifiers)
+    )
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
         print(
@@ -375,16 +476,19 @@ def cmd_upload(args) -> int:
 
 
 def cmd_sync_metadata(args) -> int:
-    rows = read_rows(args.csv)
+    data = read_csv(args.csv)
+    rows = data.rows
     registry = load_registry(args.registry)
 
     skip_identifiers: set[str] = set()
     if args.resume_from:
         skip_identifiers = load_prior_successes(args.resume_from, args.live)
 
-    to_sync = [row for row in rows if row["identifier"].strip() not in skip_identifiers]
+    to_sync = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
-    validation_results = validate_identifiers(rows, registry, frozenset(skip_identifiers))
+    validation_results = header_validation(data.fieldnames) + validate_identifiers(
+        rows, registry, frozenset(skip_identifiers)
+    )
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
         print("identifier validation failed; fix the errors above before syncing", file=sys.stderr)

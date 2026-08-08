@@ -6,7 +6,7 @@ import internetarchive
 import pytest
 
 from ia_bulk import (
-    read_rows,
+    read_csv,
     load_registry,
     check_identifier,
     validate_rows,
@@ -32,7 +32,7 @@ def write_csv(path, fieldnames, rows):
         writer.writerows(rows)
 
 
-def test_read_rows_returns_list_of_dicts(tmp_path):
+def test_read_csv_returns_list_of_dicts(tmp_path):
     csv_path = tmp_path / "items.csv"
     write_csv(
         csv_path,
@@ -48,7 +48,7 @@ def test_read_rows_returns_list_of_dicts(tmp_path):
         ],
     )
 
-    rows = read_rows(csv_path)
+    rows = read_csv(csv_path).rows
 
     assert rows == [
         {
@@ -241,6 +241,257 @@ def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers()
     assert results[0].row_number == 2
     assert not results[1].is_valid
     assert results[1].row_number == 3
+
+
+def valid_row(**overrides) -> dict:
+    row: dict = {
+        "identifier": "lcps-astoriaphotos-00001",
+        "file": "photo1.jpg",
+        "mediatype": "image",
+        "title": "First photo",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_validate_rows_flags_a_row_with_more_fields_than_the_header(tmp_path):
+    # csv.DictReader collects surplus fields under the None restkey. Left
+    # unchecked this crashes upload_row with "'list' object has no attribute
+    # 'strip'" partway through a run.
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    row = valid_row()
+    row[None] = ["surplus value"]
+
+    results = validate_rows([row], files_dir=tmp_path, registry=make_registry())
+
+    assert not results[0].is_valid
+    assert any("more fields than the header" in e for e in results[0].errors)
+
+
+def test_validate_rows_flags_a_row_with_fewer_fields_than_the_header(tmp_path):
+    # A short row means the header and the data disagree about column
+    # positions, so every value after the gap is attributed to the wrong
+    # field. This is what a comma inside an unquoted header produces.
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    rows = [valid_row(addresses=None)]
+
+    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+
+    assert not results[0].is_valid
+    assert any("fewer fields than the header" in e for e in results[0].errors)
+
+
+def test_validate_rows_names_the_column_a_short_row_is_missing(tmp_path):
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    rows = [valid_row(addresses=None)]
+
+    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+
+    assert any("addresses" in e for e in results[0].errors)
+
+
+def test_validate_rows_accepts_a_row_whose_trailing_cell_is_merely_empty(tmp_path):
+    # An empty cell is "" and is fine; only None means the field was absent.
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    rows = [valid_row(addresses="")]
+
+    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+
+    assert results[0].is_valid
+
+
+def test_check_header_accepts_a_clean_header():
+    from ia_bulk import check_header
+
+    assert check_header(["identifier", "file", "mediatype", "title", "date", "Theme"]) == []
+
+
+def test_check_header_rejects_a_column_with_surrounding_whitespace():
+    # "Place " uploads a metadata field literally named "Place ".
+    from ia_bulk import check_header
+
+    errors = check_header(["identifier", "file", "mediatype", "title", "Place "])
+
+    assert any("Place " in e and "whitespace" in e for e in errors)
+
+
+def test_check_header_rejects_duplicate_columns():
+    from ia_bulk import check_header
+
+    errors = check_header(["identifier", "file", "mediatype", "title", "Theme", "Theme"])
+
+    assert any("duplicate" in e and "Theme" in e for e in errors)
+
+
+def test_check_header_rejects_a_capitalized_variant_of_a_known_column():
+    # A "Date" column is passed through as an arbitrary field while the
+    # lowercase "date" upload_row reads stays empty, so the item gets both
+    # Date=1958 and date=[n.d.].
+    from ia_bulk import check_header
+
+    errors = check_header(["identifier", "file", "mediatype", "title", "Date"])
+
+    assert any("Date" in e and "date" in e for e in errors)
+
+
+def test_check_header_rejects_an_empty_header():
+    from ia_bulk import check_header
+
+    assert check_header([]) != []
+
+
+def test_check_header_does_not_object_to_unknown_columns():
+    from ia_bulk import check_header
+
+    assert check_header(["identifier", "file", "mediatype", "title", "Notes (LCPS Internal)"]) == []
+
+
+def test_read_csv_returns_fieldnames_alongside_rows(tmp_path):
+    from ia_bulk import read_csv
+
+    csv_path = tmp_path / "items.csv"
+    csv_path.write_text(
+        "identifier,file,mediatype,title\nlcps-astoriaphotos-00001,a.jpg,image,First\n",
+        encoding="utf-8",
+    )
+
+    data = read_csv(csv_path)
+
+    assert data.fieldnames == ["identifier", "file", "mediatype", "title"]
+    assert data.rows == [
+        {
+            "identifier": "lcps-astoriaphotos-00001",
+            "file": "a.jpg",
+            "mediatype": "image",
+            "title": "First",
+        }
+    ]
+
+
+def write_raw_csv(path, text):
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_cmd_validate_fails_on_a_header_with_a_capitalized_known_column(tmp_path, capsys):
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    csv_path = write_raw_csv(
+        tmp_path / "items.csv",
+        "identifier,file,mediatype,title,Date\nlcps-astoriaphotos-00001,a.jpg,image,First,1958\n",
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    from ia_bulk import cmd_validate
+
+    exit_code = cmd_validate(
+        Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+    )
+
+    assert exit_code == 1
+    assert "must be lowercase 'date'" in capsys.readouterr().out
+
+
+def test_cmd_validate_fails_on_an_unquoted_comma_in_the_header(tmp_path, capsys):
+    # The real failure from data/upload.csv: "Names (Last, First M.)" splits
+    # into two header cells, so the header is one field longer than the row
+    # and every later column is attributed to the wrong field.
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    csv_path = write_raw_csv(
+        tmp_path / "items.csv",
+        "identifier,file,mediatype,title,Names (Last, First M.),addresses\n"
+        "lcps-astoriaphotos-00001,a.jpg,image,First,,600 Marine Dr.\n",
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    from ia_bulk import cmd_validate
+
+    exit_code = cmd_validate(
+        Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+    )
+
+    assert exit_code == 1
+    assert "fewer fields than the header" in capsys.readouterr().out
+
+
+def test_cmd_upload_refuses_a_bad_header_before_touching_the_network(tmp_path, monkeypatch):
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    csv_path = write_raw_csv(
+        tmp_path / "items.csv",
+        "identifier,file,mediatype,title,Date\nlcps-astoriaphotos-00001,a.jpg,image,First,1958\n",
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    # run_rows catches broad Exception, so a raising fake would be swallowed
+    # and logged as a row failure - recording the call is the only way to
+    # prove the network was never reached.
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(internetarchive, "upload", record_call)
+
+    from ia_bulk import cmd_upload
+
+    exit_code = cmd_upload(
+        Namespace(
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+            live=False,
+            collection="lcps",
+            log_dir=str(tmp_path / "logs"),
+            resume_from=None,
+        )
+    )
+
+    assert exit_code == 1
+    assert calls == []
+
+
+def test_cmd_sync_metadata_refuses_a_bad_header_before_touching_the_network(tmp_path, monkeypatch):
+    csv_path = write_raw_csv(
+        tmp_path / "updates.csv",
+        "identifier,Title\nlcps-astoriaphotos-00001,Renamed\n",
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(args)
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", record_call)
+
+    from ia_bulk import cmd_sync_metadata
+
+    exit_code = cmd_sync_metadata(
+        Namespace(
+            csv=str(csv_path),
+            registry=str(registry_path),
+            live=False,
+            log_dir=str(tmp_path / "logs"),
+            resume_from=None,
+        )
+    )
+
+    assert exit_code == 1
+    assert calls == []
+
+
+def test_format_report_attributes_header_errors_to_row_1():
+    from ia_bulk import format_report
+
+    report = format_report([RowValidation(row_number=1, identifier="", errors=["CSV has no header row"])])
+
+    assert "row 1" in report
+    assert "CSV has no header row" in report
 
 
 def test_format_report_shows_pass_and_fail_with_summary():
