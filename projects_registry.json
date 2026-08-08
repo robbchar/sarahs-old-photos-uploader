@@ -2,7 +2,14 @@
   "collection_key": "lcps",
   "projects": {
     "sarahsoldphotos": {
-      "description": "Sarah's donated collection of historical Astoria photos"
+      "description": "Sarah's donated collection of historical Astoria photos",
+      "mediatype": "image",
+      "ia_collection": "CONFIRM_WITH_LCPS",
+      "sheet_id": "REPLACE_WITH_REAL_SHEET_ID",
+      "test_sheet_id": "REPLACE_WITH_TEST_SHEET_ID",
+      "sheet_tab": "Sheet1",
+      "files_dir": "./data",
+      "file_template": "{file_on_array}"
     }
   }
 }
