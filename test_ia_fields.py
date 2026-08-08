@@ -26,3 +26,57 @@ def test_suggests_standard_field_by_curated_synonym():
 
 def test_no_suggestion_when_nothing_resembles_a_standard_field():
     assert suggest_standard_fields(["architectura_style", "theme"]) == []
+
+
+# Regression tests for safety properties
+
+
+def test_no_suggestion_targets_pipeline_owned_fields():
+    """Fields the pipeline generates itself should never be suggested as rename targets."""
+    # collection_notes could suggest "collection", but collection is pipeline-owned.
+    suggestions = suggest_standard_fields(["collection_notes"])
+    assert len(suggestions) == 0
+
+    # identifier_bib could suggest "identifier", but identifier is pipeline-owned.
+    suggestions = suggest_standard_fields(["identifier_bib"])
+    assert len(suggestions) == 0
+
+    # mediatype_note could suggest "mediatype", but mediatype is pipeline-owned.
+    suggestions = suggest_standard_fields(["mediatype_note"])
+    assert len(suggestions) == 0
+
+
+def test_no_suggestion_targets_field_already_in_input():
+    """Never suggest renaming to a field that already exists in the input."""
+    # title_alternate could suggest "title", but title is already in the input.
+    suggestions = suggest_standard_fields(["title", "title_alternate"])
+    assert len(suggestions) == 0
+
+    # coverage_detail could suggest "coverage", but coverage is already in the input.
+    suggestions = suggest_standard_fields(["coverage", "coverage_detail"])
+    assert len(suggestions) == 0
+
+
+def test_multiple_inputs_to_one_standard_yield_one_suggestion():
+    """When two inputs map to the same standard, emit at most one suggestion."""
+    # Both photographer and photographer_studio are synonyms for creator.
+    suggestions = suggest_standard_fields(["photographer", "photographer_studio"])
+    assert len(suggestions) == 1
+    assert suggestions[0].standard == "creator"
+
+    # Both artist and author are synonyms for creator.
+    suggestions = suggest_standard_fields(["artist", "author"])
+    assert len(suggestions) == 1
+    assert suggestions[0].standard == "creator"
+
+
+def test_whole_word_substring_matching_prevents_false_positives():
+    """Substring matching uses word boundaries (split on _) to avoid false positives."""
+    # "discover" contains "cover" but "coverage" is split on _, so no match.
+    suggestions = suggest_standard_fields(["discover"])
+    assert len(suggestions) == 0
+
+    # But "coverage_info" does contain "coverage" as a word.
+    suggestions = suggest_standard_fields(["coverage_info"])
+    assert len(suggestions) == 1
+    assert suggestions[0].standard == "coverage"

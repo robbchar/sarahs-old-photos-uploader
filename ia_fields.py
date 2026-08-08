@@ -6,8 +6,8 @@ of truth only the maintainer could see. Nothing here ever rewrites a field:
 it produces advice a human acts on by renaming a column in the Sheet."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 # From https://archive.org/developers/metadata-schema/ - the subset a photo
 # archive realistically uses. Extend as needed; a missing entry only costs a
@@ -19,6 +19,12 @@ IA_STANDARD_FIELDS = frozenset(
         "notes", "publisher", "rights", "source", "subject", "title", "volume",
     }
 )
+
+# Fields that the upload pipeline generates itself: never suggest renaming a
+# column to these names, since a column bearing that name has its values silently
+# discarded (or overwritten) on upload. ia_bulk.py sets collection unconditionally;
+# identifier and mediatype are derived, not sourced from the Sheet.
+PIPELINE_OWNED_FIELDS = frozenset({"identifier", "mediatype", "collection"})
 
 # Curated equivalences for cases substring matching cannot see.
 SYNONYMS = {
@@ -42,7 +48,10 @@ class Suggestion:
 
 def suggest_standard_fields(field_names: Iterable[str]) -> list[Suggestion]:
     suggestions: list[Suggestion] = []
-    for field_name in field_names:
+    field_names_set = set(field_names)
+    suggested_standards: set[str] = set()
+
+    for field_name in field_names_set:
         if field_name in IA_STANDARD_FIELDS:
             continue
 
@@ -59,13 +68,26 @@ def suggest_standard_fields(field_names: Iterable[str]) -> list[Suggestion]:
         if standard is None:
             continue
 
+        # Skip if this is a pipeline-owned field (values would be silently discarded).
+        if standard in PIPELINE_OWNED_FIELDS:
+            continue
+
+        # Skip if this target already appears in the input.
+        if standard in field_names_set:
+            continue
+
+        # Skip if we've already suggested this standard from another field.
+        if standard in suggested_standards:
+            continue
+
+        suggested_standards.add(standard)
         suggestions.append(
             Suggestion(
                 field_name=field_name,
                 standard=standard,
                 reason=(
-                    f"standard field; renaming the column to `{standard.title()}` "
-                    "makes it searchable on archive.org"
+                    f"`{standard}` is a standard IA field — rename only if this "
+                    "column means the same thing"
                 ),
             )
         )
