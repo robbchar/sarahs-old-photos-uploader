@@ -1,6 +1,13 @@
 import pytest
 
-from column_map import normalize_header, build_column_map, grid_to_rows, is_held_back
+from column_map import (
+    normalize_header,
+    build_column_map,
+    grid_to_rows,
+    is_held_back,
+    check_column_map,
+    check_grid_shape,
+)
 
 
 @pytest.mark.parametrize(
@@ -76,3 +83,74 @@ def test_grid_to_rows_on_empty_grid():
 
     assert rows == []
     assert column_map.headers == []
+
+
+def test_check_column_map_collision_different_spellings():
+    """Two headers that normalize to the same field name should be detected."""
+    column_map = build_column_map(["Genre / Form", "Genre_ Form"])
+
+    errors = check_column_map(column_map)
+
+    assert len(errors) == 1
+    assert "Genre / Form" in errors[0] and "Genre_ Form" in errors[0]
+    assert "genre_form" in errors[0]
+
+
+def test_check_column_map_collision_identical_headers():
+    """Identical headers should be detected as a collision."""
+    column_map = build_column_map(["Title", "Title"])
+
+    errors = check_column_map(column_map)
+
+    assert len(errors) == 1
+    assert "Title" in errors[0]
+    assert "title" in errors[0]
+
+
+def test_check_column_map_empty_field_name():
+    """Headers that normalize to empty strings should be detected."""
+    column_map = build_column_map(["!!!", "Title"])
+
+    errors = check_column_map(column_map)
+
+    assert len(errors) == 1
+    assert "!!!" in errors[0]
+    assert "empty" in errors[0].lower()
+
+
+def test_check_column_map_clean():
+    """A clean ColumnMap with no collisions should produce no errors."""
+    column_map = build_column_map(["Title", "Date", "Genre / Form"])
+
+    errors = check_column_map(column_map)
+
+    assert errors == []
+
+
+def test_check_grid_shape_long_row():
+    """A data row with more cells than the header should be detected."""
+    grid = [["Title", "Date"], ["Alderbrook Hall", "1958", "stray", "extra"]]
+
+    errors = check_grid_shape(grid)
+
+    assert len(errors) == 1
+    assert "row 2" in errors[0]
+    assert "2 more field(s)" in errors[0]
+
+
+def test_check_grid_shape_short_row_no_error():
+    """Short rows (Sheets API behavior) should not produce an error."""
+    grid = [["Title", "Date"], ["Alderbrook Hall"]]
+
+    errors = check_grid_shape(grid)
+
+    assert errors == []
+
+
+def test_check_grid_shape_empty_grid():
+    """An empty grid should produce no errors."""
+    grid: list[list[str]] = []
+
+    errors = check_grid_shape(grid)
+
+    assert errors == []
