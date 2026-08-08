@@ -158,18 +158,60 @@ in [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md) with reproduction details:
 
 - Chunking has no real pacing or checkpoint behavior
 - `--files-dir` does not constrain path resolution
-- `--collection` keeps its `"lcps"` default and stays unvalidated (documented
-  as a warning rather than changed)
+- ~~`--collection` keeps its `"lcps"` default and stays unvalidated~~
+  **Reversed 2026-08-08** — see "Technical configuration lives in the registry"
+  below
 - Ragged-CSV handling relies on a broad `except` in `run_rows`
+
+## Technical configuration lives in the registry, not the command line
+
+*Decided 2026-08-08, reversing the "accepted, not overlooked" item above.*
+
+The target IA collection, the files directory, and the template that builds a
+row's file path all move into the per-project block in
+`projects_registry.json`. The command line keeps only what genuinely varies per
+run: `--project`, `--live`, `--limit`.
+
+The reversal is specifically about `--collection`. Leaving it as an unvalidated
+flag defaulting to `"lcps"` was defensible when the registry was barely used;
+it is not defensible once the tool already reads a per-project registry block
+to find the Sheet. A wrong `--collection` on a `--live` run pushes real files
+into the wrong collection and reports success — and unlike `collection_key`,
+nothing catches it. As a registry value it is confirmed once, in version
+control, per project, instead of retyped correctly on every run forever.
+
+The same reasoning puts `files_dir` and `file_template` there. A row's file
+path is assembled from a root plus one or more Sheet columns, which is
+plumbing; the people maintaining the Sheet should never have to think about it.
+
+## `identifier-bib` and `mediatype` are generated, not columns
+
+*Decided 2026-08-08.*
+
+`identifier-bib` records the source path of the uploaded file, which is exactly
+what `file_template` computes — so the tool generates it rather than reading a
+column that would restate it. `mediatype` is a per-project constant in the
+registry.
+
+This is not only tidiness. The surviving test item
+`zztest-lcps-sarahsoldphotos-00005` carries the field **`indentifier-bib`**,
+misspelled, permanently. A header typo ships once per batch; a generated field
+name cannot.
 
 ## Still open
 
-- `collection_key` and `--collection` have never been confirmed against LCPS's
-  real IA collection. No `--live` run has ever been made.
-- How a run establishes the next free `NUMBER` — and how it stays correct when
-  a run is interrupted partway — is undecided. See the identifier section above.
-- Which Google credential type the Sheet integration uses is undecided. An API
-  key is ruled out: Sheets API keys are read-only and only reach publicly
-  shared sheets, and the identifier write-back needs write access.
+- `collection_key` and the real IA collection have never been confirmed against
+  LCPS. No `--live` run has ever been made. This is now the main live blocker.
+- Whether IA emits a distinguishable signal at its 5,000/day cap, as opposed to
+  generic throttling. `--limit` covers the case where it does not.
+- ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:
+  reserve in the Sheet before uploading, and track completion in an
+  `ia_uploaded` column so an interrupted run is recoverable.
+- ~~Which Google credential type the Sheet integration uses~~ **Settled
+  2026-08-08**: OAuth with the **Internal** user type, which requires the Cloud
+  project to sit inside the lcpsociety.org organization and the operator to
+  hold an `@lcpsociety.org` account. An API key was ruled out (read-only, and
+  only reaches publicly shared sheets); a service account was ruled out because
+  it loses per-person attribution in the Sheet's edit history.
 - Automating the Sheet → CSV *export* was raised and deferred pending maintainer
   input. **Superseded 2026-08-08** by reading the Sheet directly (above).
