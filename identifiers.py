@@ -2,8 +2,9 @@
 state from the Sheet's two tool-owned columns.
 
 Identifiers are permanent once uploaded, so this module never reuses a number:
-gaps left by a crashed run stay gaps. See docs/DECISIONS.md, "Identifiers are
-minted by upload and written back to the Sheet"."""
+gaps left by a crashed run stay gaps. Identifiers are bounded by NUMBER_WIDTH (5 digits, max 99999);
+exceeding this raises ValueError to prevent silent wrapping into duplicate identifiers.
+See docs/DECISIONS.md, "Identifiers are minted by upload and written back to the Sheet"."""
 from __future__ import annotations
 
 import re
@@ -15,6 +16,12 @@ _IDENTIFIER_RE = re.compile(r"^(?P<collection>[a-z0-9]+)-(?P<project>[a-z0-9]+)-
 
 
 def format_identifier(collection_key: str, project_id: str, number: int) -> str:
+    max_number = 10 ** NUMBER_WIDTH - 1
+    if number > max_number:
+        raise ValueError(
+            f"Identifier number {number} exceeds {NUMBER_WIDTH}-digit maximum ({max_number}). "
+            f"Project has exhausted its identifier space; scheme requires widening."
+        )
     return f"{collection_key}-{project_id}-{number:0{NUMBER_WIDTH}d}"
 
 

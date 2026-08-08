@@ -1,3 +1,5 @@
+import pytest
+
 from identifiers import (
     RowState,
     classify_row,
@@ -96,3 +98,26 @@ def test_classify_row_done():
     row = {"identifier": "lcps-sarahsoldphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}
 
     assert classify_row(row) is RowState.DONE
+
+
+def test_format_identifier_succeeds_at_max_5_digit_boundary():
+    """Minting exactly at the 5-digit maximum (99999) must succeed; it is the
+    last valid identifier before the space is exhausted."""
+    assert format_identifier("lcps", "sarahsoldphotos", 99999) == "lcps-sarahsoldphotos-99999"
+
+
+def test_format_identifier_raises_when_exceeding_5_digit_limit():
+    """Minting past the 5-digit maximum (100000) raises ValueError to prevent
+    silent wrapping into a duplicate identifier that parse_number cannot read."""
+    with pytest.raises(ValueError, match="exceeds 5-digit maximum"):
+        format_identifier("lcps", "sarahsoldphotos", 100000)
+
+
+def test_next_identifiers_raises_when_maximum_exhausted():
+    """When the highest existing identifier is 99999 (the maximum for 5 digits),
+    attempting to mint any more must raise rather than silently produce an
+    unparseable identifier that rounds back to a duplicate."""
+    existing = ["lcps-sarahsoldphotos-99999"]
+
+    with pytest.raises(ValueError, match="exceeds 5-digit maximum"):
+        next_identifiers(existing, "lcps", "sarahsoldphotos", 1)
