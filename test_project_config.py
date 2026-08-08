@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from project_config import ConfigError, load_project_config
@@ -44,7 +47,7 @@ def test_unknown_project_is_rejected_by_name():
 def test_missing_required_key_names_the_key_and_the_project():
     registry = {"collection_key": "lcps", "projects": {"p": {"mediatype": "image"}}}
 
-    with pytest.raises(ConfigError, match="sheet_id"):
+    with pytest.raises(ConfigError, match="'p'.*sheet_id"):
         load_project_config(registry, "p")
 
 
@@ -64,3 +67,70 @@ def test_identical_sheet_ids_are_rejected():
 
     with pytest.raises(ConfigError, match="must differ"):
         load_project_config(registry, "p")
+
+
+def test_missing_collection_key_is_rejected():
+    """collection_key is a top-level registry field, not in a project block.
+    Missing it should raise ConfigError, not KeyError."""
+    registry = {"projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]}}
+
+    with pytest.raises(ConfigError, match="collection_key"):
+        load_project_config(registry, "p")
+
+
+def test_non_string_collection_key_is_rejected():
+    """collection_key must be a string. Non-string values should be caught
+    as ConfigError, not silently accepted."""
+    registry = {
+        "collection_key": 123,
+        "projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]},
+    }
+
+    with pytest.raises(ConfigError, match="collection_key.*string"):
+        load_project_config(registry, "p")
+
+
+def test_empty_string_collection_key_is_rejected():
+    """collection_key must be a non-empty string."""
+    registry = {
+        "collection_key": "   ",
+        "projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]},
+    }
+
+    with pytest.raises(ConfigError, match="collection_key"):
+        load_project_config(registry, "p")
+
+
+def test_non_string_project_value_is_rejected():
+    """Project block values must be strings. Non-string values should raise
+    ConfigError before reaching .strip()."""
+    registry = {
+        "collection_key": "lcps",
+        "projects": {
+            "p": {
+                **REGISTRY["projects"]["sarahsoldphotos"],
+                "mediatype": 42,
+            }
+        },
+    }
+
+    with pytest.raises(ConfigError, match="mediatype.*string"):
+        load_project_config(registry, "p")
+
+
+def test_shipped_registry_json_loads_and_has_placeholders():
+    """Ensure the real projects_registry.json on disk loads successfully
+    and contains the expected placeholder values. This test pins the registry
+    and REQUIRED_KEYS together so changes to one are caught if they drift
+    from the other."""
+    registry_path = Path(__file__).parent / "projects_registry.json"
+    with open(registry_path) as f:
+        registry = json.load(f)
+
+    # Should load without error
+    config = load_project_config(registry, "sarahsoldphotos")
+
+    # Verify placeholder values are intact
+    assert config.ia_collection == "CONFIRM_WITH_LCPS"
+    assert config.sheet_id == "REPLACE_WITH_REAL_SHEET_ID"
+    assert config.test_sheet_id == "REPLACE_WITH_TEST_SHEET_ID"

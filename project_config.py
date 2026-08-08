@@ -41,12 +41,33 @@ class ProjectConfig:
 
 
 def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
+    # Validate collection_key at registry root
+    if "collection_key" not in registry:
+        raise ConfigError("registry is missing required top-level key: collection_key")
+
+    collection_key = registry.get("collection_key", "")
+    if not isinstance(collection_key, str) or not collection_key.strip():
+        raise ConfigError(
+            f"registry collection_key must be a non-empty string, "
+            f"got {type(collection_key).__name__!r}"
+        )
+
     projects = registry.get("projects", {})
     if project_id not in projects:
         known = ", ".join(sorted(projects)) or "(none registered)"
         raise ConfigError(f"unknown project '{project_id}'; registry knows: {known}")
 
     block = projects[project_id]
+
+    # Validate all values are strings before processing
+    for key in REQUIRED_KEYS:
+        value = block.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(
+                f"project '{project_id}': {key} must be a string, "
+                f"got {type(value).__name__!r}"
+            )
+
     missing = [key for key in REQUIRED_KEYS if not (block.get(key) or "").strip()]
     if missing:
         raise ConfigError(
@@ -61,7 +82,7 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
 
     return ProjectConfig(
         project_id=project_id,
-        collection_key=registry["collection_key"],
+        collection_key=collection_key.strip(),
         mediatype=block["mediatype"].strip(),
         ia_collection=block["ia_collection"].strip(),
         sheet_id=block["sheet_id"].strip(),
