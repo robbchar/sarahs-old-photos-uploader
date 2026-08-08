@@ -15,6 +15,8 @@ from column_map import normalize_header
         ("Place ", "place"),
         ("  Date  ", "date"),
         ("File on Array", "file_on_array"),
+        ("Genre_ Form", "genre_form"),
+        ("Co-op Notes", "co-op_notes"),
     ],
 )
 def test_normalize_header(raw, expected):

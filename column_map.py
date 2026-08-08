@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import re
 
+# Hyphens and underscores are preserved because Internet Archive field names use them
+# (e.g., "identifier-bib"). Other punctuation is removed.
 _PUNCTUATION = re.compile(r"[^a-z0-9\s_-]")
 _WHITESPACE = re.compile(r"\s+")
 _REPEATED_UNDERSCORE = re.compile(r"_+")
