@@ -46,7 +46,16 @@ account (`ia configure`) before running `upload` or `sync-metadata`.
 python ia_bulk.py validate items.csv --files-dir ./photos --registry projects_registry.json
 ```
 
-Checks, per row:
+Checks the header once:
+- no column with leading/trailing whitespace, and no duplicate columns —
+  header text becomes the IA metadata field name verbatim
+- no case variant of a column the script reads by name (`identifier`, `file`,
+  `mediatype`, `title`, `date`) — a `Date` column is silently treated as
+  unrelated pass-through metadata while `date` stays empty
+
+Then, per row:
+- the row has exactly as many fields as the header — a mismatch means the two
+  disagree about column positions, so values upload under the wrong field names
 - `file` exists on disk (resolved against `--files-dir`)
 - `identifier` is unique in the CSV and matches the
   `COLLECTIONKEY-PROJECTID-NUMBER` scheme (lowercase, 5-digit zero-padded
@@ -54,8 +63,8 @@ Checks, per row:
 - `mediatype`, `title` are present and non-empty; `date` is optional —
   `upload` fills a blank `date` with `[n.d.]` rather than omitting it
 
-Prints a pass/fail report per row and exits non-zero if anything fails.
-Always run this before `upload`.
+Prints a pass/fail report per row (header problems are reported as row 1) and
+exits non-zero if anything fails. Always run this before `upload`.
 
 ### `upload` — upload a validated CSV
 
@@ -115,11 +124,12 @@ It must be transformed by hand into the required lowercase schema before
 running this tool. This is a deliberate manual step, not something this
 CLI automates.
 
-**`validate` cannot catch a badly prepared CSV** — it inspects four columns
-and passes everything else through to IA untouched, so a malformed header
-row can shift every metadata field by one position and still report all rows
-passing. This is happening in the repo's own `data/upload.csv` today. Follow
-[`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) before any run.
+`validate` catches the structural failures this creates — ragged rows, stray
+whitespace and duplicates in the header, and case variants of the columns the
+script reads by name. It cannot catch a *misspelled* header or a value entered
+in the wrong Sheet column, since neither is distinguishable from an intentional
+one. Follow [`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) and eyeball a
+test upload before going live.
 
 ## Tests
 

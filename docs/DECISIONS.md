@@ -80,16 +80,70 @@ which avoids re-triggering IA's `derive` task — the expensive part of an
 upload. `verbose=True` surfaces the library's own per-file byte-progress bar,
 so a long run is never silently quiet.
 
-## Identifiers are assigned in the Sheet, never generated here
+## Identifiers are minted by `upload` and written back to the Sheet
 
-The tool validates identifiers; it never mints them. Identifiers are permanent
-once uploaded, so the numbering authority lives in one place — the Sheet — and
-a script re-run can never invent a colliding or off-by-one number. The registry
-(`projects_registry.json`) exists so the prefix half of an identifier can be
-checked against a known list rather than a regex alone.
+*Reversed 2026-08-08, before implementation. This section previously recorded
+the opposite — "identifiers are assigned in the Sheet, never generated here" —
+which did not match how the collection is actually maintained.*
 
-Original filenames and donor folder structure are deliberately not part of the
-identifier; they belong in `identifier-bib`.
+An identifier's `COLLECTIONKEY` and `PROJECTID` halves come from configuration
+(`projects_registry.json`). The `NUMBER` half is assigned by `upload` as it
+goes and written back to the Sheet, so the Sheet ends up holding the permanent
+identifier without anyone typing one by hand.
+
+The batch is uploaded in chunks at different times rather than in one run, so
+every run has to establish where the previous one stopped before it can mint
+anything. The starting point comes from the Sheet at the start of the run — the
+highest existing `NUMBER` for that `PROJECTID`, plus one. Making that reliable
+across interrupted and partial runs is not settled yet and is the open question
+in this design.
+
+Unchanged by the reversal: identifiers are permanent once uploaded, never
+reused and never renamed, which is why minting is worth being careful about at
+all. The registry still exists so the prefix half can be checked against a
+known list rather than a regex alone. Original filenames and donor folder
+structure are still deliberately not part of the identifier; they belong in
+`identifier-bib`.
+
+## The Sheet is read live; the CSV becomes the offline path
+
+*Decided 2026-08-08, before implementation.*
+
+`validate` and `upload` read rows from the Google Sheet over the API rather
+than from a hand-exported CSV. Two reasons, in order of weight.
+
+`upload` has to hold a Sheet connection anyway in order to write identifiers
+back. Reading from the same place removes the "which copy is current" question
+outright instead of adding a dependency to answer it.
+
+And the export step was itself a source of defects. The traps documented in
+[`CSV-PREPARATION.md`](CSV-PREPARATION.md) — above all a comma inside an
+unquoted header splitting one column into two and shifting every field after it
+— are artifacts of CSV *parsing*, not of the data. The Sheets API returns cells
+as a grid, so a header containing a comma is just a header containing a comma.
+That failure mode is structurally absent on this path.
+
+The CSV path stays for offline and dry-run work and keeps its own header
+validation, since the traps are real for anything hand-prepared.
+
+## A malformed header is rejected, never auto-corrected
+
+*Decided 2026-08-08, when `validate` was hardened.*
+
+`check_header()` could strip stray whitespace and lowercase a `Date` column
+instead of failing. It deliberately does not.
+
+Auto-correcting means quietly deciding which field a value lands in — and
+landing values in the wrong field is the exact failure the check exists to
+catch. A tool that guesses right nine times teaches you to stop reading its
+output before the tenth. Since IA metadata is permanent, the cheap outcome is a
+failed `validate` and a two-minute CSV edit; the expensive one is a silent
+correction that was wrong across 10,000 items.
+
+The same reasoning is why `check_row_shape()` treats a field-count mismatch as
+an error rather than padding the row: `csv.DictReader` will happily fill the gap
+with `None`, but the gap means the header and the data disagree about column
+positions, and nothing can tell you which one is right.
 
 ## Generic to "a project", not hardcoded to photos
 
@@ -112,6 +166,10 @@ in [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md) with reproduction details:
 
 - `collection_key` and `--collection` have never been confirmed against LCPS's
   real IA collection. No `--live` run has ever been made.
+- How a run establishes the next free `NUMBER` — and how it stays correct when
+  a run is interrupted partway — is undecided. See the identifier section above.
+- Which Google credential type the Sheet integration uses is undecided. An API
+  key is ruled out: Sheets API keys are read-only and only reach publicly
+  shared sheets, and the identifier write-back needs write access.
 - Automating the Sheet → CSV *export* was raised and deferred pending maintainer
-  input. It would not remove the manual schema check in
-  [`CSV-PREPARATION.md`](CSV-PREPARATION.md).
+  input. **Superseded 2026-08-08** by reading the Sheet directly (above).

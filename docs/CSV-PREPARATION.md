@@ -24,9 +24,11 @@ header text as the field name. `date` is optional; a blank one becomes `[n.d.]`.
 
 ## Traps in the real export
 
-These are not hypothetical. All four are present in `data/upload.csv`, the
-prepared file currently in the repo, and were confirmed by running the tool
-against it.
+These are not hypothetical. All four were present in `data/upload.csv`, the
+prepared file in the repo, and were confirmed by running the tool against it.
+They have since been corrected there, and **`validate` now rejects traps 1–3
+rather than passing them through** — but the export still arrives in this
+shape, so you will meet them again on the next batch.
 
 ### 1. An unquoted comma in a header silently shifts every later column
 
@@ -41,23 +43,17 @@ columns — `Names (Last` and ` First M.)`. The header row ends up one field
 longer than every data row, and **every column from that point on is
 mislabeled by one position.**
 
-In `data/upload.csv` this means the value `Photographs` (a Genre / Form value)
-is uploaded as `Description`, and the address `600 Marine Dr. (1960)` is
-uploaded as `Construction Date`.
+In `data/upload.csv` this meant `Photographs` (a Genre / Form value) uploaded
+as `Description`, `Sara Meyer` (the donor) as `Photographer / Studio`, and the
+address `600 Marine Dr. (1960)` as `Construction Date` — every one of them a
+single column out of place.
 
-`validate` reports `1/1 rows passed` on this file. It only inspects the four
-required columns, which all sit *before* the broken header, so it cannot see
-the problem.
+`validate` now catches this: `check_row_shape()` compares each row's field
+count against the header's and fails the row with
+`row has fewer fields than the header (missing: ...)`.
 
 **Fix:** quote any header containing a comma (`"Names (Last, First M.)"`), or
-rename it to drop the comma. **Check:** header field count must equal data row
-field count.
-
-```bash
-python -c "import csv,sys; r=list(csv.reader(open(sys.argv[1],encoding='utf-8-sig'))); print('header',len(r[0])); print({len(x) for x in r[1:]})" data/upload.csv
-```
-
-If the header count and the row counts differ, stop and fix the CSV.
+rename it to drop the comma.
 
 ### 2. `Date` and `date` are two different fields
 
@@ -68,33 +64,44 @@ a CSV with a `Date` column produces **both**:
 - `date` → `[n.d.]` (the undated placeholder, because lowercase `date` is empty)
 
 The item ends up claiming it has no date while also carrying the real one under
-a non-standard field. **Fix:** rename `Date` to `date` during preparation.
+a non-standard field.
+
+`validate` now rejects a case variant of any column the script reads by name
+(`identifier`, `file`, `mediatype`, `title`, `date`). **Fix:** rename `Date` to
+`date` during preparation.
 
 ### 3. Headers with stray whitespace become fields with stray whitespace
 
 `Place ` (trailing space) uploads a metadata field literally named `Place `.
-**Fix:** strip whitespace from every header.
+`validate` now rejects this. **Fix:** strip whitespace from every header.
 
 ### 4. Typos in headers become typos on the item, permanently
 
-`Architectura Style` and `Commerical Buildings` are in the current data. Header
-text is the IA field name; a typo ships as-is across the whole batch and has to
-be cleaned up later with `sync-metadata`. Proofread the header row once,
-carefully — it costs a minute and saves a correction run over 10,000 items.
+Header text is the IA field name; a typo ships as-is across the whole batch and
+has to be cleaned up later with `sync-metadata`. `Architectura Style` was in the
+header and has been corrected to `Architectural Style`.
+
+**No tool can catch this** — a misspelled field name is indistinguishable from
+an intentional one. Proofread the header row once, carefully; it costs a minute
+and saves a correction run over 10,000 items. The same applies to typos in
+*values* (`Commerical Buildings` is still in the data). Those belong to the
+Sheet, so fix them there rather than in the export, or they come back next time.
 
 ## Preparation checklist
 
+`validate` enforces everything except the last two, so run it first and work
+through whatever it reports:
+
 - [ ] Re-export from the Sheet (do not reuse an old file)
-- [ ] Header field count == every data row's field count
 - [ ] Rename to lowercase: `identifier`, `file`, `mediatype`, `title`, `date`
 - [ ] Add the `mediatype` column (`image`) — it is not in the export
 - [ ] Quote or rename any header containing a comma
 - [ ] Strip leading/trailing whitespace from all headers
-- [ ] Proofread header spellings
-- [ ] No row has more fields than the header (extra fields crash the run —
-      see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#2))
 - [ ] `python ia_bulk.py validate <csv> --files-dir <dir>` exits 0
-- [ ] Test-upload and eyeball one item's metadata in a browser before `--live`
+- [ ] **Proofread header spellings** — not checkable by tool
+- [ ] **Test-upload and eyeball one item's metadata in a browser** before
+      `--live` — the only check that confirms values landed in the fields you
+      meant, rather than merely in *some* consistent set of fields
 
 ## Why this is manual
 

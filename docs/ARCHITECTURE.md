@@ -18,6 +18,13 @@ this pipeline — see `projects_registry.json`.
 Required columns: `identifier`, `file`, `mediatype`, `title`.
 All other columns pass through untouched as IA item metadata.
 
+`read_csv()` returns a `CsvData` carrying the header and the rows together,
+because validating either alone misses the failure that matters:
+`check_row_shape()` can only see a row/header field-count mismatch, and
+`check_header()` can only see the header text. Both must pass before any
+network call — `cmd_validate`, `cmd_upload`, and `cmd_sync_metadata` all run
+`header_validation()` alongside their row checks.
+
 - `identifier`: pre-assigned in the Sheet, permanent, never generated or
   renamed by this tool. Must match `COLLECTIONKEY-PROJECTID-NUMBER`,
   lowercase, hyphen-separated, 5-digit zero-padded NUMBER.
@@ -153,9 +160,11 @@ human performs, not something this CLI does automatically. See
 [`CSV-PREPARATION.md`](CSV-PREPARATION.md) for the procedure and the
 failure modes.
 
-Crucially, `validate` cannot backstop that transformation. It inspects only
-`identifier`/`file`/`mediatype`/`title` plus file existence; every other
-column is forwarded to IA unexamined. A CSV whose header row is malformed
-(e.g. an unquoted comma splitting one header into two) shifts every later
-column by a position and still passes validation — this is currently true of
-`data/upload.csv`. See [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1).
+`validate` backstops the structural half of that transformation:
+`check_header()` rejects headers with surrounding whitespace, duplicates, or a
+case variant of a column the script reads by name, and `check_row_shape()`
+rejects any row whose field count disagrees with the header — which is what an
+unquoted comma in a header cell produces. Header problems are reported as
+row 1. It cannot check whether a correctly-formed header is *semantically*
+right, so the manual proofread in
+[`CSV-PREPARATION.md`](CSV-PREPARATION.md) still matters.
