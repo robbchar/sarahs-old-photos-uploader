@@ -1,6 +1,6 @@
 # LCPS Archive Upload Project
 
-Uploading ~4,000 historical Astoria photos (donated collection) Lower Columbia Preservation Society (LCPS), a
+Uploading ~10,000 historical Astoria photos (donated collection) Lower Columbia Preservation Society (LCPS), a
 nonprofit, these are going to be put into the LCPS collection on Internet Archive. A second LCPS project may reuse this same pipeline later,
 so keep things generic to "a project" rather than hardcoded to photos.
 
@@ -36,3 +36,9 @@ they go in the `identifier-bib` metadata field instead.
 Canonical metadata lives in a Google Sheet (replacing the old emailed-CSV
 workflow). CSV export from that Sheet is a deliberate, explicit step before
 any `ia` command runs — never treat a stale local CSV as current.
+
+## temp/memory/your files
+Any file that is used only locally, that should not be part of the project, should be written to the .ignored/ directory. That includes any memory files, temp files (such as scripts or test files), and really anything that needs to be written to disk but is not part of the project.
+
+## Memory
+Anything that is relevant to how this application works and the history/derivation of how it works should be saved as memory. Put that in a memory directory and read from it when needed and update things periodically.
