@@ -5,6 +5,7 @@ from argparse import Namespace
 import internetarchive
 import pytest
 
+from column_map import build_column_map
 from ia_bulk import (
     read_csv,
     load_registry,
@@ -14,8 +15,12 @@ from ia_bulk import (
     effective_identifier,
     log_result,
     build_parser,
+    build_sheet_client,
+    format_field_receipt,
+    format_lifecycle_summary,
     main,
 )
+from project_config import ProjectConfig
 
 
 class FakeResponse:
@@ -75,6 +80,38 @@ def test_load_registry_reads_json(tmp_path):
 
 def make_registry():
     return {"collection_key": "lcps", "projects": {"astoriaphotos": {}}}
+
+
+def make_sheet_registry(files_dir=".", **project_overrides):
+    """A full project_config-shaped registry, as opposed to make_registry()'s
+    bare {collection_key, projects} shell - load_project_config needs every
+    REQUIRED_KEYS field populated. sheet_id/test_sheet_id are deliberately
+    different values (not "the same string twice") so a test that reads the
+    wrong one is distinguishable from one that reads the right one - the
+    exact gap the Task 7 review found in the SheetClient tests."""
+    project = {
+        "mediatype": "image",
+        "ia_collection": "lcpsociety",
+        "sheet_id": "REAL_SHEET_ID",
+        "test_sheet_id": "TEST_SHEET_ID",
+        "sheet_tab": "Sheet1",
+        "files_dir": files_dir,
+        "file_template": "{file}",
+    }
+    project.update(project_overrides)
+    return {"collection_key": "lcps", "projects": {"astoriaphotos": project}}
+
+
+class FakeSheetClient:
+    """Stands in for sheet_client.SheetClient in cmd_validate tests -
+    build_sheet_client is the one seam those tests monkeypatch, so nothing
+    here ever touches google_auth or googleapiclient.discovery."""
+
+    def __init__(self, grid):
+        self._grid = grid
+
+    def read_grid(self):
+        return self._grid
 
 
 def test_check_identifier_accepts_valid_registered_identifier():
@@ -573,6 +610,301 @@ def test_cmd_validate_returns_one_when_a_row_fails(tmp_path, capsys):
 
     assert exit_code == 1
     assert "0/1 rows passed" in capsys.readouterr().out
+
+
+def test_field_receipt_lists_uploadable_fields_and_held_back_ones():
+    column_map = build_column_map(
+        ["Title", "Genre / Form", "Notes (LCPS Internal)", "identifier"]
+    )
+
+    receipt = format_field_receipt(column_map)
+
+    assert "title" in receipt
+    assert "genre_form" in receipt
+    assert "held back" in receipt
+    assert "Notes (LCPS Internal)" in receipt
+    # reserved columns are never uploaded, so they must not read as fields
+    assert "identifier," not in receipt
+
+
+def test_lifecycle_summary_counts_each_state():
+    rows = [
+        {"identifier": "", "ia_uploaded": ""},
+        {"identifier": "", "ia_uploaded": ""},
+        {"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
+        {"identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
+    ]
+
+    summary = format_lifecycle_summary(rows)
+
+    assert "2 rows ready to upload" in summary
+    assert "1 already uploaded" in summary
+    assert "1 reserved but unconfirmed" in summary
+
+
+class _RecordingSheetsValues:
+    """Records the exact spreadsheetId/range passed to values().get(), so a
+    test can tell a client reading the correct Sheet apart from one reading
+    a hardcoded-wrong one - the gap the Task 7 review found (all 7 of that
+    task's original tests stayed green even with the wrong spreadsheetId
+    hardcoded into both SheetClient methods)."""
+
+    def __init__(self, response):
+        self.get_calls = []
+        self._response = response
+
+    def get(self, spreadsheetId, range):
+        self.get_calls.append((spreadsheetId, range))
+        return _RecordingExecutable(self._response)
+
+
+class _RecordingExecutable:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
+
+
+class _RecordingSheetsService:
+    def __init__(self, response):
+        self.values_api = _RecordingSheetsValues(response)
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self.values_api
+
+
+def test_build_sheet_client_reads_the_real_sheet_id_when_live(monkeypatch):
+    fake_service = _RecordingSheetsService({"values": [["Title"]]})
+    monkeypatch.setattr("ia_bulk.google_auth.load_credentials", lambda *a, **k: "FAKE_CREDS")
+    monkeypatch.setattr("ia_bulk.googleapiclient.discovery.build", lambda *a, **k: fake_service)
+    config = ProjectConfig(
+        project_id="astoriaphotos",
+        collection_key="lcps",
+        mediatype="image",
+        ia_collection="lcpsociety",
+        sheet_id="REAL_SHEET_ID",
+        test_sheet_id="TEST_SHEET_ID",
+        sheet_tab="Donor Photos",
+        files_dir=".",
+        file_template="{file}",
+    )
+
+    client = build_sheet_client(config, live=True)
+    client.read_grid()
+
+    assert fake_service.values_api.get_calls == [("REAL_SHEET_ID", "Donor Photos")]
+
+
+def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
+    fake_service = _RecordingSheetsService({"values": [["Title"]]})
+    monkeypatch.setattr("ia_bulk.google_auth.load_credentials", lambda *a, **k: "FAKE_CREDS")
+    monkeypatch.setattr("ia_bulk.googleapiclient.discovery.build", lambda *a, **k: fake_service)
+    config = ProjectConfig(
+        project_id="astoriaphotos",
+        collection_key="lcps",
+        mediatype="image",
+        ia_collection="lcpsociety",
+        sheet_id="REAL_SHEET_ID",
+        test_sheet_id="TEST_SHEET_ID",
+        sheet_tab="Donor Photos",
+        files_dir=".",
+        file_template="{file}",
+    )
+
+    client = build_sheet_client(config, live=False)
+    client.read_grid()
+
+    assert fake_service.values_api.get_calls == [("TEST_SHEET_ID", "Donor Photos")]
+
+
+def test_build_sheet_client_passes_credentials_through_to_discovery_build(monkeypatch):
+    captured = {}
+
+    def fake_load_credentials(token_path, client_secrets_path, interactive):
+        captured["token_path"] = token_path
+        captured["client_secrets_path"] = client_secrets_path
+        captured["interactive"] = interactive
+        return "FAKE_CREDS"
+
+    def fake_build(api, version, credentials):
+        captured["api"] = api
+        captured["version"] = version
+        captured["credentials"] = credentials
+        return _RecordingSheetsService({"values": []})
+
+    monkeypatch.setattr("ia_bulk.google_auth.load_credentials", fake_load_credentials)
+    monkeypatch.setattr("ia_bulk.googleapiclient.discovery.build", fake_build)
+    config = ProjectConfig(
+        project_id="astoriaphotos",
+        collection_key="lcps",
+        mediatype="image",
+        ia_collection="lcpsociety",
+        sheet_id="REAL_SHEET_ID",
+        test_sheet_id="TEST_SHEET_ID",
+        sheet_tab="Sheet1",
+        files_dir=".",
+        file_template="{file}",
+    )
+
+    build_sheet_client(config, live=True)
+
+    assert captured["credentials"] == "FAKE_CREDS"
+    assert captured["api"] == "sheets"
+    assert captured["version"] == "v4"
+
+
+def test_cmd_validate_reads_the_sheet_and_injects_mediatype_when_csv_is_omitted(
+    tmp_path, monkeypatch, capsys
+):
+    """Proves mandatory addition #2: mediatype is never a Sheet column, so
+    without injecting it from the registry this row would fail with
+    "missing required column 'mediatype'" and the exit code/pass-count
+    assertions below would flip."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    grid = [["Title", "file"], ["First photo", "photo1.jpg"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "1/1 rows passed" in out
+    assert "will upload these metadata fields:" in out
+    assert "1 rows ready to upload" in out
+    assert "suggestions (advisory - nothing is changed automatically):" in out
+
+
+def test_cmd_validate_does_not_treat_a_blank_identifier_as_an_error(tmp_path, monkeypatch, capsys):
+    """A blank identifier is the normal starting state of every new Sheet
+    row under minting, not an error like it is for a pre-assigned CSV row -
+    this is the behavior SHEET_REQUIRED_COLUMNS exists to produce."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    grid = [["Title", "file", "identifier"], ["First photo", "photo1.jpg", ""]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "missing required column 'identifier'" not in out
+
+
+def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsys):
+    """Proves mandatory addition #1: check_column_map is wired into the
+    report. Both photo1.jpg and mediatype/title are satisfied so the ONLY
+    possible source of a failure is the header collision itself."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    grid = [
+        ["Genre / Form", "Genre_ Form", "file", "Title"],
+        ["a", "b", "photo1.jpg", "First"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "both normalize to field name 'genre_form'" in out
+
+
+def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeypatch, capsys):
+    """Proves mandatory addition #1: check_grid_shape is wired into the
+    report."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    grid = [
+        ["Title", "file"],
+        ["First", "photo1.jpg", "unexpected extra cell"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "more field(s) than the header" in out
+
+
+def test_cmd_validate_passes_live_flag_and_project_config_through_to_build_sheet_client(
+    tmp_path, monkeypatch
+):
+    from ia_bulk import cmd_validate
+
+    captured = {}
+
+    def fake_build_sheet_client(config, live):
+        captured["live"] = live
+        captured["project_id"] = config.project_id
+        return FakeSheetClient([["Title", "file"], []])
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", fake_build_sheet_client)
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=True)
+
+    cmd_validate(args)
+
+    assert captured["live"] is True
+    assert captured["project_id"] == "astoriaphotos"
+
+
+def test_cmd_validate_rejects_an_unknown_project_before_touching_the_sheet(tmp_path, monkeypatch):
+    """load_project_config's ConfigError must not be swallowed - an unknown
+    --project has to fail loudly rather than silently reading nothing."""
+    from ia_bulk import cmd_validate
+    from project_config import ConfigError
+
+    calls = []
+    monkeypatch.setattr(
+        "ia_bulk.build_sheet_client", lambda config, live: calls.append(config) or FakeSheetClient([])
+    )
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_sheet_registry()), encoding="utf-8")
+    args = Namespace(csv=None, project="nosuchproject", registry=str(registry_path), live=False)
+
+    with pytest.raises(ConfigError, match="nosuchproject"):
+        cmd_validate(args)
+
+    assert calls == []
 
 
 def test_chunk_rows_splits_into_groups_of_chunk_size():
@@ -1380,17 +1712,43 @@ def test_cmd_sync_metadata_fails_identifier_validation_before_touching_network(t
 
 def test_build_parser_validate_subcommand_defaults():
     parser = build_parser()
-    args = parser.parse_args(["validate", "items.csv"])
+    args = parser.parse_args(["validate", "--project", "astoriaphotos", "--csv", "items.csv"])
     assert args.command == "validate"
+    assert args.project == "astoriaphotos"
     assert args.csv == "items.csv"
     assert args.files_dir == "."
     assert args.registry == "projects_registry.json"
+    assert args.live is False
+
+
+def test_build_parser_validate_subcommand_omits_csv_to_select_the_sheet_path():
+    """--csv is optional and mutually exclusive with reading the Sheet -
+    omitting it must leave args.csv as None rather than requiring a path,
+    since that's what cmd_validate checks to decide which source to read."""
+    parser = build_parser()
+    args = parser.parse_args(["validate", "--project", "astoriaphotos"])
+    assert args.csv is None
+
+
+@pytest.mark.parametrize(
+    "subcommand,extra_args",
+    [
+        ("validate", []),
+        ("upload", ["items.csv"]),
+        ("sync-metadata", ["updates.csv"]),
+    ],
+)
+def test_build_parser_requires_project_on_every_subcommand(subcommand, extra_args):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([subcommand, *extra_args])
 
 
 def test_build_parser_upload_subcommand_defaults_to_not_live():
     parser = build_parser()
-    args = parser.parse_args(["upload", "items.csv"])
+    args = parser.parse_args(["upload", "items.csv", "--project", "astoriaphotos"])
     assert args.command == "upload"
+    assert args.project == "astoriaphotos"
     assert args.live is False
     assert args.collection == "lcps"
     assert args.resume_from is None
@@ -1398,15 +1756,26 @@ def test_build_parser_upload_subcommand_defaults_to_not_live():
 
 def test_build_parser_upload_subcommand_accepts_live_and_resume_from():
     parser = build_parser()
-    args = parser.parse_args(["upload", "items.csv", "--live", "--resume-from", "logs/upload-x.jsonl"])
+    args = parser.parse_args(
+        [
+            "upload",
+            "items.csv",
+            "--project",
+            "astoriaphotos",
+            "--live",
+            "--resume-from",
+            "logs/upload-x.jsonl",
+        ]
+    )
     assert args.live is True
     assert args.resume_from == "logs/upload-x.jsonl"
 
 
 def test_build_parser_sync_metadata_subcommand_defaults():
     parser = build_parser()
-    args = parser.parse_args(["sync-metadata", "updates.csv"])
+    args = parser.parse_args(["sync-metadata", "updates.csv", "--project", "astoriaphotos"])
     assert args.command == "sync-metadata"
+    assert args.project == "astoriaphotos"
     assert args.csv == "updates.csv"
     assert args.live is False
 
@@ -1418,7 +1787,7 @@ def test_main_dispatches_to_cmd_validate(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr("ia_bulk.cmd_validate", lambda args: calls.append(args.csv) or 0)
 
-    exit_code = main(["validate", str(csv_path)])
+    exit_code = main(["validate", "--project", "astoriaphotos", "--csv", str(csv_path)])
 
     assert exit_code == 0
     assert calls == [str(csv_path)]

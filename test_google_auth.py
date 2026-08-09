@@ -1,11 +1,20 @@
 import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 
-from google_auth import SCOPES, AuthUnavailable, _save, load_credentials
+import google_auth
+from google_auth import (
+    DEFAULT_CLIENT_SECRETS_PATH,
+    DEFAULT_TOKEN_PATH,
+    SCOPES,
+    AuthUnavailable,
+    _save,
+    load_credentials,
+)
 
 
 def _write_token(path, expired=False):
@@ -223,3 +232,24 @@ def test_save_is_atomic_and_never_leaves_a_partial_token_on_failure(tmp_path, mo
 
     assert token_path.read_text(encoding="utf-8") == "previous-good-token-content"
     assert list(tmp_path.iterdir()) == [token_path]
+
+
+def test_default_paths_are_absolute_and_anchored_to_the_project_root(monkeypatch, tmp_path):
+    """DEFAULT_TOKEN_PATH/DEFAULT_CLIENT_SECRETS_PATH must not depend on the
+    process's current working directory. Before this, they were bare
+    relative Paths (Path(".ignored/google-token.json")), which only resolve
+    against whatever directory the process happens to be running from at the
+    moment they're opened - so `python ia_bulk.py validate` invoked from
+    anywhere other than the project root would silently miss an existing
+    cached token (never reusing it, never refreshing it) and would write a
+    fresh one into a wrong, unintended .ignored/ directory instead of
+    failing loudly. Anchoring them to this module's own directory (which is
+    also where ia_bulk.py lives) makes the invocation directory stop
+    mattering."""
+    monkeypatch.chdir(tmp_path)
+    project_root = Path(google_auth.__file__).resolve().parent
+
+    assert DEFAULT_TOKEN_PATH.is_absolute()
+    assert DEFAULT_CLIENT_SECRETS_PATH.is_absolute()
+    assert DEFAULT_TOKEN_PATH == project_root / ".ignored" / "google-token.json"
+    assert DEFAULT_CLIENT_SECRETS_PATH == project_root / ".ignored" / "google-client-secret.json"

@@ -40,13 +40,37 @@ account (`ia configure`) before running `upload` or `sync-metadata`.
 
 ## Commands
 
-### `validate` — check a CSV offline, no network calls
+### `validate` — check a project's Sheet, or an offline CSV, no writes
+
+`--project` is required (it looks up the project's block in
+`projects_registry.json`). By default `validate` reads the project's Sheet
+live over the Google Sheets API (its test Sheet, unless `--live` is passed);
+pass `--csv` to validate an offline CSV export instead — the CSV path is
+unchanged from before this integration and still needs `--files-dir`.
 
 ```bash
-python ia_bulk.py validate items.csv --files-dir ./photos --registry projects_registry.json
+# read the project's Sheet
+python ia_bulk.py validate --project sarahsoldphotos
+
+# validate an offline CSV instead
+python ia_bulk.py validate --project sarahsoldphotos --csv items.csv --files-dir ./photos
 ```
 
-Checks the header once:
+Note: the full Sheet-workflow write-up (registry fields, Google Cloud
+prerequisites, the reserve/upload/confirm protocol) is still to be documented
+in a later task; this is a minimal correction so the command above stays
+accurate. See `docs/DECISIONS.md` ("The Sheet is read live") in the
+meantime.
+
+Sheet path: checks the header for colliding or empty field names and any data
+row longer than the header, injects `mediatype` from the registry, then
+prints a pass/fail report per row, a receipt of which fields will upload,
+a lifecycle summary (rows ready to upload / already uploaded / reserved but
+unconfirmed), and advisory suggestions for renaming a column to a standard IA
+field name. A blank `identifier` is normal for a new row, not an error — it's
+assigned by `upload` later.
+
+CSV path: checks the header once —
 - no column with leading/trailing whitespace, and no duplicate columns —
   header text becomes the IA metadata field name verbatim
 - no case variant of a column the script reads by name (`identifier`, `file`,
@@ -68,8 +92,11 @@ exits non-zero if anything fails. Always run this before `upload`.
 
 ### `upload` — upload a validated CSV
 
+`--project` is required here too (registry lookup), but this command still
+only reads from a CSV — it does not yet read or write the Sheet.
+
 ```bash
-python ia_bulk.py upload items.csv --files-dir ./photos
+python ia_bulk.py upload items.csv --project sarahsoldphotos --files-dir ./photos
 ```
 
 - Re-validates the CSV before any network call
@@ -84,8 +111,10 @@ python ia_bulk.py upload items.csv --files-dir ./photos
 
 ### `sync-metadata` — update metadata on already-uploaded items
 
+`--project` is required here too, for the same reason as `upload`.
+
 ```bash
-python ia_bulk.py sync-metadata updates.csv
+python ia_bulk.py sync-metadata updates.csv --project sarahsoldphotos
 ```
 
 Same chunking/logging/safety-rail behavior as `upload`, but only requires
@@ -107,7 +136,7 @@ to target the real collection with the real identifier as-is — do this
 deliberately, never as a default.
 
 ```bash
-python ia_bulk.py upload items.csv --live --collection lcps
+python ia_bulk.py upload items.csv --project sarahsoldphotos --live --collection lcps
 ```
 
 **Before any `--live` run**, double-check both of these by hand — neither

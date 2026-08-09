@@ -18,8 +18,17 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DEFAULT_TOKEN_PATH = Path(".ignored/google-token.json")
-DEFAULT_CLIENT_SECRETS_PATH = Path(".ignored/google-client-secret.json")
+
+# Anchored to the project root (this file's own directory, which is where
+# ia_bulk.py also lives) rather than left as bare relative Paths. A relative
+# Path resolves against the process's current working directory at the
+# moment it's opened/checked - not at import time - so running
+# `python ia_bulk.py validate ...` from any directory other than the project
+# root would silently miss an existing cached token and write .ignored/
+# somewhere unintended instead of failing loudly.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_TOKEN_PATH = _PROJECT_ROOT / ".ignored" / "google-token.json"
+DEFAULT_CLIENT_SECRETS_PATH = _PROJECT_ROOT / ".ignored" / "google-client-secret.json"
 
 
 class AuthUnavailable(Exception):

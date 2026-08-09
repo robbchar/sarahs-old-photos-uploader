@@ -1,6 +1,8 @@
-"""Bulk validate/upload/sync-metadata CLI for Internet Archive, driven by a CSV
-exported from the LCPS Google Sheet. See docs/ARCHITECTURE.md for the CSV
-schema and identifier scheme this script assumes."""
+"""Bulk validate/upload/sync-metadata CLI for Internet Archive, driven by a
+project's Google Sheet (read live) or, for offline/dry-run work, a CSV
+exported from it. See docs/ARCHITECTURE.md for the CSV schema and identifier
+scheme this script assumes, and docs/DECISIONS.md ("The Sheet is read live")
+for why both sources exist."""
 from __future__ import annotations
 
 import argparse
@@ -13,11 +15,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+import googleapiclient.discovery
 import internetarchive
 import requests
 
+import google_auth
+from column_map import ColumnMap, check_column_map, check_grid_shape, grid_to_rows
+from ia_fields import suggest_standard_fields
+from identifiers import RowState, classify_row
+from project_config import ProjectConfig, load_project_config
+from sheet_client import SheetClient
+
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
+# A Sheet row's identifier is minted by `upload`, not pre-assigned like a CSV
+# row's - a blank identifier is the normal starting state for every new row
+# (RowState.UNASSIGNED), not an error, so it is excluded here. The remaining
+# three columns still have to exist before anything can be uploaded.
+SHEET_REQUIRED_COLUMNS = tuple(column for column in REQUIRED_UPLOAD_COLUMNS if column != "identifier")
 # Columns this script reads by exact lowercase name. A case variant of one of
 # these (a "Date" column from the raw Sheet export, say) is silently treated as
 # unrelated pass-through metadata, so check_header rejects it.
@@ -176,11 +191,16 @@ def validate_rows(
     files_dir: str | Path,
     registry: dict,
     skip_identifiers: frozenset[str] = frozenset(),
+    required_columns: tuple[str, ...] = REQUIRED_UPLOAD_COLUMNS,
 ) -> list[RowValidation]:
     """skip_identifiers lets a --resume-from run skip re-validating rows a
     prior run already validated and uploaded successfully - the identifier
     is still tracked for duplicate detection, just without redoing the
-    regex/registry/disk-stat checks."""
+    regex/registry/disk-stat checks.
+
+    required_columns defaults to REQUIRED_UPLOAD_COLUMNS (the CSV path,
+    unchanged) but the Sheet path passes SHEET_REQUIRED_COLUMNS, which
+    excludes 'identifier' - see that constant's comment for why."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
@@ -195,7 +215,7 @@ def validate_rows(
 
         errors: list[str] = check_row_shape(row)
 
-        for column in REQUIRED_UPLOAD_COLUMNS:
+        for column in required_columns:
             if not (row.get(column) or "").strip():
                 errors.append(f"missing required column '{column}'")
 
@@ -211,6 +231,45 @@ def validate_rows(
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
     return results
+
+
+def sheet_structure_validation(column_map: ColumnMap, grid: list[list[str]]) -> list[RowValidation]:
+    """check_column_map catches two headers that normalize to the same IA
+    field name - which would silently overwrite one column's data across
+    every row - and headers that normalize to an empty field name.
+    check_grid_shape catches a data row longer than the header, whose excess
+    cells otherwise vanish without a trace. Reported as row 1, mirroring
+    header_validation() for the CSV path, so these flow through the same
+    report and exit-code path as row problems instead of needing a parallel
+    channel."""
+    errors = check_column_map(column_map) + check_grid_shape(grid)
+    return [RowValidation(row_number=1, identifier="", errors=errors)] if errors else []
+
+
+def format_field_receipt(column_map: ColumnMap) -> str:
+    """Printed before anything permanent happens, so the transformation from
+    Sheet header to IA field name is reviewable by a human."""
+    lines = ["will upload these metadata fields:"]
+    fields = column_map.uploadable_fields()
+    lines.append("  " + ", ".join(fields) if fields else "  (none)")
+    if column_map.held_back:
+        lines.append("held back (LCPS Internal): " + ", ".join(column_map.held_back))
+    return "\n".join(lines)
+
+
+def format_lifecycle_summary(rows: list[dict[str, str]]) -> str:
+    counts = {state: 0 for state in RowState}
+    for row in rows:
+        counts[classify_row(row)] += 1
+
+    return "\n".join(
+        [
+            f"{counts[RowState.UNASSIGNED]} rows ready to upload (no identifier yet)",
+            f"{counts[RowState.DONE]} already uploaded",
+            f"{counts[RowState.RESERVED]} reserved but unconfirmed "
+            "- will retry under existing identifier",
+        ]
+    )
 
 
 def format_report(results: list[RowValidation]) -> str:
@@ -383,13 +442,66 @@ def header_validation(fieldnames: list[str]) -> list[RowValidation]:
     return [RowValidation(row_number=1, identifier="", errors=errors)] if errors else []
 
 
+def build_sheet_client(config: ProjectConfig, live: bool) -> SheetClient:
+    """The only place `google_auth.load_credentials` and
+    `googleapiclient.discovery.build` are called. Every Sheet-touching code
+    path (cmd_validate now, upload/sync-metadata in later tasks) goes through
+    this one function, so tests can monkeypatch this single seam and run with
+    no credentials and no network.
+
+    interactive=True whenever a human is at a terminal to see the OAuth
+    consent-flow browser tab; sys.stdin.isatty() is False for anything
+    unattended (cron, CI), where load_credentials fails fast with
+    AuthUnavailable instead of hanging waiting for a browser nobody sees."""
+    credentials = google_auth.load_credentials(
+        google_auth.DEFAULT_TOKEN_PATH,
+        google_auth.DEFAULT_CLIENT_SECRETS_PATH,
+        interactive=sys.stdin.isatty(),
+    )
+    service = googleapiclient.discovery.build("sheets", "v4", credentials=credentials)
+    return SheetClient(service, config.sheet_id_for(live), config.sheet_tab)
+
+
 def cmd_validate(args) -> int:
-    data = read_csv(args.csv)
+    csv_path = getattr(args, "csv", None)
+    if csv_path:
+        data = read_csv(args.csv)
+        registry = load_registry(args.registry)
+        results = header_validation(data.fieldnames) + validate_rows(
+            data.rows, args.files_dir, registry
+        )
+        print(format_report(results))
+        return 0 if all(r.is_valid for r in results) else 1
+
     registry = load_registry(args.registry)
-    results = header_validation(data.fieldnames) + validate_rows(
-        data.rows, args.files_dir, registry
+    config = load_project_config(registry, args.project)
+    client = build_sheet_client(config, args.live)
+    grid = client.read_grid()
+    column_map, rows = grid_to_rows(grid)
+
+    # mediatype is a per-project constant, never a Sheet column - inject it
+    # before validating so every row satisfies the required-column check
+    # instead of failing on a column that was never meant to exist.
+    for row in rows:
+        row["mediatype"] = config.mediatype
+
+    results = sheet_structure_validation(column_map, grid) + validate_rows(
+        rows, config.files_dir, registry, required_columns=SHEET_REQUIRED_COLUMNS
     )
     print(format_report(results))
+    print()
+    print(format_field_receipt(column_map))
+    print()
+    print(format_lifecycle_summary(rows))
+    print()
+    print("suggestions (advisory - nothing is changed automatically):")
+    suggestions = suggest_standard_fields(column_map.uploadable_fields())
+    if suggestions:
+        for suggestion in suggestions:
+            print(f"  '{suggestion.field_name}' -> '{suggestion.standard}': {suggestion.reason}")
+    else:
+        print("  (none)")
+
     return 0 if all(r.is_valid for r in results) else 1
 
 
@@ -516,17 +628,33 @@ def cmd_sync_metadata(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ia_bulk",
-        description="Validate, upload, and sync metadata for Internet Archive items from a CSV.",
+        description=(
+            "Validate, upload, and sync metadata for Internet Archive items from "
+            "a project's Google Sheet (read live) or, for validate, an offline CSV."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    validate_parser = subparsers.add_parser("validate", help="Validate a CSV without touching the network")
-    validate_parser.add_argument("csv", help="Path to the CSV to validate")
-    validate_parser.add_argument("--files-dir", default=".", help="Base directory the 'file' column is resolved against")
+    validate_parser = subparsers.add_parser(
+        "validate", help="Validate a project's Sheet, or an offline CSV, without touching the network"
+    )
+    validate_parser.add_argument("--project", required=True, help="Project ID from the registry")
+    validate_parser.add_argument(
+        "--csv", default=None, help="Validate this CSV offline instead of reading the project's Sheet"
+    )
+    validate_parser.add_argument(
+        "--files-dir", default=".", help="Base directory the CSV's 'file' column is resolved against (--csv only)"
+    )
     validate_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    validate_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Read the project's real Sheet instead of its test Sheet (ignored with --csv)",
+    )
 
     upload_parser = subparsers.add_parser("upload", help="Upload items from a validated CSV")
     upload_parser.add_argument("csv", help="Path to the validated CSV")
+    upload_parser.add_argument("--project", required=True, help="Project ID from the registry")
     upload_parser.add_argument("--files-dir", default=".", help="Base directory the 'file' column is resolved against")
     upload_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
     upload_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
@@ -536,6 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_parser = subparsers.add_parser("sync-metadata", help="Update metadata on already-uploaded items")
     sync_parser.add_argument("csv", help="Path to the CSV of identifier + changed metadata columns")
+    sync_parser.add_argument("--project", required=True, help="Project ID from the registry")
     sync_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
     sync_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
     sync_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
