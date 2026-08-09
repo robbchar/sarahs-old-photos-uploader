@@ -28,11 +28,23 @@ from sheet_client import SheetClient
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
-# A Sheet row's identifier is minted by `upload`, not pre-assigned like a CSV
-# row's - a blank identifier is the normal starting state for every new row
-# (RowState.UNASSIGNED), not an error, so it is excluded here. The remaining
-# three columns still have to exist before anything can be uploaded.
-SHEET_REQUIRED_COLUMNS = tuple(column for column in REQUIRED_UPLOAD_COLUMNS if column != "identifier")
+# Deliberately excludes both "identifier" and "file" - do not "fix" this back
+# to REQUIRED_UPLOAD_COLUMNS.
+#
+# "identifier": a Sheet row's identifier is minted by `upload`, not
+# pre-assigned like a CSV row's - a blank identifier is the normal starting
+# state for every new row (RowState.UNASSIGNED), not an error.
+#
+# "file": a Sheet row has no literal `file` column at all. Task 9 builds a
+# row's file path from `file_template` in the registry (e.g.
+# "{cd}/{file_on_array}"), combining several Sheet columns with a root
+# directory - `file` is Task 9's output, not Task 8's input. Requiring it
+# here (or checking it against disk - see validate_rows' check_file_exists)
+# would fail every row on a machine that doesn't have the photos present,
+# which is exactly the machine Phase 1 (this task) is meant to run on: a
+# human validating a copy of the real Sheet with "no IA credentials and not
+# a single file on disk".
+SHEET_REQUIRED_COLUMNS = ("mediatype", "title")
 # Columns this script reads by exact lowercase name. A case variant of one of
 # these (a "Date" column from the raw Sheet export, say) is silently treated as
 # unrelated pass-through metadata, so check_header rejects it.
@@ -192,6 +204,7 @@ def validate_rows(
     registry: dict,
     skip_identifiers: frozenset[str] = frozenset(),
     required_columns: tuple[str, ...] = REQUIRED_UPLOAD_COLUMNS,
+    check_file_exists: bool = True,
 ) -> list[RowValidation]:
     """skip_identifiers lets a --resume-from run skip re-validating rows a
     prior run already validated and uploaded successfully - the identifier
@@ -200,7 +213,17 @@ def validate_rows(
 
     required_columns defaults to REQUIRED_UPLOAD_COLUMNS (the CSV path,
     unchanged) but the Sheet path passes SHEET_REQUIRED_COLUMNS, which
-    excludes 'identifier' - see that constant's comment for why."""
+    excludes 'identifier' and 'file' - see that constant's comment for why.
+
+    check_file_exists defaults to True (the CSV path, unchanged: a CSV row's
+    'file' is a real, already-resolvable path, so checking it on disk is
+    correct there). The Sheet path passes False explicitly - Phase 1 (this
+    task) runs with no files on disk by design, and a Sheet row has no
+    'file' value to check yet regardless (see SHEET_REQUIRED_COLUMNS). This
+    is a dedicated flag rather than relying on required_columns excluding
+    'file', or on files_dir pointing nowhere, so the skip is an explicit
+    statement of intent instead of an incidental side effect of some other
+    setting."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
@@ -222,11 +245,12 @@ def validate_rows(
         if identifier:
             errors.extend(check_identifier(identifier, row_number, registry, seen_identifiers))
 
-        file_value = (row.get("file") or "").strip()
-        if file_value:
-            file_path = Path(files_dir) / file_value
-            if not file_path.is_file():
-                errors.append(f"file not found: {file_path}")
+        if check_file_exists:
+            file_value = (row.get("file") or "").strip()
+            if file_value:
+                file_path = Path(files_dir) / file_value
+                if not file_path.is_file():
+                    errors.append(f"file not found: {file_path}")
 
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
@@ -486,7 +510,11 @@ def cmd_validate(args) -> int:
         row["mediatype"] = config.mediatype
 
     results = sheet_structure_validation(column_map, grid) + validate_rows(
-        rows, config.files_dir, registry, required_columns=SHEET_REQUIRED_COLUMNS
+        rows,
+        config.files_dir,
+        registry,
+        required_columns=SHEET_REQUIRED_COLUMNS,
+        check_file_exists=False,
     )
     print(format_report(results))
     print()

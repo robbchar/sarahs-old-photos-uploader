@@ -763,16 +763,18 @@ def test_cmd_validate_reads_the_sheet_and_injects_mediatype_when_csv_is_omitted(
     """Proves mandatory addition #2: mediatype is never a Sheet column, so
     without injecting it from the registry this row would fail with
     "missing required column 'mediatype'" and the exit code/pass-count
-    assertions below would flip."""
+    assertions below would flip. files_dir points at a directory that does
+    not exist - Phase 1 runs with no files on disk (see
+    test_cmd_validate_does_not_check_file_existence_on_the_sheet_path) - so
+    a regression that reintroduced a file check would fail this test too."""
     from ia_bulk import cmd_validate
 
-    (tmp_path / "photo1.jpg").write_bytes(b"data")
     grid = [["Title", "file"], ["First photo", "photo1.jpg"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -792,13 +794,12 @@ def test_cmd_validate_does_not_treat_a_blank_identifier_as_an_error(tmp_path, mo
     this is the behavior SHEET_REQUIRED_COLUMNS exists to produce."""
     from ia_bulk import cmd_validate
 
-    (tmp_path / "photo1.jpg").write_bytes(b"data")
     grid = [["Title", "file", "identifier"], ["First photo", "photo1.jpg", ""]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -809,13 +810,63 @@ def test_cmd_validate_does_not_treat_a_blank_identifier_as_an_error(tmp_path, mo
     assert "missing required column 'identifier'" not in out
 
 
-def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsys):
-    """Proves mandatory addition #1: check_column_map is wired into the
-    report. Both photo1.jpg and mediatype/title are satisfied so the ONLY
-    possible source of a failure is the header collision itself."""
+def test_cmd_validate_does_not_check_file_existence_on_the_sheet_path(tmp_path, monkeypatch, capsys):
+    """Phase 1's explicit contract (see the plan) is 'no IA credentials and
+    not a single file on disk' - a human validates a copy of the real Sheet
+    on a machine that does not have the ~10,000 photos. This row names a
+    file, and files_dir points at a directory that does not even exist, so
+    if the disk check were reintroduced this would fail with
+    "file not found" instead of passing. `file` itself isn't required
+    either (Task 9 supplies it via file_template, not this task)."""
     from ia_bulk import cmd_validate
 
-    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    grid = [["Title", "file"], ["First photo", "photo-that-does-not-exist.jpg"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "1/1 rows passed" in out
+    assert "file not found" not in out
+
+
+def test_cmd_validate_does_not_require_a_file_column_on_the_sheet_path(tmp_path, monkeypatch, capsys):
+    """Distinct from the disk-existence check above: 'file' must not even be
+    in SHEET_REQUIRED_COLUMNS. A Sheet has no 'file' column at all in Phase
+    1 - Task 9 is what builds one via file_template - so a row lacking it
+    entirely (not just an unchecked one) must still pass."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title"], ["First photo"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "missing required column 'file'" not in out
+
+
+def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsys):
+    """Proves mandatory addition #1: check_column_map is wired into the
+    report. mediatype/title are satisfied and the Sheet path never checks
+    file existence, so the ONLY possible source of a failure is the header
+    collision itself."""
+    from ia_bulk import cmd_validate
+
     grid = [
         ["Genre / Form", "Genre_ Form", "file", "Title"],
         ["a", "b", "photo1.jpg", "First"],
@@ -824,7 +875,7 @@ def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsy
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -840,7 +891,6 @@ def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeyp
     report."""
     from ia_bulk import cmd_validate
 
-    (tmp_path / "photo1.jpg").write_bytes(b"data")
     grid = [
         ["Title", "file"],
         ["First", "photo1.jpg", "unexpected extra cell"],
@@ -849,7 +899,7 @@ def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeyp
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
