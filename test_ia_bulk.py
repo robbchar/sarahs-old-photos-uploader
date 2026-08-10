@@ -1,5 +1,6 @@
 import json
 import csv
+import re
 from argparse import Namespace
 
 import internetarchive
@@ -696,6 +697,63 @@ def test_field_receipt_lists_uploadable_fields_and_held_back_ones():
     assert "identifier," not in receipt
 
 
+def test_sheet_structure_validation_files_a_grid_shape_error_under_its_own_row_not_row_1():
+    """check_grid_shape's message already names the real row number (e.g.
+    "row 3 has..."); filing it under row 1 regardless - which an earlier
+    version of this function did - puts a row-3 problem under the heading a
+    volunteer reads as "the header row"."""
+    from ia_bulk import sheet_structure_validation
+
+    grid = [
+        ["Title", "file"],
+        ["First", "photo1.jpg"],
+        ["Second", "photo2.jpg", "unexpected extra cell"],
+    ]
+    column_map = build_column_map(grid[0])
+
+    results = sheet_structure_validation(column_map, grid)
+
+    assert len(results) == 1
+    assert results[0].row_number == 3
+    assert "more field(s) than the header" in results[0].errors[0]
+
+
+def test_sheet_structure_validation_files_a_header_collision_under_row_1():
+    """Two headers colliding is genuinely a header-level problem - not
+    about any one data row - so it stays under row 1."""
+    from ia_bulk import sheet_structure_validation
+
+    grid = [["Genre / Form", "Genre_ Form"], ["a", "b"]]
+    column_map = build_column_map(grid[0])
+
+    results = sheet_structure_validation(column_map, grid)
+
+    assert len(results) == 1
+    assert results[0].row_number == 1
+    assert "genre_form" in results[0].errors[0]
+
+
+def test_sheet_structure_validation_files_a_header_problem_and_a_shape_problem_separately():
+    """Both defects can be present in the same Sheet at once, and must be
+    filed under their own distinct rows rather than merged into a single
+    row-1 entry."""
+    from ia_bulk import sheet_structure_validation
+
+    grid = [
+        ["Genre / Form", "Genre_ Form", "Title"],
+        ["a", "b", "First"],
+        ["c", "d", "Second", "unexpected extra cell"],
+    ]
+    column_map = build_column_map(grid[0])
+
+    results = sheet_structure_validation(column_map, grid)
+
+    by_row = {result.row_number: result.errors[0] for result in results}
+    assert set(by_row) == {1, 3}
+    assert "genre_form" in by_row[1]
+    assert "more field(s) than the header" in by_row[3]
+
+
 def test_lifecycle_summary_counts_each_state():
     rows = [
         {"identifier": "", "ia_uploaded": ""},
@@ -742,6 +800,91 @@ def test_lifecycle_summary_does_not_count_a_failed_unassigned_row_as_ready():
 
     assert "0 rows ready to upload" in summary
     assert "1 row" in summary and "failed validation" in summary
+
+
+def test_lifecycle_summary_does_not_count_a_failed_done_row_as_already_uploaded():
+    """Same contradiction as the UNASSIGNED case, in the DONE bucket: a row
+    classify_row() calls DONE (has both identifier and ia_uploaded) but that
+    now fails validation (a duplicate identifier, say) is not cleanly
+    "already uploaded" - it needs a human to look, not silent inclusion in
+    a bucket that implies everything is fine."""
+    rows = [{"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}]
+    row_results = [
+        RowValidation(
+            row_number=2,
+            identifier="lcps-astoriaphotos-00001",
+            errors=["identifier 'lcps-astoriaphotos-00001' duplicates row 5"],
+        )
+    ]
+
+    summary = format_lifecycle_summary(rows, row_results)
+
+    assert "0 already uploaded" in summary
+    assert "1 row already uploaded but now fail validation" in summary
+
+
+def test_lifecycle_summary_does_not_count_a_failed_reserved_row_as_will_retry():
+    """The coordinator's exact example: rows with a duplicate identifier or
+    an unregistered project prefix were reported as "3 reserved but
+    unconfirmed - will retry under existing identifier" - a forward-looking
+    promise a row failing identifier validation cannot keep."""
+    rows = [{"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""}]
+    row_results = [
+        RowValidation(
+            row_number=2,
+            identifier="lcps-astoriaphotos-00001",
+            errors=["identifier 'lcps-astoriaphotos-00001' duplicates row 5"],
+        )
+    ]
+
+    summary = format_lifecycle_summary(rows, row_results)
+
+    assert "0 reserved but unconfirmed" in summary
+    assert "1 row reserved but invalid" in summary
+    assert "will NOT retry automatically" in summary
+
+
+def test_lifecycle_summary_counts_always_sum_to_the_total_row_count():
+    """Every row falls into exactly one of the six buckets (three
+    classify_row() states, each split into valid/invalid), so their counts
+    must always add up to len(rows) - a regression that double-counts or
+    drops a row on some branch would break this without necessarily
+    breaking any single-bucket assertion."""
+    rows = [
+        {"identifier": "", "ia_uploaded": ""},
+        {"identifier": "", "ia_uploaded": ""},
+        {"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
+        {"identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
+    ]
+    row_results = [
+        RowValidation(row_number=2, identifier="", errors=[]),
+        RowValidation(row_number=3, identifier="", errors=["missing required column 'title'"]),
+        RowValidation(
+            row_number=4,
+            identifier="lcps-astoriaphotos-00001",
+            errors=["identifier 'lcps-astoriaphotos-00001' duplicates row 9"],
+        ),
+        RowValidation(row_number=5, identifier="lcps-astoriaphotos-00002", errors=[]),
+    ]
+
+    summary = format_lifecycle_summary(rows, row_results)
+
+    counts = [int(match) for match in re.findall(r"^(\d+)", summary, flags=re.MULTILINE)]
+    assert sum(counts) == len(rows)
+
+
+def test_lifecycle_summary_raises_on_mismatched_lengths_instead_of_silently_truncating():
+    """zip(rows, row_results) truncates to the shorter list without
+    raising - a caller passing the wrong list (e.g. the combined report
+    instead of just the row results) would silently get wrong-but-
+    plausible-looking counts instead of an obvious failure. That is exactly
+    the kind of silent wrongness this function exists to prevent, so a
+    length mismatch must raise rather than zip quietly."""
+    with pytest.raises(ValueError, match="same length"):
+        format_lifecycle_summary(
+            rows=[{"identifier": ""}, {"identifier": ""}],
+            row_results=[RowValidation(row_number=2, identifier="")],
+        )
 
 
 class _RecordingSheetsValues:
@@ -990,7 +1133,10 @@ def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsy
 
 def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeypatch, capsys):
     """Proves mandatory addition #1: check_grid_shape is wired into the
-    report."""
+    report - AND that the problem is filed under the row it's actually
+    about (row 2, the single data row here), not under row 1. A volunteer
+    reads "row 1" as the header row; a row-2 problem filed there is
+    confusing even though the message text itself already names row 2."""
     from ia_bulk import cmd_validate
 
     grid = [
@@ -1009,6 +1155,40 @@ def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeyp
     out = capsys.readouterr().out
 
     assert exit_code == 1
+    assert "more field(s) than the header" in out
+    assert "[FAIL] row 2" in out
+    assert "[FAIL] row 1" not in out
+
+
+def test_cmd_validate_reports_a_header_collision_and_a_shape_error_under_their_own_rows(
+    tmp_path, monkeypatch, capsys
+):
+    """Both a genuinely header-level defect (a collision) and a specific
+    row's shape defect can be present in the same Sheet at once, and must
+    be filed under their own distinct rows rather than merged into a single
+    row-1 entry."""
+    from ia_bulk import cmd_validate
+
+    grid = [
+        ["Genre / Form", "Genre_ Form", "Title"],
+        ["a", "b", "First"],
+        ["c", "d", "Second", "unexpected extra cell"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "[FAIL] row 1" in out
+    assert "[FAIL] row 3" in out
+    assert "both normalize to field name 'genre_form'" in out
     assert "more field(s) than the header" in out
 
 
@@ -1137,7 +1317,10 @@ def test_cmd_validate_flags_a_header_only_sheet_as_an_error_not_a_false_green(
     copy of the Sheet, or a Sheet never actually shared with the service
     account than a real project with zero rows - reporting "0/0 rows
     passed" and exiting 0 would be a false green from a command whose
-    entire job is catching exactly this kind of problem."""
+    entire job is catching exactly this kind of problem. And a "0/1 rows
+    passed" line must never appear here either - the "1" would be a
+    synthetic entry standing in for zero real rows, which reads as
+    nonsense arithmetic."""
     from ia_bulk import cmd_validate
 
     grid = [["Title", "file"]]  # header row only, zero data rows
@@ -1154,6 +1337,7 @@ def test_cmd_validate_flags_a_header_only_sheet_as_an_error_not_a_false_green(
 
     assert exit_code == 1
     assert "no data rows" in out
+    assert "rows passed" not in out
 
 
 def test_cmd_validate_flags_a_completely_empty_sheet_as_an_error(tmp_path, monkeypatch, capsys):
@@ -1172,6 +1356,34 @@ def test_cmd_validate_flags_a_completely_empty_sheet_as_an_error(tmp_path, monke
 
     assert exit_code == 1
     assert "no data rows" in out
+    assert "rows passed" not in out
+
+
+def test_cmd_validate_still_reports_a_header_collision_when_the_sheet_has_no_data_rows(
+    tmp_path, monkeypatch, capsys
+):
+    """The no-data-rows short-circuit must not swallow a genuine header
+    problem - a colliding header is worth surfacing even on an otherwise
+    empty Sheet, since fixing it is a prerequisite to populating the Sheet
+    correctly in the first place."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Genre / Form", "Genre_ Form"]]  # colliding header, zero data rows
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "both normalize to field name 'genre_form'" in out
+    assert "no data rows" in out
+    assert "rows passed" not in out
 
 
 def test_cmd_validate_prints_test_mode_and_the_test_sheet_id_by_default(tmp_path, monkeypatch, capsys):
@@ -1254,6 +1466,119 @@ def test_cmd_validate_injects_mediatype_from_the_registry_not_a_hardcoded_value(
     cmd_validate(args)
 
     assert captured_rows == [{"title": "First photo", "mediatype": "phonorecord"}]
+
+
+def test_cmd_validate_passes_only_the_row_results_to_the_lifecycle_summary_not_the_combined_report(
+    tmp_path, monkeypatch
+):
+    """Coordinator-caught gap (3a): passing the combined `results` list
+    (which also carries sheet_structure_validation()'s row-1/shape
+    entries) instead of validate_rows()'s own row_results would misalign
+    zip(rows, row_results) - silently, since zip() truncates rather than
+    raising. A Sheet with BOTH a structural error (a header collision) and
+    a normal data row is what makes the combined list a different LENGTH
+    than `rows`, so this is pinned by inspecting exactly what cmd_validate
+    hands to format_lifecycle_summary, not by relying on the length guard
+    added to format_lifecycle_summary itself to happen to fire."""
+    from ia_bulk import cmd_validate
+
+    captured = {}
+
+    def fake_format_lifecycle_summary(rows, row_results):
+        captured["rows"] = rows
+        captured["row_results"] = row_results
+        return "captured"
+
+    monkeypatch.setattr("ia_bulk.format_lifecycle_summary", fake_format_lifecycle_summary)
+
+    grid = [
+        ["Genre / Form", "Genre_ Form", "Title"],  # colliding headers -> a structural error
+        ["a", "b", "First photo"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+
+    assert len(captured["rows"]) == 1
+    assert len(captured["row_results"]) == 1
+
+
+def test_cmd_validate_prints_correct_lifecycle_counts_for_a_mix_of_states_end_to_end(
+    tmp_path, monkeypatch, capsys
+):
+    """End-to-end version of 3a/3b: a real Sheet with one row in each of
+    the six (state x valid/invalid) combinations, run through the actual
+    cmd_validate/validate_rows/format_lifecycle_summary wiring - not just
+    format_lifecycle_summary in isolation, which was already correct on its
+    own and is exactly why the coordinator's mutations (fabricated
+    all-valid results; the combined report instead of row_results) slipped
+    past every previous test: the only existing end-to-end summary
+    assertion was on an all-passing run, where every mutation happens to
+    look identical to correct behavior."""
+    from ia_bulk import cmd_validate
+
+    grid = [
+        ["Title", "identifier", "ia_uploaded"],
+        ["Ready", "", ""],
+        ["", "", ""],  # blank title -> fails validation, still unassigned
+        ["Done", "lcps-astoriaphotos-00001", "2026-01-01T00:00:00"],
+        ["", "lcps-astoriaphotos-00002", "2026-01-01T00:00:00"],  # blank title -> fails
+        ["Reserved", "lcps-astoriaphotos-00003", ""],
+        ["", "lcps-astoriaphotos-00004", ""],  # blank title -> fails
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "3/6 rows passed" in out
+    assert "1 row ready to upload (no identifier yet)" in out
+    assert "1 row not yet assigned an identifier but failed validation" in out
+    assert "1 already uploaded" in out
+    assert "1 row already uploaded but now fail validation" in out
+    assert "1 reserved but unconfirmed - will retry under existing identifier" in out
+    assert "1 row reserved but invalid" in out
+
+
+def test_cmd_validate_output_encodes_cleanly_under_a_restrictive_windows_console_codepage(
+    tmp_path, monkeypatch, capsys
+):
+    """Finding 5 (fix round 2) replaced an em dash in ia_fields.py with an
+    ASCII hyphen, but nothing pinned it - restoring the em dash would pass
+    every other test in this suite. cp437 is the default codepage on many
+    non-UTF-8 Windows consoles; encoding the full validate output as plain
+    ascii (a stricter test - anything ascii-safe is cp437-safe too) is what
+    would have caught it, since a character that can't encode there raises
+    UnicodeEncodeError and truncates the human's report mid-run on exactly
+    the machine this task hands off to."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title", "Photographer"], ["First photo", "Jane Doe"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+    out = capsys.readouterr().out
+
+    out.encode("ascii")  # raises UnicodeEncodeError if any non-ASCII character slipped in
 
 
 def test_cmd_validate_prints_an_actual_suggestion_not_just_the_heading(tmp_path, monkeypatch, capsys):

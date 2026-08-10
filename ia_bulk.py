@@ -263,34 +263,43 @@ def validate_rows(
     return results
 
 
-def sheet_structure_validation(
-    column_map: ColumnMap, grid: list[list[str]], rows: list[dict[str, str]]
-) -> list[RowValidation]:
+_GRID_SHAPE_ROW_NUMBER_RE = re.compile(r"^row (\d+) ")
+
+
+def sheet_structure_validation(column_map: ColumnMap, grid: list[list[str]]) -> list[RowValidation]:
     """check_column_map catches two headers that normalize to the same IA
     field name - which would silently overwrite one column's data across
-    every row - and headers that normalize to an empty field name.
+    every row - and headers that normalize to an empty field name. Those are
+    genuinely header-level problems, so they're filed under row 1, mirroring
+    header_validation() for the CSV path.
+
     check_grid_shape catches a data row longer than the header, whose excess
-    cells otherwise vanish without a trace.
+    cells otherwise vanish without a trace - but that is a problem with a
+    SPECIFIC data row, not with the header. check_grid_shape's own message
+    already names the real row number (e.g. "row 3 has 1 more field(s)...");
+    filing it under row 1 anyway - as an earlier version of this function
+    did - puts a row-3 problem under the heading a volunteer reads as "the
+    header row", which is actively confusing. So each shape-error message is
+    parsed for the row number it already names and filed there instead,
+    producing one RowValidation per affected row.
 
-    A Sheet with no data rows (header-only, or completely empty) is also
-    flagged here as an error rather than allowed to print "0/0 rows passed"
-    and exit 0: an empty read is far more likely to mean a wrong tab name,
-    an unpopulated copy of the Sheet, or a Sheet that was never actually
-    shared with the service account than a real project with zero rows -
-    and reporting that as success would defeat the entire purpose of
-    running `validate`.
+    check_grid_shape's message format is a private contract between these
+    two functions, not a public interface - if that wording ever changes
+    such that the leading "row N " prefix disappears, _GRID_SHAPE_ROW_NUMBER_RE
+    simply fails to match and the message is filed under row 1 as a safe
+    fallback rather than raising."""
+    results: list[RowValidation] = []
 
-    All of the above are reported as row 1, mirroring header_validation()
-    for the CSV path, so they flow through the same report and exit-code
-    path as row problems instead of needing a parallel channel."""
-    errors = check_column_map(column_map) + check_grid_shape(grid)
-    if not rows:
-        errors.append(
-            "the Sheet has no data rows (only a header, or nothing at all) - check that "
-            "'sheet_tab' in the project's registry entry names the right tab, and that "
-            "the Sheet has actually been populated and shared"
-        )
-    return [RowValidation(row_number=1, identifier="", errors=errors)] if errors else []
+    header_errors = check_column_map(column_map)
+    if header_errors:
+        results.append(RowValidation(row_number=1, identifier="", errors=header_errors))
+
+    for message in check_grid_shape(grid):
+        match = _GRID_SHAPE_ROW_NUMBER_RE.match(message)
+        row_number = int(match.group(1)) if match else 1
+        results.append(RowValidation(row_number=row_number, identifier="", errors=[message]))
+
+    return results
 
 
 def format_field_receipt(column_map: ColumnMap) -> str:
@@ -309,33 +318,56 @@ def _pluralize(count: int, noun: str) -> str:
 
 
 def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowValidation]) -> str:
-    """row_results must be validate_rows()'s output for these same rows, in
-    the same order (one result per row) - NOT the combined report that also
-    includes sheet_structure_validation()'s single row-1 entry, which isn't
-    aligned with `rows` at all.
+    """row_results must be validate_rows()'s own output for these exact
+    rows, in the same order (one result per row) - NOT the combined report
+    that also includes sheet_structure_validation()'s row-1/shape entries,
+    which are not aligned with `rows` at all. Passing a mismatched list
+    would make zip() silently truncate to the shorter one rather than
+    raising, so a caller-side wiring mistake would produce plausible-looking
+    but wrong counts instead of an obvious failure - which is exactly the
+    kind of silent wrongness this function exists to prevent, so the length
+    is checked explicitly instead.
 
-    Counts are cross-referenced against row_results rather than classify_row()
-    alone: an UNASSIGNED row that failed content validation (missing title,
-    say) is not "ready to upload" just because it has no identifier yet -
-    reporting it as ready is exactly the kind of pass/fail contradiction that
-    makes a human trust the summary over the report above it, which is
-    backwards."""
-    ready = 0
-    failed_unassigned = 0
-    done = 0
-    reserved = 0
+    Counts are cross-referenced against row_results rather than
+    classify_row() alone, for EVERY bucket, not just "ready": a row that
+    classify_row() would call DONE or RESERVED but that actually fails
+    validation (a duplicate identifier, an unregistered project prefix, a
+    now-missing title) is not "already uploaded" or "will retry" just
+    because it has the shape of one - RESERVED in particular makes a
+    forward-looking promise ("will retry under existing identifier") that a
+    row failing identifier validation cannot keep. Every row falls into
+    exactly one of UNASSIGNED/DONE/RESERVED and then exactly one of
+    valid/invalid, so the six counts below always sum to len(rows)."""
+    if len(rows) != len(row_results):
+        raise ValueError(
+            f"format_lifecycle_summary: got {len(rows)} row(s) but {len(row_results)} "
+            "row_results - they must be the same length, in the same order. Pass "
+            "validate_rows()'s own return value here, not the combined report (which "
+            "also carries sheet_structure_validation()'s row-1/shape entries)."
+        )
+
+    ready = failed_unassigned = 0
+    done = failed_done = 0
+    reserved = failed_reserved = 0
 
     for row, result in zip(rows, row_results):
         state = classify_row(row)
+        valid = result.is_valid
         if state is RowState.UNASSIGNED:
-            if result.is_valid:
+            if valid:
                 ready += 1
             else:
                 failed_unassigned += 1
         elif state is RowState.DONE:
-            done += 1
+            if valid:
+                done += 1
+            else:
+                failed_done += 1
         elif state is RowState.RESERVED:
-            reserved += 1
+            if valid:
+                reserved += 1
+            else:
+                failed_reserved += 1
 
     lines = [f"{_pluralize(ready, 'row')} ready to upload (no identifier yet)"]
     if failed_unassigned:
@@ -344,11 +376,27 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
             "validation - see the errors above; will not be uploaded until fixed"
         )
     lines.append(f"{done} already uploaded")
+    if failed_done:
+        lines.append(
+            f"{_pluralize(failed_done, 'row')} already uploaded but now fail validation - see "
+            "the errors above; this needs a human to look, not an automatic retry"
+        )
     lines.append(f"{reserved} reserved but unconfirmed - will retry under existing identifier")
+    if failed_reserved:
+        lines.append(
+            f"{_pluralize(failed_reserved, 'row')} reserved but invalid - see the errors above; "
+            "will NOT retry automatically until fixed"
+        )
     return "\n".join(lines)
 
 
-def format_report(results: list[RowValidation]) -> str:
+def _format_result_lines(results: list[RowValidation]) -> list[str]:
+    """The [STATUS]/error-line half of a report, without the trailing
+    "N/M rows passed" count - factored out so a caller that needs to show
+    structural errors WITHOUT a misleading pass/fail count next to them
+    (see cmd_validate's no-data-rows branch: "0/1 rows passed" reads as
+    nonsense when the "1" is a synthetic entry standing in for zero real
+    rows) can reuse the exact same formatting `format_report` uses."""
     lines: list[str] = []
     for result in results:
         status = "PASS" if result.is_valid else "FAIL"
@@ -360,7 +408,11 @@ def format_report(results: list[RowValidation]) -> str:
         lines.append(f"[{status}] row {result.row_number}{label}")
         for error in result.errors:
             lines.append(f"    - {error}")
+    return lines
 
+
+def format_report(results: list[RowValidation]) -> str:
+    lines = _format_result_lines(results)
     passed = sum(1 for r in results if r.is_valid)
     lines.append("")
     lines.append(f"{passed}/{len(results)} rows passed")
@@ -600,7 +652,30 @@ def cmd_validate(args) -> int:
     for row in rows:
         row["mediatype"] = config.mediatype
 
-    structure_results = sheet_structure_validation(column_map, grid, rows)
+    structure_results = sheet_structure_validation(column_map, grid)
+
+    if not rows:
+        # A dedicated branch, not just another row-1 structural error: an
+        # empty read is far more likely to mean a wrong tab name, an
+        # unpopulated copy of the Sheet, or a Sheet never actually shared
+        # with the service account than a real project with zero rows, and
+        # reporting that as success would defeat the entire purpose of
+        # running `validate`. Handled separately from the normal report
+        # (rather than folded into sheet_structure_validation's row-1
+        # entry) specifically so the summary line never has to say
+        # "0/1 rows passed" - that "1" would be a synthetic entry standing
+        # in for zero real rows, which reads as nonsense arithmetic to
+        # whoever is staring at it.
+        if structure_results:
+            print("\n".join(_format_result_lines(structure_results)))
+            print()
+        print(
+            "the Sheet has no data rows (only a header, or nothing at all) - check that "
+            "'sheet_tab' in the project's registry entry names the right tab, and that "
+            "the Sheet has actually been populated and shared"
+        )
+        return 1
+
     row_results = validate_rows(
         rows,
         config.files_dir,
