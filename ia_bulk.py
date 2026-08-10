@@ -683,7 +683,31 @@ def cmd_validate(args) -> int:
         required_columns=SHEET_REQUIRED_COLUMNS,
         check_file_exists=False,
     )
-    results = structure_results + row_results
+    # A structural problem with one specific data row (a long row) belongs
+    # IN that row's own result, not in a second entry printed beside it.
+    # Filing it separately made the row appear twice with opposite verdicts
+    # ("[FAIL] row 9" from check_grid_shape, "[PASS] row 9" from
+    # validate_rows), inflated format_report's denominator past the number
+    # of data rows the Sheet actually has, and - worst - left the row
+    # counted as "ready to upload" by the lifecycle summary, which reads
+    # row_results alone. check_grid_shape and validate_rows both number
+    # rows `offset + 2`, so row_number - 2 indexes row_results exactly.
+    # Anything outside that range is header-level and keeps its own row-1
+    # entry (as does _GRID_SHAPE_ROW_NUMBER_RE's row-1 fallback) - the
+    # bounds check is load-bearing, not defensive: a bare row_number - 2
+    # would quietly fold row 1 into the LAST data row via negative indexing.
+    header_results: list[RowValidation] = []
+    for entry in structure_results:
+        index = entry.row_number - 2
+        if 0 <= index < len(row_results):
+            row_result = row_results[index]
+            # structural errors first: a long row's mis-attributed values
+            # are the likely cause of whatever content errors follow.
+            row_result.errors = entry.errors + row_result.errors
+        else:
+            header_results.append(entry)
+
+    results = header_results + row_results
     print(format_report(results))
     print()
     print(format_field_receipt(column_map))

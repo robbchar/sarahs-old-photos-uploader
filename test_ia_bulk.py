@@ -1192,6 +1192,98 @@ def test_cmd_validate_reports_a_header_collision_and_a_shape_error_under_their_o
     assert "more field(s) than the header" in out
 
 
+def status_lines(out: str) -> list[str]:
+    """The "[PASS]/[FAIL] row N" headings of a report, in printed order -
+    without their indented error lines. Lets a test assert the exact set,
+    order and verdict of the rows reported, which a substring check on any
+    single heading cannot: a row reported twice with opposite verdicts
+    satisfies both `"[FAIL] row 3" in out` and `"[PASS] row 3" in out`."""
+    return [line for line in out.splitlines() if line.startswith("[")]
+
+
+def test_cmd_validate_reports_a_long_row_once_as_failed_not_twice_with_opposite_verdicts(
+    tmp_path, monkeypatch, capsys
+):
+    """A structural problem with a specific data row must be folded into
+    that row's own result, not reported as a second, parallel entry beside
+    it. Filing it separately made a long row print twice with contradicting
+    verdicts ("[FAIL] row 3" from check_grid_shape, "[PASS] row 3" from
+    validate_rows), inflated the "N/M rows passed" denominator past the
+    number of data rows the Sheet actually has, and left the row counted as
+    "ready to upload" in the lifecycle summary - a failing row promised as
+    uploadable, printed directly beneath the report failing it.
+
+    Row 3 is long but otherwise complete (title present, identifier blank
+    which is normal, no header defect anywhere), so the shape error is the
+    only possible source of a failure and the only possible source of an
+    entry outside the three data rows."""
+    from ia_bulk import cmd_validate
+
+    grid = [
+        ["Title", "Date"],
+        ["First photo", "1912"],
+        ["Second photo", "1913", "unexpected extra cell"],
+        ["Third photo", "1914"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    # each row exactly once, in order, under its own number - no duplicate
+    # row 3 and no phantom row-1 entry standing in for a data row's problem
+    assert status_lines(out) == ["[PASS] row 2", "[FAIL] row 3", "[PASS] row 4"]
+    # the error is filed under row 3's heading, not merely mentioned somewhere
+    assert "[FAIL] row 3\n    - row 3 has 1 more field(s) than the header" in out
+    # the denominator is the real number of data rows (3), not 3 + one
+    # parallel structural entry
+    assert "2/3 rows passed" in out
+    # and the failing row is counted as failed, not as ready to upload
+    assert "2 rows ready to upload (no identifier yet)" in out
+    assert "1 row not yet assigned an identifier but failed validation" in out
+
+
+def test_cmd_validate_keeps_a_header_level_error_under_row_1_when_the_last_data_row_is_also_long(
+    tmp_path, monkeypatch, capsys
+):
+    """The companion hazard to folding per-row structural errors into
+    row_results: a header-level entry is row 1, and `row_results[1 - 2]` is
+    `row_results[-1]` - Python's negative indexing would quietly file a
+    header collision under the LAST data row and drop the row-1 heading
+    entirely. Here the last data row is ALSO long, so a wrong fold lands the
+    collision on a row that already fails for its own reason and would
+    otherwise look plausible."""
+    from ia_bulk import cmd_validate
+
+    grid = [
+        ["Genre / Form", "Genre_ Form", "Title"],  # colliding headers -> a header-level error
+        ["a", "b", "First photo"],
+        ["c", "d", "Second photo", "unexpected extra cell"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert status_lines(out) == ["[FAIL] row 1", "[PASS] row 2", "[FAIL] row 3"]
+    assert "[FAIL] row 1\n    - columns 'Genre / Form' and 'Genre_ Form' both normalize" in out
+    assert "[FAIL] row 3\n    - row 3 has 1 more field(s) than the header" in out
+
+
 @pytest.mark.parametrize("live", [True, False])
 def test_cmd_validate_passes_live_flag_and_project_config_through_to_build_sheet_client(
     tmp_path, monkeypatch, live
