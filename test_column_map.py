@@ -118,6 +118,21 @@ def test_check_column_map_empty_field_name():
     assert "empty" in errors[0].lower()
 
 
+def test_check_column_map_multiple_blank_headers_produce_one_combined_error():
+    """Previously: N headers normalizing to "" produced N empty-field-name
+    messages plus N-1 pairwise "both normalize to the same field name"
+    collision messages against each other - three blank columns produced
+    five overlapping messages for one root cause. They must be reported
+    once, together, naming each blank header."""
+    column_map = build_column_map(["", "!!!", "###", "Title"])
+
+    errors = check_column_map(column_map)
+
+    assert len(errors) == 1
+    assert "!!!" in errors[0]
+    assert "###" in errors[0]
+
+
 def test_check_column_map_clean():
     """A clean ColumnMap with no collisions should produce no errors."""
     column_map = build_column_map(["Title", "Date", "Genre / Form"])

@@ -87,7 +87,7 @@ def suggest_standard_fields(field_names: Iterable[str]) -> list[Suggestion]:
                 field_name=field_name,
                 standard=standard,
                 reason=(
-                    f"`{standard}` is a standard IA field — rename only if this "
+                    f"`{standard}` is a standard IA field - rename only if this "
                     "column means the same thing"
                 ),
             )

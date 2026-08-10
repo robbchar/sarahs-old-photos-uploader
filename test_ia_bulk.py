@@ -4,6 +4,7 @@ from argparse import Namespace
 
 import internetarchive
 import pytest
+from googleapiclient.errors import HttpError
 
 from column_map import build_column_map
 from ia_bulk import (
@@ -112,6 +113,35 @@ class FakeSheetClient:
 
     def read_grid(self):
         return self._grid
+
+
+class RaisingSheetClient:
+    """Stands in for SheetClient when a test needs read_grid() to raise -
+    e.g. an HttpError from a wrong tab name or a not-yet-shared Sheet."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def read_grid(self):
+        raise self._exc
+
+
+def make_http_error(message="Unable to parse range: Sheet1", status=400):
+    """A realistic HttpError, as googleapiclient actually raises it: the
+    real .resp needs a .status and .reason, and .content must be the raw
+    JSON error body Google's API returns, not a plain string."""
+
+    class _FakeHttpResponse:
+        def __init__(self, status, reason):
+            self.status = status
+            self.reason = reason
+
+    content = json.dumps({"error": {"message": message}}).encode("utf-8")
+    return HttpError(
+        _FakeHttpResponse(status, reason="Bad Request"),
+        content,
+        uri="https://sheets.googleapis.com/v4/spreadsheets/TEST_SHEET_ID/values/Sheet1",
+    )
 
 
 def test_check_identifier_accepts_valid_registered_identifier():
@@ -337,6 +367,32 @@ def test_validate_rows_accepts_a_row_whose_trailing_cell_is_merely_empty(tmp_pat
     assert results[0].is_valid
 
 
+def test_validate_rows_default_required_columns_still_requires_identifier_and_file(tmp_path):
+    """Pins validate_rows' required_columns default at REQUIRED_UPLOAD_COLUMNS
+    - the CSV path, unchanged - since introducing that parameter for the
+    Sheet path means the CSV path's own correctness now depends on a
+    default value rather than on hardcoded behavior. If the default were
+    ever flipped to SHEET_REQUIRED_COLUMNS (which excludes identifier and
+    file), a CSV row with both blank would become "valid", and
+    effective_identifier("", live=False) returns just "zztest-" - not a
+    real identifier."""
+    rows = [
+        {
+            "identifier": "",
+            "file": "",
+            "mediatype": "image",
+            "title": "First photo",
+            "date": "1958",
+        }
+    ]
+
+    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+
+    assert not results[0].is_valid
+    assert "missing required column 'identifier'" in results[0].errors
+    assert "missing required column 'file'" in results[0].errors
+
+
 def test_check_header_accepts_a_clean_header():
     from ia_bulk import check_header
 
@@ -551,6 +607,19 @@ def test_format_report_shows_pass_and_fail_with_summary():
     assert "1/2 rows passed" in report
 
 
+def test_format_report_does_not_duplicate_the_row_number_for_a_blank_identifier():
+    """A blank identifier is the normal state of an unassigned Sheet row
+    (RowState.UNASSIGNED), not a special case worth restating the row
+    number for - "[PASS] row 2 (row 2)" said nothing "[PASS] row 2" didn't
+    already say, and reads as a bug on every passing Sheet row."""
+    from ia_bulk import format_report
+
+    report = format_report([RowValidation(row_number=2, identifier="", errors=[])])
+
+    assert "[PASS] row 2" in report
+    assert "(row 2)" not in report
+
+
 def test_cmd_validate_returns_zero_when_all_rows_valid(tmp_path, capsys):
     from ia_bulk import cmd_validate
 
@@ -634,12 +703,45 @@ def test_lifecycle_summary_counts_each_state():
         {"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
         {"identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
     ]
+    # row_results must line up 1:1 with rows, in order; all pass here so
+    # this test pins pure lifecycle counting, independent of the
+    # fails-validation case pinned separately below.
+    row_results = [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
 
-    summary = format_lifecycle_summary(rows)
+    summary = format_lifecycle_summary(rows, row_results)
 
     assert "2 rows ready to upload" in summary
     assert "1 already uploaded" in summary
     assert "1 reserved but unconfirmed" in summary
+
+
+def test_lifecycle_summary_uses_singular_row_for_a_count_of_one():
+    rows = [{"identifier": "", "ia_uploaded": ""}]
+    row_results = [RowValidation(row_number=2, identifier="")]
+
+    summary = format_lifecycle_summary(rows, row_results)
+
+    assert "1 row ready to upload" in summary
+    assert "1 rows ready to upload" not in summary
+
+
+def test_lifecycle_summary_does_not_count_a_failed_unassigned_row_as_ready():
+    """The bug the coordinator caught: classify_row() alone can't see
+    validation results, so a row with a blank identifier that actually
+    failed validation (missing title, say) was counted as "ready to
+    upload" right next to a report saying that same row failed. Counts
+    must be cross-referenced against row_results, and a failed-but-
+    unassigned row must be called out separately rather than folded into
+    either bucket silently."""
+    rows = [{"identifier": "", "ia_uploaded": ""}]
+    row_results = [
+        RowValidation(row_number=2, identifier="", errors=["missing required column 'title'"])
+    ]
+
+    summary = format_lifecycle_summary(rows, row_results)
+
+    assert "0 rows ready to upload" in summary
+    assert "1 row" in summary and "failed validation" in summary
 
 
 class _RecordingSheetsValues:
@@ -784,7 +886,7 @@ def test_cmd_validate_reads_the_sheet_and_injects_mediatype_when_csv_is_omitted(
     assert exit_code == 0
     assert "1/1 rows passed" in out
     assert "will upload these metadata fields:" in out
-    assert "1 rows ready to upload" in out
+    assert "1 row ready to upload" in out
     assert "suggestions (advisory - nothing is changed automatically):" in out
 
 
@@ -910,9 +1012,18 @@ def test_cmd_validate_flags_a_sheet_row_longer_than_the_header(tmp_path, monkeyp
     assert "more field(s) than the header" in out
 
 
+@pytest.mark.parametrize("live", [True, False])
 def test_cmd_validate_passes_live_flag_and_project_config_through_to_build_sheet_client(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, live
 ):
+    """Coordinator-flagged CRITICAL gap: only the live=True case was ever
+    exercised, so cmd_validate could have been hardcoded to
+    build_sheet_client(config, True) - always reading the REAL Sheet
+    regardless of --live - and every one of the 167 tests at the time would
+    still have passed, because every other Sheet test's stub discards
+    `live` entirely. Parametrizing over both values is what pins the
+    argument actually flows through, in both directions, rather than one
+    direction happening to be right by coincidence."""
     from ia_bulk import cmd_validate
 
     captured = {}
@@ -928,11 +1039,11 @@ def test_cmd_validate_passes_live_flag_and_project_config_through_to_build_sheet
     registry_path.write_text(
         json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
-    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=True)
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=live)
 
     cmd_validate(args)
 
-    assert captured["live"] is True
+    assert captured["live"] is live
     assert captured["project_id"] == "astoriaphotos"
 
 
@@ -955,6 +1066,240 @@ def test_cmd_validate_rejects_an_unknown_project_before_touching_the_sheet(tmp_p
         cmd_validate(args)
 
     assert calls == []
+
+
+def test_cmd_validate_rejects_an_unreplaced_placeholder_sheet_id_before_touching_the_network(
+    tmp_path, monkeypatch, capsys
+):
+    """projects_registry.json ships sheet_id/test_sheet_id as
+    REPLACE_WITH_* until a human edits in the real Google Sheet ID. Asking
+    Google about a placeholder produces an opaque 404/permission error that
+    doesn't say what to fix; catching it before the network call and naming
+    the registry file directly is what makes the first-run failure
+    actionable."""
+    from ia_bulk import cmd_validate
+
+    def _must_not_reach_the_network(config, live):
+        raise AssertionError("build_sheet_client must not be called for an unreplaced placeholder")
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", _must_not_reach_the_network)
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(test_sheet_id="REPLACE_WITH_TEST_SHEET_ID")), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "REPLACE_WITH_TEST_SHEET_ID" in err
+    assert str(registry_path) in err
+
+
+def test_cmd_validate_turns_an_http_error_reading_the_sheet_into_an_actionable_message(
+    tmp_path, monkeypatch, capsys
+):
+    """A wrong tab name (or an unshared/deleted Sheet) surfaces from the API
+    as googleapiclient.errors.HttpError, e.g. "Unable to parse range:
+    Sheet1" - which by itself doesn't tell anyone to go edit 'sheet_tab' in
+    the registry. This must be caught and turned into a message naming the
+    spreadsheet ID, the tab, and the registry file, not left as a raw
+    traceback."""
+    from ia_bulk import cmd_validate
+
+    monkeypatch.setattr(
+        "ia_bulk.build_sheet_client",
+        lambda config, live: RaisingSheetClient(make_http_error("Unable to parse range: Sheet1")),
+    )
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(sheet_tab="Sheet1")), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "TEST_SHEET_ID" in err
+    assert "Sheet1" in err
+    assert str(registry_path) in err
+    assert "sheet_tab" in err
+
+
+def test_cmd_validate_flags_a_header_only_sheet_as_an_error_not_a_false_green(
+    tmp_path, monkeypatch, capsys
+):
+    """An empty read is far more likely to mean a wrong tab, an unpopulated
+    copy of the Sheet, or a Sheet never actually shared with the service
+    account than a real project with zero rows - reporting "0/0 rows
+    passed" and exiting 0 would be a false green from a command whose
+    entire job is catching exactly this kind of problem."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title", "file"]]  # header row only, zero data rows
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no data rows" in out
+
+
+def test_cmd_validate_flags_a_completely_empty_sheet_as_an_error(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_validate
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient([]))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "no data rows" in out
+
+
+def test_cmd_validate_prints_test_mode_and_the_test_sheet_id_by_default(tmp_path, monkeypatch, capsys):
+    """Run mode is this project's core safety design, so it - and exactly
+    which spreadsheet/tab back it - must be visible in the output, not just
+    implied by which flags were passed on the command line."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title"], ["First"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"), sheet_tab="Donor Photos")
+        ),
+        encoding="utf-8",
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert "test mode" in out
+    assert "TEST_SHEET_ID" in out
+    assert "REAL_SHEET_ID" not in out
+    assert "Donor Photos" in out
+
+
+def test_cmd_validate_prints_live_mode_and_the_real_sheet_id_when_live(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_validate
+
+    grid = [["Title"], ["First"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"), sheet_tab="Donor Photos")
+        ),
+        encoding="utf-8",
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=True)
+
+    cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert "live mode" in out
+    assert "REAL_SHEET_ID" in out
+    assert "TEST_SHEET_ID" not in out
+
+
+def test_cmd_validate_injects_mediatype_from_the_registry_not_a_hardcoded_value(tmp_path, monkeypatch):
+    """Every existing fixture happens to use mediatype="image", so a
+    hardcoded row["mediatype"] = "image" would pass all of them - proving
+    only "some non-empty value", never "from ProjectConfig.mediatype".
+    mediatype is permanent on IA once uploaded and is never printed
+    anywhere, so nothing else in this suite would catch a wrong source -
+    a distinctive fixture value plus capturing the actual row dict passed
+    to validate_rows is the only way to pin it."""
+    from ia_bulk import cmd_validate
+
+    captured_rows = []
+
+    def fake_validate_rows(rows, files_dir, registry, **kwargs):
+        captured_rows.extend(rows)
+        return [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
+
+    monkeypatch.setattr("ia_bulk.validate_rows", fake_validate_rows)
+    grid = [["Title"], ["First photo"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path), mediatype="phonorecord")),
+        encoding="utf-8",
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+
+    assert captured_rows == [{"title": "First photo", "mediatype": "phonorecord"}]
+
+
+def test_cmd_validate_prints_an_actual_suggestion_not_just_the_heading(tmp_path, monkeypatch, capsys):
+    """Only the "suggestions (advisory ...)" heading was previously
+    asserted anywhere - deleting the loop that prints each suggestion,
+    keeping only the heading, passed every test. This is one of the three
+    things the Phase 1 handoff session exists to exercise."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title", "Photographer"], ["First photo", "Jane Doe"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert "photographer" in out
+    assert "creator" in out
+
+
+def test_cmd_validate_treats_an_empty_csv_flag_as_an_explicit_csv_path_not_the_sheet_path(monkeypatch):
+    """--csv "" must stay on the CSV branch (and fail there, opening a file
+    named "") rather than silently falling through to the Sheet path
+    because an empty string is falsy - `if csv_path:` was the bug,
+    `if csv_path is not None:` is the fix. Guarding build_sheet_client to
+    raise AssertionError if reached, and asserting specifically
+    FileNotFoundError (not a bare Exception), proves this fails for the
+    CSV-branch reason and not by tripping the guard."""
+    from ia_bulk import cmd_validate
+
+    def _must_not_reach_the_sheet_path(config, live):
+        raise AssertionError("--csv '' must stay on the CSV path, not fall through to the Sheet")
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", _must_not_reach_the_sheet_path)
+
+    args = Namespace(
+        csv="", files_dir=".", registry="projects_registry.json", project="astoriaphotos", live=False
+    )
+
+    with pytest.raises(FileNotFoundError):
+        cmd_validate(args)
 
 
 def test_chunk_rows_splits_into_groups_of_chunk_size():

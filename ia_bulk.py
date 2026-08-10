@@ -18,6 +18,7 @@ from typing import Iterator
 import googleapiclient.discovery
 import internetarchive
 import requests
+from googleapiclient.errors import HttpError
 
 import google_auth
 from column_map import ColumnMap, check_column_map, check_grid_shape, grid_to_rows
@@ -53,6 +54,11 @@ CHUNK_SIZE = 500
 TEST_COLLECTION = "test_collection"
 TEST_IDENTIFIER_PREFIX = "zztest-"
 UNDATED_PLACEHOLDER = "[n.d.]"
+# projects_registry.json ships sheet_id/test_sheet_id as REPLACE_WITH_* until
+# someone edits in the real Google Sheet ID. Checked before ever asking
+# Google about it, so an unreplaced placeholder fails with a message naming
+# the fix (edit the registry) instead of an opaque 404/permission error.
+PLACEHOLDER_SHEET_ID_PREFIX = "REPLACE_WITH"
 
 
 def chunk_rows(rows: list[dict], chunk_size: int = CHUNK_SIZE) -> "Iterator[list[dict]]":
@@ -257,16 +263,33 @@ def validate_rows(
     return results
 
 
-def sheet_structure_validation(column_map: ColumnMap, grid: list[list[str]]) -> list[RowValidation]:
+def sheet_structure_validation(
+    column_map: ColumnMap, grid: list[list[str]], rows: list[dict[str, str]]
+) -> list[RowValidation]:
     """check_column_map catches two headers that normalize to the same IA
     field name - which would silently overwrite one column's data across
     every row - and headers that normalize to an empty field name.
     check_grid_shape catches a data row longer than the header, whose excess
-    cells otherwise vanish without a trace. Reported as row 1, mirroring
-    header_validation() for the CSV path, so these flow through the same
-    report and exit-code path as row problems instead of needing a parallel
-    channel."""
+    cells otherwise vanish without a trace.
+
+    A Sheet with no data rows (header-only, or completely empty) is also
+    flagged here as an error rather than allowed to print "0/0 rows passed"
+    and exit 0: an empty read is far more likely to mean a wrong tab name,
+    an unpopulated copy of the Sheet, or a Sheet that was never actually
+    shared with the service account than a real project with zero rows -
+    and reporting that as success would defeat the entire purpose of
+    running `validate`.
+
+    All of the above are reported as row 1, mirroring header_validation()
+    for the CSV path, so they flow through the same report and exit-code
+    path as row problems instead of needing a parallel channel."""
     errors = check_column_map(column_map) + check_grid_shape(grid)
+    if not rows:
+        errors.append(
+            "the Sheet has no data rows (only a header, or nothing at all) - check that "
+            "'sheet_tab' in the project's registry entry names the right tab, and that "
+            "the Sheet has actually been populated and shared"
+        )
     return [RowValidation(row_number=1, identifier="", errors=errors)] if errors else []
 
 
@@ -281,27 +304,60 @@ def format_field_receipt(column_map: ColumnMap) -> str:
     return "\n".join(lines)
 
 
-def format_lifecycle_summary(rows: list[dict[str, str]]) -> str:
-    counts = {state: 0 for state in RowState}
-    for row in rows:
-        counts[classify_row(row)] += 1
+def _pluralize(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
-    return "\n".join(
-        [
-            f"{counts[RowState.UNASSIGNED]} rows ready to upload (no identifier yet)",
-            f"{counts[RowState.DONE]} already uploaded",
-            f"{counts[RowState.RESERVED]} reserved but unconfirmed "
-            "- will retry under existing identifier",
-        ]
-    )
+
+def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowValidation]) -> str:
+    """row_results must be validate_rows()'s output for these same rows, in
+    the same order (one result per row) - NOT the combined report that also
+    includes sheet_structure_validation()'s single row-1 entry, which isn't
+    aligned with `rows` at all.
+
+    Counts are cross-referenced against row_results rather than classify_row()
+    alone: an UNASSIGNED row that failed content validation (missing title,
+    say) is not "ready to upload" just because it has no identifier yet -
+    reporting it as ready is exactly the kind of pass/fail contradiction that
+    makes a human trust the summary over the report above it, which is
+    backwards."""
+    ready = 0
+    failed_unassigned = 0
+    done = 0
+    reserved = 0
+
+    for row, result in zip(rows, row_results):
+        state = classify_row(row)
+        if state is RowState.UNASSIGNED:
+            if result.is_valid:
+                ready += 1
+            else:
+                failed_unassigned += 1
+        elif state is RowState.DONE:
+            done += 1
+        elif state is RowState.RESERVED:
+            reserved += 1
+
+    lines = [f"{_pluralize(ready, 'row')} ready to upload (no identifier yet)"]
+    if failed_unassigned:
+        lines.append(
+            f"{_pluralize(failed_unassigned, 'row')} not yet assigned an identifier but failed "
+            "validation - see the errors above; will not be uploaded until fixed"
+        )
+    lines.append(f"{done} already uploaded")
+    lines.append(f"{reserved} reserved but unconfirmed - will retry under existing identifier")
+    return "\n".join(lines)
 
 
 def format_report(results: list[RowValidation]) -> str:
     lines: list[str] = []
     for result in results:
         status = "PASS" if result.is_valid else "FAIL"
-        label = result.identifier or f"(row {result.row_number})"
-        lines.append(f"[{status}] row {result.row_number} {label}")
+        # A blank identifier is the normal state of an unassigned Sheet row
+        # (see RowState.UNASSIGNED), not a special case worth restating the
+        # row number for - "[PASS] row 2 (row 2)" said nothing "[PASS] row 2"
+        # didn't already say.
+        label = f" {result.identifier}" if result.identifier else ""
+        lines.append(f"[{status}] row {result.row_number}{label}")
         for error in result.errors:
             lines.append(f"    - {error}")
 
@@ -487,9 +543,13 @@ def build_sheet_client(config: ProjectConfig, live: bool) -> SheetClient:
 
 
 def cmd_validate(args) -> int:
+    # `is not None`, not truthiness: --csv "" must be an explicit (if
+    # useless) request to read a CSV named "", and fail as such, rather than
+    # silently falling through to the Sheet path because an empty string is
+    # falsy.
     csv_path = getattr(args, "csv", None)
-    if csv_path:
-        data = read_csv(args.csv)
+    if csv_path is not None:
+        data = read_csv(csv_path)
         registry = load_registry(args.registry)
         results = header_validation(data.fieldnames) + validate_rows(
             data.rows, args.files_dir, registry
@@ -499,8 +559,39 @@ def cmd_validate(args) -> int:
 
     registry = load_registry(args.registry)
     config = load_project_config(registry, args.project)
+    sheet_id = config.sheet_id_for(args.live)
+    mode = "live" if args.live else "test"
+
+    # The run mode is this project's core safety design (a rehearsal must
+    # never touch the real Sheet), so it - and exactly which spreadsheet and
+    # tab back it - is printed before anything else, unconditionally, not
+    # just on success. A human staring at a report has to be able to
+    # confirm at a glance they're pointed where they think they are.
+    print(f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', tab '{config.sheet_tab}'")
+    print()
+
+    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
+        print(
+            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still "
+            f"the placeholder '{sheet_id}' - edit it in {args.registry} to the real Google "
+            "Sheet ID before running validate.",
+            file=sys.stderr,
+        )
+        return 1
+
     client = build_sheet_client(config, args.live)
-    grid = client.read_grid()
+    try:
+        grid = client.read_grid()
+    except HttpError as exc:
+        print(
+            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
+            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
+            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
+            "been shared with the service account.",
+            file=sys.stderr,
+        )
+        return 1
+
     column_map, rows = grid_to_rows(grid)
 
     # mediatype is a per-project constant, never a Sheet column - inject it
@@ -509,18 +600,20 @@ def cmd_validate(args) -> int:
     for row in rows:
         row["mediatype"] = config.mediatype
 
-    results = sheet_structure_validation(column_map, grid) + validate_rows(
+    structure_results = sheet_structure_validation(column_map, grid, rows)
+    row_results = validate_rows(
         rows,
         config.files_dir,
         registry,
         required_columns=SHEET_REQUIRED_COLUMNS,
         check_file_exists=False,
     )
+    results = structure_results + row_results
     print(format_report(results))
     print()
     print(format_field_receipt(column_map))
     print()
-    print(format_lifecycle_summary(rows))
+    print(format_lifecycle_summary(rows, row_results))
     print()
     print("suggestions (advisory - nothing is changed automatically):")
     suggestions = suggest_standard_fields(column_map.uploadable_fields())

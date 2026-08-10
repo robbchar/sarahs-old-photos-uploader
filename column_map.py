@@ -93,14 +93,37 @@ def check_column_map(column_map: ColumnMap) -> list[str]:
     headers normalizing to the same field name collide, silently overwriting
     one value with the other in the output dict. A header normalizing to the
     empty string is a similar defect: multiple decorative/divider columns would
-    all collide on an empty key. This function reports each collision and each
-    empty-string field name so all defects are visible to the user at once."""
+    all collide on an empty key. This function reports each collision and the
+    empty-string field name defect so all defects are visible to the user at
+    once.
+
+    Headers that normalize to "" are reported as a single combined message
+    naming all of them, not one message per header plus a pairwise collision
+    message for every pair - three blank/decorative columns used to produce
+    five overlapping messages for what is really one root cause, which reads
+    as noise rather than a clear signal."""
     errors: list[str] = []
 
-    # Check for collisions: two different headers mapping to the same field name
+    blank_headers = [header for header in column_map.headers if column_map.field_names[header] == ""]
+    if blank_headers:
+        header_list = ", ".join(f"'{header}'" for header in blank_headers)
+        errors.append(
+            f"column(s) {header_list} normalize to an empty field name (no alphanumeric "
+            "characters remain after removing punctuation) - any columns that do this "
+            "collide with each other and silently overwrite one another's value"
+        )
+
+    # Check for collisions among the remaining (non-blank) headers: two
+    # different headers mapping to the same non-empty field name. Blank
+    # headers are excluded here since they're already covered, together,
+    # above - without this exclusion N blank headers would also produce
+    # N-1 pairwise "both normalize to ''" collision messages against each
+    # other.
     seen: dict[str, str] = {}
     for header in column_map.headers:
         field_name = column_map.field_names[header]
+        if field_name == "":
+            continue
         if field_name in seen:
             errors.append(
                 f"columns '{seen[field_name]}' and '{header}' both normalize to field name "
@@ -108,15 +131,6 @@ def check_column_map(column_map: ColumnMap) -> list[str]:
             )
         else:
             seen[field_name] = header
-
-    # Check for empty field names
-    for header in column_map.headers:
-        if column_map.field_names[header] == "":
-            errors.append(
-                f"column '{header}' normalizes to an empty field name (no alphanumeric "
-                "characters remain after removing punctuation) - it will collide with "
-                "other decorative columns and destroy data"
-            )
 
     return errors
 
