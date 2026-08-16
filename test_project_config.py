@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from project_config import ConfigError, load_project_config
+from project_config import REQUIRED_KEYS, ConfigError, load_project_config
 
 REGISTRY = {
     "collection_key": "lcps",
@@ -118,19 +118,20 @@ def test_non_string_project_value_is_rejected():
         load_project_config(registry, "p")
 
 
-def test_shipped_registry_json_loads_and_has_placeholders():
-    """Ensure the real projects_registry.json on disk loads successfully
-    and contains the expected placeholder values. This test pins the registry
-    and REQUIRED_KEYS together so changes to one are caught if they drift
-    from the other."""
+def test_shipped_registry_json_loads_against_the_current_required_keys():
+    """Pin the registry file and REQUIRED_KEYS together so the two cannot drift
+    apart silently: adding a required key without adding it to the shipped
+    registry, or removing a key from the registry, both fail here.
+
+    Deliberately asserts nothing about the *values*. Those are operational
+    settings that get filled in with real Sheet IDs and collection names as the
+    project is configured, so asserting placeholders would make this test fail
+    the moment the tool starts being used for real."""
     registry_path = Path(__file__).parent / "projects_registry.json"
     with open(registry_path) as f:
         registry = json.load(f)
 
-    # Should load without error
     config = load_project_config(registry, "sarahsoldphotos")
 
-    # Verify placeholder values are intact
-    assert config.ia_collection == "CONFIRM_WITH_LCPS"
-    assert config.sheet_id == "REPLACE_WITH_REAL_SHEET_ID"
-    assert config.test_sheet_id == "REPLACE_WITH_TEST_SHEET_ID"
+    for key in REQUIRED_KEYS:
+        assert getattr(config, key), f"shipped registry has an empty '{key}'"

@@ -309,7 +309,8 @@ def format_field_receipt(column_map: ColumnMap) -> str:
     fields = column_map.uploadable_fields()
     lines.append("  " + ", ".join(fields) if fields else "  (none)")
     if column_map.held_back:
-        lines.append("held back (LCPS Internal): " + ", ".join(column_map.held_back))
+        lines.append("held back (LCPS Internal):")
+        lines.append("  " + ", ".join(column_map.held_back))
     return "\n".join(lines)
 
 
