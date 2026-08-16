@@ -108,15 +108,23 @@ def check_identifier(
     row_number: int,
     registry: dict,
     seen_identifiers: dict[str, int],
+    column_name: str = "identifier",
 ) -> list[str]:
+    """column_name defaults to "identifier" (the CSV path, unchanged) and
+    names the column being checked in every message. The Sheet path passes
+    "ia_identifier" - on a Sheet that has BOTH its own `Identifier` column
+    (donor metadata, untouched by this tool) and `ia_identifier` (the
+    tool's minted one), a message that just says "identifier" leaves a
+    volunteer unable to tell which column to go fix. Naming the actual
+    column is exactly what Part A's `ia_` prefix exists to make possible."""
     identifier = identifier.strip()
     if not identifier:
-        return ["missing required column 'identifier'"]
+        return [f"missing required column '{column_name}'"]
 
     errors: list[str] = []
     if not IDENTIFIER_RE.match(identifier):
         errors.append(
-            f"identifier '{identifier}' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
+            f"{column_name} '{identifier}' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
         )
     else:
         collection_key, project_id, _number = identifier.split("-")
@@ -125,11 +133,11 @@ def check_identifier(
         )
         if not known_prefix:
             errors.append(
-                f"identifier prefix '{collection_key}-{project_id}' not found in project registry"
+                f"{column_name} prefix '{collection_key}-{project_id}' not found in project registry"
             )
 
     if identifier in seen_identifiers:
-        errors.append(f"identifier '{identifier}' duplicates row {seen_identifiers[identifier]}")
+        errors.append(f"{column_name} '{identifier}' duplicates row {seen_identifiers[identifier]}")
     else:
         seen_identifiers[identifier] = row_number
 
@@ -273,7 +281,11 @@ def validate_rows(
                 errors.append(f"missing required column '{column}'")
 
         if identifier:
-            errors.extend(check_identifier(identifier, row_number, registry, seen_identifiers))
+            errors.extend(
+                check_identifier(
+                    identifier, row_number, registry, seen_identifiers, identifier_column
+                )
+            )
 
         if check_file_exists:
             file_value = (row.get("file") or "").strip()

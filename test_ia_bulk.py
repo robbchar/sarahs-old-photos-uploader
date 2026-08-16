@@ -193,6 +193,39 @@ def test_check_identifier_rejects_empty():
     assert errors == ["missing required column 'identifier'"]
 
 
+def test_check_identifier_column_name_defaults_to_identifier_for_the_csv_path():
+    """Pins the CSV path's wording exactly - column_name existing as a
+    parameter must not change what the CSV path's messages say."""
+    errors = check_identifier(
+        "LCPS_astoriaphotos_1", row_number=2, registry=make_registry(), seen_identifiers={}
+    )
+    assert errors == [
+        "identifier 'LCPS_astoriaphotos_1' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
+    ]
+
+
+def test_check_identifier_names_the_column_it_checked():
+    """A Sheet with both a donor 'Identifier' column (untouched metadata)
+    and 'ia_identifier' (the tool's minted one) needs its error messages to
+    say WHICH column is wrong - the bare word 'identifier' is ambiguous
+    between the two and sends a volunteer to fix the wrong one."""
+    errors = check_identifier(
+        "lcps-astoriaphotos-00001",
+        row_number=5,
+        registry=make_registry(),
+        seen_identifiers={"lcps-astoriaphotos-00001": 2},
+        column_name="ia_identifier",
+    )
+    assert errors == ["ia_identifier 'lcps-astoriaphotos-00001' duplicates row 2"]
+
+
+def test_check_identifier_names_the_column_for_a_blank_value_too():
+    errors = check_identifier(
+        "", row_number=2, registry=make_registry(), seen_identifiers={}, column_name="ia_identifier"
+    )
+    assert errors == ["missing required column 'ia_identifier'"]
+
+
 def test_validate_rows_passes_a_fully_valid_row(tmp_path):
     (tmp_path / "photo1.jpg").write_bytes(b"fake-image-bytes")
     rows = [
@@ -1120,6 +1153,38 @@ def test_cmd_validate_uploads_a_donor_identifier_column_as_ordinary_metadata(
     assert "1/1 rows passed" in out
     assert "does not match scheme" not in out
     assert "will upload these metadata fields:\n  title, identifier" in out
+
+
+def test_cmd_validate_names_ia_identifier_not_identifier_in_a_duplicate_error(
+    tmp_path, monkeypatch, capsys
+):
+    """A Sheet with BOTH a donor 'Identifier' column (distinct values,
+    ordinary metadata) and a duplicated 'ia_identifier' (the tool's minted
+    one) must say which column the duplicate is actually in - a bare
+    'identifier' would be ambiguous between the two and send a volunteer to
+    edit the wrong cell."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    (tmp_path / "b.jpg").write_bytes(b"x")
+    grid = [
+        ["Title", "file", "Identifier", "ia_identifier"],
+        ["First", "a.jpg", "Donor Ref A", "lcps-astoriaphotos-00001"],
+        ["Second", "b.jpg", "Donor Ref B", "lcps-astoriaphotos-00001"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "ia_identifier 'lcps-astoriaphotos-00001' duplicates row 2" in out
 
 
 def test_cmd_validate_fails_a_row_whose_file_cannot_be_resolved_with_the_resolvers_message(

@@ -215,8 +215,32 @@ def candidate_path(template: str, row: dict[str, str]) -> str:
     not a path guaranteed to exist: see resolve_file(), which is what turns
     a candidate into a real, disk-verified path. Kept separate from
     resolve_file() so the two failure modes (a malformed template vs. a
-    file that isn't actually there) stay distinguishable."""
-    return template.format(**row)
+    file that isn't actually there) stay distinguishable.
+
+    Each field value is stripped before substitution. A folder or filename
+    cell with a stray trailing space is otherwise a landmine on Windows:
+    `Path.is_dir()` normalizes a trailing space away when it stats the
+    path, but `Path.iterdir()` on the very same path can still raise
+    `FileNotFoundError` - two checks in resolve_file() disagreeing about
+    whether the same folder exists. Stripping here removes the space
+    before either check ever sees it, rather than working around the
+    disagreement after the fact."""
+    stripped_row = {key: value.strip() for key, value in row.items()}
+    return template.format(**stripped_row)
+
+
+def _unique_match_or_none(matches: list[str], directory: Path, name_part: str) -> str | None:
+    """Zero matches means "try the next, looser rule" to the caller (a
+    `None` return); more than one is never ambiguous-and-ignorable, so it
+    raises immediately regardless of which rule produced it."""
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    raise FileResolutionError(
+        f"'{name_part}' in '{directory}' matches more than one file, refusing to pick "
+        f"between them: {', '.join(matches)}"
+    )
 
 
 def resolve_file(
@@ -231,45 +255,95 @@ def resolve_file(
     a path".
 
     `candidate` is split at its last "/" into a directory part and a name
-    part. Within `files_dir/<directory>`, an exact filename match wins
-    first (handles the 9 rows that already carry an extension); failing
-    that, a file whose stem matches the name part case-insensitively,
-    ignoring its own extension, wins (handles the 225 that don't). Zero
-    matches or more than one both raise FileResolutionError rather than
-    guess - two files sharing a stem (a JPEG and a TIFF master, say) is
-    exactly the case an operator must resolve by hand, never automatically.
+    part. A "/" present with nothing before it (an empty folder segment -
+    e.g. a blank cell in file_template's folder column) is refused outright
+    rather than treated as "search files_dir's own root": that silently
+    turns a missing required cell into a search of the wrong place instead
+    of a failure. `files_dir` is a hard boundary, not just a starting
+    point - the folder part is resolved and checked to still be under it,
+    so an absolute path or a `..` pasted into a Sheet cell cannot escape it
+    (`Path(files_dir) / part` would otherwise silently discard `files_dir`
+    entirely when `part` is itself absolute).
+
+    Within the resolved directory, matching happens in three passes, each
+    one only tried if the previous found nothing:
+    1. An exact, case-sensitive filename match (handles the 9 real rows
+       that already carry an extension).
+    2. A file whose own extension-stripped stem equals the FULL name part,
+       case-insensitively, without touching the name part itself - this is
+       what lets a name that legitimately contains a dot which isn't an
+       extension (an archival reference like "Report.1958") still match
+       "Report.1958.tif" instead of being chopped down to "Report" and
+       silently matching an unrelated "Report.jpg".
+    3. The same comparison but with the name part's OWN trailing segment
+       also chopped as if it were an extension - this is the fallback that
+       handles the Sheet cell already carrying a real extension in a
+       different case than disk (e.g. ".jpg" in the cell, ".JPEG" on disk).
+    Zero matches (after all three passes) or more than one at any pass both
+    raise FileResolutionError rather than guess - two files sharing a stem
+    (a JPEG and a TIFF master, say) is exactly the case an operator must
+    resolve by hand, never automatically.
 
     `listing_cache` maps a resolved directory to its file listing, built at
     most once per directory - the real Sheet is 234 rows across 5 folders,
     and the full collection is ~10,000 rows across a similar handful, so
     this keeps the cost at one scan per folder rather than one per row."""
-    directory_part, _, name_part = candidate.rpartition("/")
-    directory = Path(files_dir) / directory_part
+    directory_part, separator, name_part = candidate.rpartition("/")
+
+    if separator and not directory_part.strip():
+        raise FileResolutionError(
+            f"'{candidate}' has an empty folder segment before the last '/' - refusing to "
+            "search files_dir's own root on behalf of what looks like a blank folder cell"
+        )
+
+    files_root = Path(files_dir).resolve()
+    directory = (files_root / directory_part).resolve()
+
+    if directory != files_root and files_root not in directory.parents:
+        raise FileResolutionError(
+            f"'{candidate}' resolves to '{directory}', which is outside files_dir "
+            f"('{files_root}') - refusing to search there"
+        )
 
     if directory not in listing_cache:
-        if not directory.is_dir():
-            raise FileResolutionError(f"no such folder: {directory} (does not exist)")
-        listing_cache[directory] = [entry.name for entry in directory.iterdir() if entry.is_file()]
+        try:
+            if not directory.is_dir():
+                raise FileResolutionError(f"no such folder: {directory} (does not exist)")
+            listing_cache[directory] = [
+                entry.name for entry in directory.iterdir() if entry.is_file()
+            ]
+        except OSError as exc:
+            # Covers real, seen-in-the-field disagreements: a folder cell
+            # with a trailing space can leave is_dir() reporting True (the
+            # OS normalizes it for stat) while iterdir() on the identical
+            # path still raises FileNotFoundError, and a PermissionError or
+            # a disconnected external drive mid-scan both land here too.
+            # Any of these must become a per-row FileResolutionError, never
+            # an unhandled traceback that kills the whole validate run.
+            raise FileResolutionError(f"could not read folder '{directory}': {exc}") from exc
 
     listing = listing_cache[directory]
 
     if name_part in listing:
         resolved_name = name_part
     else:
-        target_stem = Path(name_part).stem.lower()
-        matches = sorted(entry for entry in listing if Path(entry).stem.lower() == target_stem)
+        target_lower = name_part.lower()
+        full_matches = sorted(
+            entry for entry in listing if Path(entry).stem.lower() == target_lower
+        )
+        resolved_name = _unique_match_or_none(full_matches, directory, name_part)
 
-        if len(matches) == 1:
-            resolved_name = matches[0]
-        elif not matches:
-            raise FileResolutionError(
-                f"no file found in '{directory}' matching '{name_part}' (looked for an exact "
-                "filename match, then a case-insensitive match ignoring extension)"
+        if resolved_name is None:
+            target_stem = Path(name_part).stem.lower()
+            stem_matches = sorted(
+                entry for entry in listing if Path(entry).stem.lower() == target_stem
             )
-        else:
-            raise FileResolutionError(
-                f"'{name_part}' in '{directory}' matches more than one file, refusing to pick "
-                f"between them: {', '.join(matches)}"
-            )
+            resolved_name = _unique_match_or_none(stem_matches, directory, name_part)
+
+            if resolved_name is None:
+                raise FileResolutionError(
+                    f"no file found in '{directory}' matching '{name_part}' (looked for an "
+                    "exact filename match, then a case-insensitive match ignoring extension)"
+                )
 
     return f"{directory_part}/{resolved_name}" if directory_part else resolved_name

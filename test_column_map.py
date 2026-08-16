@@ -1,3 +1,6 @@
+from pathlib import Path
+from unittest import mock
+
 import pytest
 
 from column_map import (
@@ -287,3 +290,157 @@ def test_resolve_file_scans_each_directory_only_once(tmp_path):
         resolve_file(tmp_path, f"SOP CD1/photo{n}", cache)
 
     assert len(cache) == 1
+
+
+# --- Fix round: review findings against the real-drive resolution path ---
+
+
+def test_candidate_path_strips_field_values_before_joining():
+    """A trailing/leading space in a Sheet cell (e.g. a folder column typed
+    as 'SOP CD1 ') must not survive into the candidate - on Windows it
+    produces a path where is_dir() and iterdir() disagree about whether the
+    folder exists (see the OSError-wrapping test below), and even off
+    Windows it would just fail to match a real folder named without the
+    space."""
+    row = {"file_on_array": " SOP CD1 ", "identifier": " Central SS "}
+
+    assert (
+        candidate_path("{file_on_array}/{identifier}", row) == "SOP CD1/Central SS"
+    )
+
+
+def test_resolve_file_wraps_a_directory_scan_oserror_as_a_file_resolution_error(tmp_path):
+    """On Windows, a folder cell with a trailing space can leave is_dir()
+    reporting True (the OS normalizes a trailing space away when it stats
+    the path) while iterdir() on the SAME path still raises
+    FileNotFoundError - a disagreement between the two checks that
+    otherwise reaches cmd_validate as a bare, unhandled traceback instead
+    of a per-row FileResolutionError. A disconnected external drive
+    mid-scan, or a permissions error, hits the same code path.
+
+    Simulated directly via mock rather than relying on the Windows-specific
+    trailing-space quirk to reproduce, so the test is deterministic and
+    pins the actual contract - ANY OSError during the scan becomes
+    FileResolutionError - rather than one specific trigger for it."""
+    folder = tmp_path / "SOP CD1"
+    folder.mkdir()
+
+    def raising_iterdir(self):
+        raise FileNotFoundError(f"[WinError 3] simulated: '{self}'")
+
+    with mock.patch.object(Path, "iterdir", raising_iterdir):
+        with pytest.raises(FileResolutionError):
+            resolve_file(tmp_path, "SOP CD1/Anything", {})
+
+
+def test_resolve_file_does_not_treat_a_non_extension_dot_in_the_target_as_an_extension(tmp_path):
+    """'Report.1958' is an archival reference, not a filename with a
+    '.1958' extension. Chopping the TARGET's own trailing segment before
+    comparing (the old bug) silently resolved this to 'Report.jpg' - the
+    only entry whose stem matched 'report' under that wrong comparison -
+    with no ambiguity ever reported. Asserts on the resolved file's actual
+    BYTES, not just the returned name string, since a wrong-but-plausible-
+    looking path is exactly the failure mode this pins."""
+    folder = tmp_path / "SOP CD1"
+    folder.mkdir()
+    (folder / "Report.jpg").write_bytes(b"WRONG-FILE")
+    (folder / "Report.1958.tif").write_bytes(b"CORRECT-FILE")
+
+    resolved = resolve_file(tmp_path, "SOP CD1/Report.1958", {})
+
+    assert resolved == "SOP CD1/Report.1958.tif"
+    assert (tmp_path / resolved).read_bytes() == b"CORRECT-FILE"
+
+
+def test_resolve_file_matches_a_target_containing_a_dot_that_is_not_an_extension(tmp_path):
+    """The benign variant of the same bug: a target with a dot that isn't
+    an extension must still find its file, not merely avoid finding the
+    wrong one."""
+    folder = tmp_path / "SOP CD1"
+    folder.mkdir()
+    (folder / "CD 1.01.53.jpg").write_bytes(b"x")
+
+    assert resolve_file(tmp_path, "SOP CD1/CD 1.01.53", {}) == "SOP CD1/CD 1.01.53.jpg"
+
+
+def test_an_explicit_extension_wins_over_an_ambiguous_stem(tmp_path):
+    """The exact-match branch (step 1) must actually be taken, not merely
+    happen to agree with the stem-matching fallback: with two files
+    sharing a stem, only the exact match correctly picks one without
+    raising ambiguity."""
+    folder = tmp_path / "SOP CD5"
+    folder.mkdir()
+    (folder / "Liberty.jpg").write_bytes(b"x")
+    (folder / "Liberty.tif").write_bytes(b"x")
+
+    assert resolve_file(tmp_path, "SOP CD5/Liberty.jpg", {}) == "SOP CD5/Liberty.jpg"
+
+
+def test_resolve_file_still_matches_when_the_sheets_extension_case_differs_from_disk(tmp_path):
+    """Pass 3's fallback: the Sheet cell already carries a real extension
+    but in a different case than disk (exported as '.jpg', the file is
+    '.JPEG') - must still resolve via the target-chopped fallback, not
+    just the untouched-full-string comparison in pass 2."""
+    folder = tmp_path / "SOP CD1"
+    folder.mkdir()
+    (folder / "Liberty.JPEG").write_bytes(b"x")
+
+    assert resolve_file(tmp_path, "SOP CD1/Liberty.jpg", {}) == "SOP CD1/Liberty.JPEG"
+
+
+def test_resolve_file_refuses_to_escape_files_dir_via_an_absolute_folder_cell(tmp_path):
+    """files_dir is a boundary, not a suggestion. Path(files_dir) / part
+    silently discards files_dir entirely when part is itself an absolute
+    path, so a Sheet cell that accidentally holds a full path (someone
+    pasted 'C:/Windows/System32' instead of 'SOP CD1') must not be
+    honored."""
+    escape_target = tmp_path / "outside"
+    escape_target.mkdir()
+    (escape_target / "Secret.txt").write_bytes(b"x")
+
+    files_dir = tmp_path / "files"
+    files_dir.mkdir()
+
+    candidate = f"{escape_target.as_posix()}/Secret"
+
+    with pytest.raises(FileResolutionError, match="files_dir"):
+        resolve_file(files_dir, candidate, {})
+
+
+def test_resolve_file_refuses_to_escape_files_dir_via_dot_dot(tmp_path):
+    """A '..' folder segment must not walk back out of files_dir either -
+    Path silently normalizes '..' away, so the same containment check that
+    catches an absolute path must also catch this."""
+    files_dir = tmp_path / "files"
+    files_dir.mkdir()
+    (tmp_path / "Secret.txt").write_bytes(b"x")
+
+    with pytest.raises(FileResolutionError, match="files_dir"):
+        resolve_file(files_dir, "../Secret", {})
+
+
+def test_resolve_file_refuses_a_blank_folder_segment_rather_than_searching_files_dirs_root(
+    tmp_path,
+):
+    """candidate_path can produce something like '/Liberty' when a
+    two-column template's folder cell is blank - directory_part is then
+    "", and Path(files_dir) / "" is just files_dir, so this would
+    otherwise silently search files_dir's own ROOT (and might resolve
+    against an unrelated file living there) instead of failing on what is
+    really a missing required cell."""
+    (tmp_path / "Liberty.jpg").write_bytes(b"x")  # a decoy at files_dir's own root
+
+    with pytest.raises(FileResolutionError, match="folder"):
+        resolve_file(tmp_path, "/Liberty", {})
+
+
+def test_resolve_file_still_searches_files_dirs_root_for_a_single_segment_template(tmp_path):
+    """The blank-folder-segment guard above must not misfire on a
+    single-column file_template (e.g. '{file}') that has no folder concept
+    at all - there, searching files_dir's own root is correct, not a
+    blank-cell defect. Distinguished from the '/Liberty' case by whether a
+    '/' was present in the candidate at all, not by directory_part alone
+    (both are "" in either case)."""
+    (tmp_path / "Liberty.jpg").write_bytes(b"x")
+
+    assert resolve_file(tmp_path, "Liberty", {}) == "Liberty.jpg"
