@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 # Hyphens and underscores are preserved because Internet Archive field names use them
 # (e.g., "identifier-bib"). Other punctuation is removed.
@@ -26,7 +27,14 @@ def normalize_header(header: str) -> str:
 
 
 HELD_BACK_MARKER = "(lcps internal)"
-RESERVED_FIELDS = frozenset({"identifier", "file", "ia_uploaded", "ia_url"})
+# `identifier` is deliberately NOT here: the real Sheet's own `Identifier`
+# column holds the donor's original archival reference (e.g.
+# "CD 1 01 53 58 1 Central SS"), not a minted IA identifier - that lives in
+# `ia_identifier` instead. Every column the tool itself writes carries the
+# `ia_` prefix so it cannot collide with whatever a Sheet author already
+# named a column. See docs/DECISIONS.md, "Tool-owned Sheet columns are all
+# `ia_`-prefixed".
+RESERVED_FIELDS = frozenset({"file", "ia_identifier", "ia_identifier_bib", "ia_uploaded", "ia_url"})
 
 
 def is_held_back(header: str) -> bool:
@@ -162,3 +170,106 @@ def check_grid_shape(grid: list[list[str]]) -> list[str]:
             )
 
     return errors
+
+
+class TemplateError(Exception):
+    """A `file_template` names a column the Sheet's header row does not
+    have. Checked once, at startup, via check_file_template() - the
+    alternative is every single row failing file resolution with the same
+    root cause, which buries a one-line registry typo under (at real scale)
+    thousands of identical-looking errors."""
+
+
+class FileResolutionError(Exception):
+    """A row's candidate file could not be resolved to exactly one file on
+    disk: either nothing matched, or more than one file did. resolve_file()
+    never picks on the operator's behalf - see docs/DECISIONS.md, "A file
+    is found by resolution, not by constructing a path"."""
+
+
+_TEMPLATE_FIELD_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def check_file_template(template: str, column_map: ColumnMap) -> None:
+    """Fails fast if `file_template` (from the project registry) references
+    a column the Sheet's actual header row doesn't have - a mistyped
+    placeholder or a Sheet whose columns changed since the registry was
+    written. Deliberately checked against every normalized field name the
+    Sheet has, not just uploadable ones: a template is allowed to reference
+    a reserved or held-back column (the folder/filename columns commonly
+    are)."""
+    known_fields = set(column_map.field_names.values())
+    referenced = _TEMPLATE_FIELD_RE.findall(template)
+    missing = [name for name in referenced if name not in known_fields]
+    if missing:
+        column_list = ", ".join(f"'{name}'" for name in missing)
+        raise TemplateError(
+            f"file_template references column(s) {column_list}, which the Sheet's header "
+            "row does not have"
+        )
+
+
+def candidate_path(template: str, row: dict[str, str]) -> str:
+    """Builds a CANDIDATE relative path by substituting the row's field
+    values into `file_template` - a plain string join, nothing more. This is
+    not a path guaranteed to exist: see resolve_file(), which is what turns
+    a candidate into a real, disk-verified path. Kept separate from
+    resolve_file() so the two failure modes (a malformed template vs. a
+    file that isn't actually there) stay distinguishable."""
+    return template.format(**row)
+
+
+def resolve_file(
+    files_dir: str | Path, candidate: str, listing_cache: dict[Path, list[str]]
+) -> str:
+    """Resolves a candidate relative path against the filesystem rather than
+    trusting it as a literal path. In the real Sheet, 225 of 234 filenames
+    carry no extension and 9 already carry `.jpg` - constructing
+    `name + ".jpg"` would produce `Liberty.jpg.jpg` for the 9 and can't be
+    trusted to be right for the other 225 (some are TIFF masters). See
+    docs/DECISIONS.md, "A file is found by resolution, not by constructing
+    a path".
+
+    `candidate` is split at its last "/" into a directory part and a name
+    part. Within `files_dir/<directory>`, an exact filename match wins
+    first (handles the 9 rows that already carry an extension); failing
+    that, a file whose stem matches the name part case-insensitively,
+    ignoring its own extension, wins (handles the 225 that don't). Zero
+    matches or more than one both raise FileResolutionError rather than
+    guess - two files sharing a stem (a JPEG and a TIFF master, say) is
+    exactly the case an operator must resolve by hand, never automatically.
+
+    `listing_cache` maps a resolved directory to its file listing, built at
+    most once per directory - the real Sheet is 234 rows across 5 folders,
+    and the full collection is ~10,000 rows across a similar handful, so
+    this keeps the cost at one scan per folder rather than one per row."""
+    directory_part, _, name_part = candidate.rpartition("/")
+    directory = Path(files_dir) / directory_part
+
+    if directory not in listing_cache:
+        if not directory.is_dir():
+            raise FileResolutionError(f"no such folder: {directory} (does not exist)")
+        listing_cache[directory] = [entry.name for entry in directory.iterdir() if entry.is_file()]
+
+    listing = listing_cache[directory]
+
+    if name_part in listing:
+        resolved_name = name_part
+    else:
+        target_stem = Path(name_part).stem.lower()
+        matches = sorted(entry for entry in listing if Path(entry).stem.lower() == target_stem)
+
+        if len(matches) == 1:
+            resolved_name = matches[0]
+        elif not matches:
+            raise FileResolutionError(
+                f"no file found in '{directory}' matching '{name_part}' (looked for an exact "
+                "filename match, then a case-insensitive match ignoring extension)"
+            )
+        else:
+            raise FileResolutionError(
+                f"'{name_part}' in '{directory}' matches more than one file, refusing to pick "
+                f"between them: {', '.join(matches)}"
+            )
+
+    return f"{directory_part}/{resolved_name}" if directory_part else resolved_name

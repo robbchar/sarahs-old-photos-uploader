@@ -21,7 +21,17 @@ import requests
 from googleapiclient.errors import HttpError
 
 import google_auth
-from column_map import ColumnMap, check_column_map, check_grid_shape, grid_to_rows
+from column_map import (
+    ColumnMap,
+    FileResolutionError,
+    TemplateError,
+    candidate_path,
+    check_column_map,
+    check_file_template,
+    check_grid_shape,
+    grid_to_rows,
+    resolve_file,
+)
 from ia_fields import suggest_standard_fields
 from identifiers import RowState, classify_row
 from project_config import ProjectConfig, load_project_config
@@ -29,23 +39,27 @@ from sheet_client import SheetClient
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
-# Deliberately excludes both "identifier" and "file" - do not "fix" this back
-# to REQUIRED_UPLOAD_COLUMNS.
+# Deliberately excludes "identifier" only - do not "fix" this back to
+# REQUIRED_UPLOAD_COLUMNS, and do not add "identifier" back either.
 #
-# "identifier": a Sheet row's identifier is minted by `upload`, not
-# pre-assigned like a CSV row's - a blank identifier is the normal starting
-# state for every new row (RowState.UNASSIGNED), not an error.
+# "identifier": on the Sheet path this is ordinary donor metadata (the
+# real Sheet's own `Identifier` column holds an archival reference like
+# "CD 1 01 53 58 1 Central SS"), not the tool's minted identifier - that
+# lives in `ia_identifier`, which is never required here either: a blank
+# ia_identifier is the normal starting state for every new row
+# (RowState.UNASSIGNED), not an error. See docs/DECISIONS.md, "Tool-owned
+# Sheet columns are all `ia_`-prefixed".
 #
-# "file": a Sheet row has no literal `file` column at all. Task 9 builds a
-# row's file path from `file_template` in the registry (e.g.
-# "{cd}/{file_on_array}"), combining several Sheet columns with a root
-# directory - `file` is Task 9's output, not Task 8's input. Requiring it
-# here (or checking it against disk - see validate_rows' check_file_exists)
-# would fail every row on a machine that doesn't have the photos present,
-# which is exactly the machine Phase 1 (this task) is meant to run on: a
-# human validating a copy of the real Sheet with "no IA credentials and not
-# a single file on disk".
-SHEET_REQUIRED_COLUMNS = ("mediatype", "title")
+# "file" IS required here - this is Phase 2's deliberate reversal of Task
+# 8's Phase 1 exemption (which ran with no photos on disk by design). By
+# the time validate_rows sees a Sheet row, cmd_validate has already turned
+# `file_template` plus the row's own columns into a candidate path and
+# resolved it against `files_dir` (see resolve_file() in column_map.py) -
+# so every row either carries a real, disk-verified `file` value or has
+# already failed with the resolver's own error message. See
+# docs/DECISIONS.md, "A file is found by resolution, not by constructing a
+# path".
+SHEET_REQUIRED_COLUMNS = ("mediatype", "title", "file")
 # Columns this script reads by exact lowercase name. A case variant of one of
 # these (a "Date" column from the raw Sheet export, say) is silently treated as
 # unrelated pass-through metadata, so check_header rejects it.
@@ -211,6 +225,7 @@ def validate_rows(
     skip_identifiers: frozenset[str] = frozenset(),
     required_columns: tuple[str, ...] = REQUIRED_UPLOAD_COLUMNS,
     check_file_exists: bool = True,
+    identifier_column: str = "identifier",
 ) -> list[RowValidation]:
     """skip_identifiers lets a --resume-from run skip re-validating rows a
     prior run already validated and uploaded successfully - the identifier
@@ -219,23 +234,32 @@ def validate_rows(
 
     required_columns defaults to REQUIRED_UPLOAD_COLUMNS (the CSV path,
     unchanged) but the Sheet path passes SHEET_REQUIRED_COLUMNS, which
-    excludes 'identifier' and 'file' - see that constant's comment for why.
+    excludes 'identifier' - see that constant's comment for why.
 
     check_file_exists defaults to True (the CSV path, unchanged: a CSV row's
     'file' is a real, already-resolvable path, so checking it on disk is
-    correct there). The Sheet path passes False explicitly - Phase 1 (this
-    task) runs with no files on disk by design, and a Sheet row has no
-    'file' value to check yet regardless (see SHEET_REQUIRED_COLUMNS). This
-    is a dedicated flag rather than relying on required_columns excluding
-    'file', or on files_dir pointing nowhere, so the skip is an explicit
-    statement of intent instead of an incidental side effect of some other
-    setting."""
+    correct there). The Sheet path now also passes True (Phase 2 - see
+    SHEET_REQUIRED_COLUMNS' comment): by the time this runs, cmd_validate
+    has already resolved each row's 'file' against disk via resolve_file(),
+    so this check is a redundant safety net there rather than the primary
+    signal, which is fine - it costs one cheap is_file() stat per row.
+
+    identifier_column defaults to "identifier" (the CSV path, unchanged:
+    that column is pre-assigned, permanent, and never generated by this
+    tool). The Sheet path passes "ia_identifier" instead - after Task 9 the
+    Sheet's own 'identifier' column holds the donor's original archival
+    reference (e.g. "CD 1 01 53 58 1 Central SS"), not a minted IA
+    identifier, and running check_identifier's COLLECTIONKEY-PROJECTID-
+    NUMBER regex against a donor reference fails every row for the wrong
+    reason - which is exactly what happened against the real Sheet before
+    this fix. See docs/DECISIONS.md, "Tool-owned Sheet columns are all
+    `ia_`-prefixed"."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
     for offset, row in enumerate(rows):
         row_number = offset + 2  # header is row 1
-        identifier = (row.get("identifier") or "").strip()
+        identifier = (row.get(identifier_column) or "").strip()
 
         if identifier in skip_identifiers:
             seen_identifiers.setdefault(identifier, row_number)
@@ -677,13 +701,65 @@ def cmd_validate(args) -> int:
         )
         return 1
 
+    # A file_template naming a column the Sheet's header row doesn't have
+    # (a registry typo, or a Sheet whose columns changed) is checked once,
+    # here, rather than surfacing as the same resolution failure repeated
+    # on every one of the Sheet's rows. Deliberately after the no-rows
+    # branch above: an empty or header-only Sheet already gets a more
+    # useful diagnostic ("no data rows") than a template complaint would be.
+    try:
+        check_file_template(config.file_template, column_map)
+    except TemplateError as exc:
+        print(
+            f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Resolves each row's file against disk BEFORE validate_rows runs, so a
+    # row either carries a real, disk-verified 'file' value (and the
+    # resolved name, which may differ from what the Sheet cell says - see
+    # resolve_file() - also becomes 'ia_identifier_bib') or is recorded
+    # here with the resolver's own message, which is filed into that row's
+    # result below rather than left to the generic "missing required
+    # column 'file'" alone. See docs/DECISIONS.md, "A file is found by
+    # resolution, not by constructing a path".
+    listing_cache: dict[Path, list[str]] = {}
+    file_resolution_errors: dict[int, str] = {}
+    for offset, row in enumerate(rows):
+        row_number = offset + 2  # header is row 1
+        candidate = candidate_path(config.file_template, row)
+        try:
+            resolved = resolve_file(config.files_dir, candidate, listing_cache)
+        except FileResolutionError as exc:
+            file_resolution_errors[row_number] = str(exc)
+            # The Sheet cell's raw, UNVERIFIED candidate must not survive as
+            # row['file'] here - left in place, it would coincidentally
+            # resolve as a literal path for validate_rows' own disk check
+            # (or even for a future upload step), silently masking the fact
+            # that resolution never actually confirmed this file exists.
+            row["file"] = ""
+            continue
+        row["file"] = resolved
+        row["ia_identifier_bib"] = resolved
+
     row_results = validate_rows(
         rows,
         config.files_dir,
         registry,
         required_columns=SHEET_REQUIRED_COLUMNS,
-        check_file_exists=False,
+        check_file_exists=True,
+        identifier_column="ia_identifier",
     )
+    for row_number, message in file_resolution_errors.items():
+        # The resolver's own message first: it names the folder and the
+        # name that was looked for, which is the actionable part. The
+        # generic "missing required column 'file'" that follows from
+        # required_columns (row['file'] was never set - see above) merely
+        # restates that the row has no file.
+        row_result = row_results[row_number - 2]
+        row_result.errors = [message] + row_result.errors
+
     # A structural problem with one specific data row (a long row) belongs
     # IN that row's own result, not in a second entry printed beside it.
     # Filing it separately made the row appear twice with opposite verdicts

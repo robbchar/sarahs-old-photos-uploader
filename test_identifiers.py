@@ -85,19 +85,40 @@ def test_next_identifiers_leaves_multiple_gaps_alone():
 
 
 def test_classify_row_unassigned():
-    assert classify_row({"identifier": "", "ia_uploaded": ""}) is RowState.UNASSIGNED
+    assert classify_row({"ia_identifier": "", "ia_uploaded": ""}) is RowState.UNASSIGNED
 
 
 def test_classify_row_reserved_but_unconfirmed():
-    row = {"identifier": "lcps-sarahsoldphotos-00001", "ia_uploaded": ""}
+    row = {"ia_identifier": "lcps-sarahsoldphotos-00001", "ia_uploaded": ""}
 
     assert classify_row(row) is RowState.RESERVED
 
 
 def test_classify_row_done():
-    row = {"identifier": "lcps-sarahsoldphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}
+    row = {"ia_identifier": "lcps-sarahsoldphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}
 
     assert classify_row(row) is RowState.DONE
+
+
+def test_classify_row_reads_the_ia_identifier_column():
+    assert classify_row({"ia_identifier": "", "ia_uploaded": ""}) is RowState.UNASSIGNED
+    assert (
+        classify_row({"ia_identifier": "lcps-p-00001", "ia_uploaded": ""})
+        is RowState.RESERVED
+    )
+    assert (
+        classify_row({"ia_identifier": "lcps-p-00001", "ia_uploaded": "2026-08-16T10:00:00"})
+        is RowState.DONE
+    )
+
+
+def test_classify_row_ignores_a_donor_identifier_column():
+    """The real Sheet's `Identifier` column holds donor references like
+    'CD 1 01 53 58 1 Central SS'. Reading it as a minted identifier is what
+    made all 234 rows report as 'reserved but invalid'."""
+    row = {"identifier": "CD 1 01 53 58 1 Central SS", "ia_identifier": "", "ia_uploaded": ""}
+
+    assert classify_row(row) is RowState.UNASSIGNED
 
 
 def test_format_identifier_succeeds_at_max_5_digit_boundary():

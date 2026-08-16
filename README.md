@@ -63,12 +63,18 @@ accurate. See `docs/DECISIONS.md` ("The Sheet is read live") in the
 meantime.
 
 Sheet path: checks the header for colliding or empty field names and any data
-row longer than the header, injects `mediatype` from the registry, then
-prints a pass/fail report per row, a receipt of which fields will upload,
-a lifecycle summary (rows ready to upload / already uploaded / reserved but
-unconfirmed), and advisory suggestions for renaming a column to a standard IA
-field name. A blank `identifier` is normal for a new row, not an error — it's
-assigned by `upload` later.
+row longer than the header, injects `mediatype` from the registry, resolves
+each row's file against `files_dir` using `file_template` (an exact filename
+match first, then a case-insensitive match ignoring extension — two matching
+candidates is a failure naming both, never a silent pick), then prints a
+pass/fail report per row, a receipt of which fields will upload, a lifecycle
+summary (rows ready to upload / already uploaded / reserved but unconfirmed),
+and advisory suggestions for renaming a column to a standard IA field name.
+Every column the tool itself writes is `ia_`-prefixed (`ia_identifier`,
+`ia_identifier_bib`, `ia_uploaded`, `ia_url`); a blank `ia_identifier` is
+normal for a new row, not an error — it's assigned by `upload` later. The
+Sheet's own `identifier` column (if it has one) is ordinary donor metadata,
+untouched by this tool.
 
 CSV path: checks the header once —
 - no column with leading/trailing whitespace, and no duplicate columns —

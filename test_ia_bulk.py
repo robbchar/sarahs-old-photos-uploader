@@ -373,9 +373,9 @@ def test_validate_rows_default_required_columns_still_requires_identifier_and_fi
     - the CSV path, unchanged - since introducing that parameter for the
     Sheet path means the CSV path's own correctness now depends on a
     default value rather than on hardcoded behavior. If the default were
-    ever flipped to SHEET_REQUIRED_COLUMNS (which excludes identifier and
-    file), a CSV row with both blank would become "valid", and
-    effective_identifier("", live=False) returns just "zztest-" - not a
+    ever flipped to SHEET_REQUIRED_COLUMNS (which excludes identifier
+    only), a CSV row with both blank would become "valid" for identifier,
+    and effective_identifier("", live=False) returns just "zztest-" - not a
     real identifier."""
     rows = [
         {
@@ -392,6 +392,37 @@ def test_validate_rows_default_required_columns_still_requires_identifier_and_fi
     assert not results[0].is_valid
     assert "missing required column 'identifier'" in results[0].errors
     assert "missing required column 'file'" in results[0].errors
+
+
+def test_validate_rows_identifier_column_lets_the_sheet_path_read_ia_identifier(tmp_path):
+    """After Task 9 the Sheet's own 'identifier' column holds a donor
+    reference like 'CD 1 01 53 58 1 Central SS', not a minted IA
+    identifier - running check_identifier's COLLECTIONKEY-PROJECTID-NUMBER
+    regex against it would fail every row for the wrong reason.
+    identifier_column lets the Sheet path point validate_rows at
+    'ia_identifier' instead; the CSV path's default ('identifier') is
+    pinned separately above and is untouched by this parameter existing."""
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    rows = [
+        {
+            "identifier": "CD 1 01 53 58 1 Central SS",
+            "ia_identifier": "",
+            "file": "photo1.jpg",
+            "mediatype": "image",
+            "title": "First photo",
+        }
+    ]
+
+    results = validate_rows(
+        rows,
+        files_dir=tmp_path,
+        registry=make_registry(),
+        required_columns=("mediatype", "title", "file"),
+        identifier_column="ia_identifier",
+    )
+
+    assert results[0].is_valid
+    assert results[0].identifier == ""
 
 
 def test_check_header_accepts_a_clean_header():
@@ -756,10 +787,10 @@ def test_sheet_structure_validation_files_a_header_problem_and_a_shape_problem_s
 
 def test_lifecycle_summary_counts_each_state():
     rows = [
-        {"identifier": "", "ia_uploaded": ""},
-        {"identifier": "", "ia_uploaded": ""},
-        {"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
-        {"identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
+        {"ia_identifier": "", "ia_uploaded": ""},
+        {"ia_identifier": "", "ia_uploaded": ""},
+        {"ia_identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
+        {"ia_identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
     ]
     # row_results must line up 1:1 with rows, in order; all pass here so
     # this test pins pure lifecycle counting, independent of the
@@ -774,7 +805,7 @@ def test_lifecycle_summary_counts_each_state():
 
 
 def test_lifecycle_summary_uses_singular_row_for_a_count_of_one():
-    rows = [{"identifier": "", "ia_uploaded": ""}]
+    rows = [{"ia_identifier": "", "ia_uploaded": ""}]
     row_results = [RowValidation(row_number=2, identifier="")]
 
     summary = format_lifecycle_summary(rows, row_results)
@@ -791,7 +822,7 @@ def test_lifecycle_summary_does_not_count_a_failed_unassigned_row_as_ready():
     must be cross-referenced against row_results, and a failed-but-
     unassigned row must be called out separately rather than folded into
     either bucket silently."""
-    rows = [{"identifier": "", "ia_uploaded": ""}]
+    rows = [{"ia_identifier": "", "ia_uploaded": ""}]
     row_results = [
         RowValidation(row_number=2, identifier="", errors=["missing required column 'title'"])
     ]
@@ -808,7 +839,7 @@ def test_lifecycle_summary_does_not_count_a_failed_done_row_as_already_uploaded(
     now fails validation (a duplicate identifier, say) is not cleanly
     "already uploaded" - it needs a human to look, not silent inclusion in
     a bucket that implies everything is fine."""
-    rows = [{"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}]
+    rows = [{"ia_identifier": "lcps-astoriaphotos-00001", "ia_uploaded": "2026-08-08T10:00:00"}]
     row_results = [
         RowValidation(
             row_number=2,
@@ -828,7 +859,7 @@ def test_lifecycle_summary_does_not_count_a_failed_reserved_row_as_will_retry():
     an unregistered project prefix were reported as "3 reserved but
     unconfirmed - will retry under existing identifier" - a forward-looking
     promise a row failing identifier validation cannot keep."""
-    rows = [{"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""}]
+    rows = [{"ia_identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""}]
     row_results = [
         RowValidation(
             row_number=2,
@@ -851,10 +882,10 @@ def test_lifecycle_summary_counts_always_sum_to_the_total_row_count():
     drops a row on some branch would break this without necessarily
     breaking any single-bucket assertion."""
     rows = [
-        {"identifier": "", "ia_uploaded": ""},
-        {"identifier": "", "ia_uploaded": ""},
-        {"identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
-        {"identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
+        {"ia_identifier": "", "ia_uploaded": ""},
+        {"ia_identifier": "", "ia_uploaded": ""},
+        {"ia_identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
+        {"ia_identifier": "lcps-astoriaphotos-00002", "ia_uploaded": "2026-08-08T10:00:00"},
     ]
     row_results = [
         RowValidation(row_number=2, identifier="", errors=[]),
@@ -1008,18 +1039,19 @@ def test_cmd_validate_reads_the_sheet_and_injects_mediatype_when_csv_is_omitted(
     """Proves mandatory addition #2: mediatype is never a Sheet column, so
     without injecting it from the registry this row would fail with
     "missing required column 'mediatype'" and the exit code/pass-count
-    assertions below would flip. files_dir points at a directory that does
-    not exist - Phase 1 runs with no files on disk (see
-    test_cmd_validate_does_not_check_file_existence_on_the_sheet_path) - so
-    a regression that reintroduced a file check would fail this test too."""
+    assertions below would flip. Phase 2 (Task 9) requires the file to
+    actually resolve on disk, so files_dir points at a real directory
+    containing the named file - a regression that broke resolution would
+    fail this test too."""
     from ia_bulk import cmd_validate
 
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
     grid = [["Title", "file"], ["First photo", "photo1.jpg"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1033,18 +1065,21 @@ def test_cmd_validate_reads_the_sheet_and_injects_mediatype_when_csv_is_omitted(
     assert "suggestions (advisory - nothing is changed automatically):" in out
 
 
-def test_cmd_validate_does_not_treat_a_blank_identifier_as_an_error(tmp_path, monkeypatch, capsys):
-    """A blank identifier is the normal starting state of every new Sheet
-    row under minting, not an error like it is for a pre-assigned CSV row -
-    this is the behavior SHEET_REQUIRED_COLUMNS exists to produce."""
+def test_cmd_validate_does_not_treat_a_blank_ia_identifier_as_an_error(tmp_path, monkeypatch, capsys):
+    """A blank ia_identifier is the normal starting state of every new
+    Sheet row under minting, not an error like a pre-assigned CSV
+    identifier - this is the behavior SHEET_REQUIRED_COLUMNS (which
+    excludes ia_identifier) exists to produce. Uses 'ia_identifier', not
+    'identifier': after Task 9 the latter is ordinary donor metadata."""
     from ia_bulk import cmd_validate
 
-    grid = [["Title", "file", "identifier"], ["First photo", "photo1.jpg", ""]]
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    grid = [["Title", "file", "ia_identifier"], ["First photo", "photo1.jpg", ""]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1052,25 +1087,29 @@ def test_cmd_validate_does_not_treat_a_blank_identifier_as_an_error(tmp_path, mo
     out = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "missing required column 'identifier'" not in out
+    assert "missing required column" not in out
 
 
-def test_cmd_validate_does_not_check_file_existence_on_the_sheet_path(tmp_path, monkeypatch, capsys):
-    """Phase 1's explicit contract (see the plan) is 'no IA credentials and
-    not a single file on disk' - a human validates a copy of the real Sheet
-    on a machine that does not have the ~10,000 photos. This row names a
-    file, and files_dir points at a directory that does not even exist, so
-    if the disk check were reintroduced this would fail with
-    "file not found" instead of passing. `file` itself isn't required
-    either (Task 9 supplies it via file_template, not this task)."""
+def test_cmd_validate_uploads_a_donor_identifier_column_as_ordinary_metadata(
+    tmp_path, monkeypatch, capsys
+):
+    """The real Sheet's own 'Identifier' column holds the donor's archival
+    reference (e.g. 'CD 1 01 53 58 1 Central SS'), not a minted IA
+    identifier - after Task 9 it must pass through as ordinary metadata
+    (appearing in the field receipt) and must NOT be checked against the
+    COLLECTIONKEY-PROJECTID-NUMBER scheme, which it would never match."""
     from ia_bulk import cmd_validate
 
-    grid = [["Title", "file"], ["First photo", "photo-that-does-not-exist.jpg"]]
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    grid = [
+        ["Title", "file", "Identifier"],
+        ["First photo", "photo1.jpg", "CD 1 01 53 58 1 Central SS"],
+    ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1079,22 +1118,158 @@ def test_cmd_validate_does_not_check_file_existence_on_the_sheet_path(tmp_path, 
 
     assert exit_code == 0
     assert "1/1 rows passed" in out
-    assert "file not found" not in out
+    assert "does not match scheme" not in out
+    assert "will upload these metadata fields:\n  title, identifier" in out
 
 
-def test_cmd_validate_does_not_require_a_file_column_on_the_sheet_path(tmp_path, monkeypatch, capsys):
-    """Distinct from the disk-existence check above: 'file' must not even be
-    in SHEET_REQUIRED_COLUMNS. A Sheet has no 'file' column at all in Phase
-    1 - Task 9 is what builds one via file_template - so a row lacking it
-    entirely (not just an unchecked one) must still pass."""
+def test_cmd_validate_fails_a_row_whose_file_cannot_be_resolved_with_the_resolvers_message(
+    tmp_path, monkeypatch, capsys
+):
+    """Phase 2's reversal of Task 8's Phase 1 exemption: the disk check is
+    back, and a row whose file_template candidate matches nothing on disk
+    must fail with the resolver's OWN message (naming the folder and the
+    name it looked for), not the generic disk-check 'file not found' or
+    'missing required column' that would say the same thing without
+    naming what was actually searched for.
+
+    Distinguishing resolve_file()'s own wording ("no file found in ...
+    matching ...") from the generic checks matters: without it, this test
+    would pass even if cmd_validate silently discarded the resolver's
+    message and fell back to validate_rows' plain disk-existence check,
+    which would produce a superficially similar-looking failure by
+    accident (the raw, never-verified Sheet cell value happens to embed
+    the same folder/name substrings) rather than by design."""
     from ia_bulk import cmd_validate
 
-    grid = [["Title"], ["First photo"]]
+    (tmp_path / "SOP CD1").mkdir()  # folder exists, the named file does not
+    grid = [["Title", "file"], ["First photo", "SOP CD1/Nothing Here"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "[FAIL] row 2" in out
+    assert "no file found in" in out
+    assert "SOP CD1" in out and "Nothing Here" in out
+    assert "file not found:" not in out
+
+
+def test_cmd_validate_fails_on_an_ambiguous_file_naming_both_candidates(tmp_path, monkeypatch, capsys):
+    """Two files sharing a stem (a JPEG and a TIFF master, say) must never be
+    picked between silently - an item's identifier is permanent - so the
+    row fails, and the report names both candidates."""
+    from ia_bulk import cmd_validate
+
+    folder = tmp_path / "SOP CD5"
+    folder.mkdir()
+    (folder / "Liberty.jpg").write_bytes(b"x")
+    (folder / "Liberty.tif").write_bytes(b"x")
+
+    grid = [["Title", "file"], ["Liberty", "SOP CD5/Liberty"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Liberty.jpg" in out and "Liberty.tif" in out
+
+
+def test_cmd_validate_fails_fast_when_file_template_names_a_column_the_sheet_lacks(
+    tmp_path, monkeypatch, capsys
+):
+    """A file_template referencing a column absent from the Sheet's actual
+    header row (a registry typo, or a Sheet whose columns changed) must be
+    caught once at startup via check_file_template, not surfaced as the
+    same resolution failure repeated on every single row."""
+    from ia_bulk import cmd_validate
+
+    grid = [["Title"], ["First photo"]]  # no "file" column at all
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    exit_code = cmd_validate(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "file_template" in err
+    assert "'file'" in err
+
+
+def test_cmd_validate_resolves_a_filename_missing_its_extension_and_writes_identifier_bib(
+    tmp_path, monkeypatch
+):
+    """225 of 234 real rows have no extension in the Sheet. resolve_file()
+    finds the actual file on disk, and both row['file'] and
+    row['ia_identifier_bib'] must end up holding the RESOLVED name (with
+    its real extension) - not the Sheet's literal cell value."""
+    from ia_bulk import cmd_validate
+
+    (tmp_path / "Alderbrook Hall.jpg").write_bytes(b"x")
+    captured_rows = []
+
+    def fake_validate_rows(rows, files_dir, registry, **kwargs):
+        captured_rows.extend(rows)
+        return [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
+
+    monkeypatch.setattr("ia_bulk.validate_rows", fake_validate_rows)
+    grid = [["Title", "file"], ["Alderbrook Hall", "Alderbrook Hall"]]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
+
+    cmd_validate(args)
+
+    assert captured_rows[0]["file"] == "Alderbrook Hall.jpg"
+    assert captured_rows[0]["ia_identifier_bib"] == "Alderbrook Hall.jpg"
+
+
+def test_cmd_validate_resolves_using_a_two_column_file_template_like_the_real_registry(
+    tmp_path, monkeypatch, capsys
+):
+    """projects_registry.json's real file_template joins two Sheet columns
+    ('{file_on_array}/{identifier}'), not one - proves cmd_validate's
+    wiring isn't accidentally hardcoded to a single-placeholder template."""
+    from ia_bulk import cmd_validate
+
+    folder = tmp_path / "SOP CD1"
+    folder.mkdir()
+    (folder / "CD 1 01 53 58 1 Central SS.jpg").write_bytes(b"x")
+
+    grid = [
+        ["Title", "File on Array", "Identifier"],
+        ["Central School", "SOP CD1", "CD 1 01 53 58 1 Central SS"],
+    ]
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(files_dir=str(tmp_path), file_template="{file_on_array}/{identifier}")
+        ),
+        encoding="utf-8",
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1102,7 +1277,7 @@ def test_cmd_validate_does_not_require_a_file_column_on_the_sheet_path(tmp_path,
     out = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "missing required column 'file'" not in out
+    assert "1/1 rows passed" in out
 
 
 def test_cmd_validate_flags_colliding_sheet_headers(tmp_path, monkeypatch, capsys):
@@ -1169,16 +1344,18 @@ def test_cmd_validate_reports_a_header_collision_and_a_shape_error_under_their_o
     row-1 entry."""
     from ia_bulk import cmd_validate
 
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    (tmp_path / "b.jpg").write_bytes(b"x")
     grid = [
-        ["Genre / Form", "Genre_ Form", "Title"],
-        ["a", "b", "First"],
-        ["c", "d", "Second", "unexpected extra cell"],
+        ["Genre / Form", "Genre_ Form", "Title", "file"],
+        ["a", "b", "First", "a.jpg"],
+        ["c", "d", "Second", "b.jpg", "unexpected extra cell"],
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1219,17 +1396,20 @@ def test_cmd_validate_reports_a_long_row_once_as_failed_not_twice_with_opposite_
     entry outside the three data rows."""
     from ia_bulk import cmd_validate
 
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    (tmp_path / "b.jpg").write_bytes(b"x")
+    (tmp_path / "c.jpg").write_bytes(b"x")
     grid = [
-        ["Title", "Date"],
-        ["First photo", "1912"],
-        ["Second photo", "1913", "unexpected extra cell"],
-        ["Third photo", "1914"],
+        ["Title", "Date", "file"],
+        ["First photo", "1912", "a.jpg"],
+        ["Second photo", "1913", "b.jpg", "unexpected extra cell"],
+        ["Third photo", "1914", "c.jpg"],
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1262,16 +1442,18 @@ def test_cmd_validate_keeps_a_header_level_error_under_row_1_when_the_last_data_
     otherwise look plausible."""
     from ia_bulk import cmd_validate
 
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    (tmp_path / "b.jpg").write_bytes(b"x")
     grid = [
-        ["Genre / Form", "Genre_ Form", "Title"],  # colliding headers -> a header-level error
-        ["a", "b", "First photo"],
-        ["c", "d", "Second photo", "unexpected extra cell"],
+        ["Genre / Form", "Genre_ Form", "Title", "file"],  # colliding headers -> a header-level error
+        ["a", "b", "First photo", "a.jpg"],
+        ["c", "d", "Second photo", "b.jpg", "unexpected extra cell"],
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1545,7 +1727,8 @@ def test_cmd_validate_injects_mediatype_from_the_registry_not_a_hardcoded_value(
         return [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
 
     monkeypatch.setattr("ia_bulk.validate_rows", fake_validate_rows)
-    grid = [["Title"], ["First photo"]]
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    grid = [["Title", "file"], ["First photo", "photo1.jpg"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
@@ -1557,7 +1740,14 @@ def test_cmd_validate_injects_mediatype_from_the_registry_not_a_hardcoded_value(
 
     cmd_validate(args)
 
-    assert captured_rows == [{"title": "First photo", "mediatype": "phonorecord"}]
+    assert captured_rows == [
+        {
+            "title": "First photo",
+            "file": "photo1.jpg",
+            "mediatype": "phonorecord",
+            "ia_identifier_bib": "photo1.jpg",
+        }
+    ]
 
 
 def test_cmd_validate_passes_only_the_row_results_to_the_lifecycle_summary_not_the_combined_report(
@@ -1583,15 +1773,16 @@ def test_cmd_validate_passes_only_the_row_results_to_the_lifecycle_summary_not_t
 
     monkeypatch.setattr("ia_bulk.format_lifecycle_summary", fake_format_lifecycle_summary)
 
+    (tmp_path / "a.jpg").write_bytes(b"x")
     grid = [
-        ["Genre / Form", "Genre_ Form", "Title"],  # colliding headers -> a structural error
-        ["a", "b", "First photo"],
+        ["Genre / Form", "Genre_ Form", "Title", "file"],  # colliding headers -> a structural error
+        ["a", "b", "First photo", "a.jpg"],
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1615,20 +1806,25 @@ def test_cmd_validate_prints_correct_lifecycle_counts_for_a_mix_of_states_end_to
     look identical to correct behavior."""
     from ia_bulk import cmd_validate
 
+    for name in ("ready.jpg", "done.jpg", "done2.jpg", "reserved.jpg", "reserved2.jpg"):
+        (tmp_path / name).write_bytes(b"x")
+
+    # Uses "ia_identifier", not "identifier": after Task 9 the latter is
+    # ordinary donor metadata and no longer drives classify_row() at all.
     grid = [
-        ["Title", "identifier", "ia_uploaded"],
-        ["Ready", "", ""],
-        ["", "", ""],  # blank title -> fails validation, still unassigned
-        ["Done", "lcps-astoriaphotos-00001", "2026-01-01T00:00:00"],
-        ["", "lcps-astoriaphotos-00002", "2026-01-01T00:00:00"],  # blank title -> fails
-        ["Reserved", "lcps-astoriaphotos-00003", ""],
-        ["", "lcps-astoriaphotos-00004", ""],  # blank title -> fails
+        ["Title", "file", "ia_identifier", "ia_uploaded"],
+        ["Ready", "ready.jpg", "", ""],
+        ["", "ready.jpg", "", ""],  # blank title -> fails validation, still unassigned
+        ["Done", "done.jpg", "lcps-astoriaphotos-00001", "2026-01-01T00:00:00"],
+        ["", "done2.jpg", "lcps-astoriaphotos-00002", "2026-01-01T00:00:00"],  # blank title -> fails
+        ["Reserved", "reserved.jpg", "lcps-astoriaphotos-00003", ""],
+        ["", "reserved2.jpg", "lcps-astoriaphotos-00004", ""],  # blank title -> fails
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
@@ -1658,18 +1854,23 @@ def test_cmd_validate_output_encodes_cleanly_under_a_restrictive_windows_console
     the machine this task hands off to."""
     from ia_bulk import cmd_validate
 
-    grid = [["Title", "Photographer"], ["First photo", "Jane Doe"]]
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    grid = [["Title", "Photographer", "file"], ["First photo", "Jane Doe", "photo1.jpg"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 
     cmd_validate(args)
     out = capsys.readouterr().out
 
+    # The row must actually reach the suggestions section (not short-circuit
+    # on a template/resolution error) for this to be a meaningful check of
+    # the FULL report's encoding, not just the banner line's.
+    assert "suggestions (advisory - nothing is changed automatically):" in out
     out.encode("ascii")  # raises UnicodeEncodeError if any non-ASCII character slipped in
 
 
@@ -1680,12 +1881,13 @@ def test_cmd_validate_prints_an_actual_suggestion_not_just_the_heading(tmp_path,
     things the Phase 1 handoff session exists to exercise."""
     from ia_bulk import cmd_validate
 
-    grid = [["Title", "Photographer"], ["First photo", "Jane Doe"]]
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    grid = [["Title", "Photographer", "file"], ["First photo", "Jane Doe", "photo1.jpg"]]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(
-        json.dumps(make_sheet_registry(files_dir=str(tmp_path / "no-photos-here"))), encoding="utf-8"
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
     )
     args = Namespace(csv=None, project="astoriaphotos", registry=str(registry_path), live=False)
 

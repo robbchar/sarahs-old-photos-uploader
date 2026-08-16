@@ -184,6 +184,78 @@ The same reasoning puts `files_dir` and `file_template` there. A row's file
 path is assembled from a root plus one or more Sheet columns, which is
 plumbing; the people maintaining the Sheet should never have to think about it.
 
+## Tool-owned Sheet columns are all `ia_`-prefixed
+
+*Decided 2026-08-16, after the first run against a real copy of the LCPS Sheet.*
+
+The Sheet already had an `Identifier` column, holding the donor's original
+reference (`CD 1 01 53 58 1 Central SS`). That normalizes to `identifier` —
+which was the tool's reserved column for the minted IA identifier. The first
+`upload` would have overwritten every one of those original references with a
+freshly minted `lcps-sarahsoldphotos-NNNNN`.
+
+The tool's column is therefore renamed `ia_identifier`, joining `ia_uploaded`
+and `ia_url`. Every column the tool writes now carries the `ia_` prefix, which
+is both a consistent convention and a namespace the Sheet's existing headers do
+not collide with. The Sheet keeps `Identifier` meaning exactly what it always
+meant.
+
+This was found only by running `validate` against real data. No test would have
+caught it: the collision is between the tool's vocabulary and one particular
+spreadsheet's, and nothing in the repo knew what that spreadsheet contained.
+
+## `identifier-bib` is written back to the Sheet, not just generated
+
+*Decided 2026-08-16, extending the decision below.*
+
+`identifier-bib` was to be generated at upload time from the resolved file
+path and never recorded locally. It is now also written to an `ia_identifier_bib`
+column, so the value that went to Internet Archive is reviewable in the Sheet
+alongside `ia_uploaded` and `ia_url` rather than being inferable only from a log.
+
+Its value is the donor's original location: the folder column joined to the
+filename column (`File on Array` + `/` + `Identifier`). Those are two separate
+columns in the real Sheet, which is why the path is assembled rather than read
+from one place.
+
+Note this is *not* necessarily the path used to open the file on disk. In the
+real Sheet, 225 of 234 filenames carry no extension, so the recorded reference
+and the resolvable path differ. See `file_template` for the latter.
+
+## A file is found by resolution, not by constructing a path
+
+*Decided 2026-08-16, after seeing that 225 of 234 filenames in the real Sheet
+carry no extension while 9 do.*
+
+The obvious design — join the folder column, the filename column and a
+configured extension — fails on this data twice over. Nine rows already carry
+`.jpg`, so appending one would produce `Liberty.jpg.jpg`. And nobody can promise
+the remaining files are all `.jpg` rather than `.jpeg` or a TIFF master.
+
+So the tool resolves rather than constructs. Within the directory named by the
+folder column it looks for an exact filename match first, then for a file whose
+stem matches ignoring extension. What it finds is what gets used.
+
+Two rules keep this from guessing:
+
+**Two files sharing a stem is an error naming both, never a pick.** An item's
+identifier is permanent; choosing between `Liberty.jpg` and `Liberty.tif` on the
+operator's behalf is the kind of silent decision this project rejects
+everywhere else.
+
+**Stem matching is case-insensitive.** The archive lives on a Windows-attached
+drive whose filesystem is case-insensitive already, so matching case-sensitively
+would reject files that do exist. A case-only collision surfaces as the
+ambiguity error above rather than a silent wrong pick.
+
+Directory listings are cached per folder. The real Sheet has 234 rows across 5
+folders, and the full collection is ~10,000 rows across a similar handful — one
+scan per folder rather than one per row.
+
+Because the resolved name is the real one, `ia_identifier_bib` records
+`folder/resolved-filename`, which can differ from what the Sheet says. That is
+the point: it records what was uploaded, not what someone typed.
+
 ## `identifier-bib` and `mediatype` are generated, not columns
 
 *Decided 2026-08-08.*

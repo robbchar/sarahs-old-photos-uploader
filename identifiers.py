@@ -57,8 +57,15 @@ class RowState(Enum):
 def classify_row(row: dict[str, str]) -> RowState:
     """RESERVED is the crash-recovery case: a number was written to the Sheet
     but the upload never confirmed. Such a row must be retried under its
-    EXISTING identifier, never re-minted."""
-    if not (row.get("identifier") or "").strip():
+    EXISTING identifier, never re-minted.
+
+    Reads `ia_identifier`, not `identifier`: the real Sheet's own
+    `Identifier` column holds the donor's original archival reference
+    (e.g. "CD 1 01 53 58 1 Central SS"), not a minted IA identifier. Reading
+    that column here was the exact defect that made all 234 real rows
+    report as "reserved but invalid" - see docs/DECISIONS.md, "Tool-owned
+    Sheet columns are all `ia_`-prefixed"."""
+    if not (row.get("ia_identifier") or "").strip():
         return RowState.UNASSIGNED
     if not (row.get("ia_uploaded") or "").strip():
         return RowState.RESERVED
