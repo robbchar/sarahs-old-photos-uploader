@@ -15,6 +15,7 @@ from ia_bulk import (
     validate_rows,
     RowValidation,
     effective_identifier,
+    run_stamp,
     log_result,
     build_parser,
     build_sheet_client,
@@ -37,6 +38,14 @@ def write_csv(path, fieldnames, rows):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+# A fixed stand-in for run_stamp(), threaded into every test that needs a
+# deterministic non-live identifier - see docs/DECISIONS.md, "Test
+# identifiers carry a per-run stamp". Tests that instead need to prove the
+# stamp is computed once per run (not once per row/chunk) monkeypatch
+# ia_bulk.run_stamp with their own counting fake instead of this constant.
+FIXED_STAMP = "20260819t090000"
 
 
 def test_read_csv_returns_list_of_dicts(tmp_path):
@@ -408,8 +417,8 @@ def test_validate_rows_default_required_columns_still_requires_identifier_and_fi
     default value rather than on hardcoded behavior. If the default were
     ever flipped to SHEET_REQUIRED_COLUMNS (which excludes identifier
     only), a CSV row with both blank would become "valid" for identifier,
-    and effective_identifier("", live=False) returns just "zztest-" - not a
-    real identifier."""
+    and effective_identifier("", live=False, stamp) returns just
+    "zztest-<stamp>-" - not a real identifier."""
     rows = [
         {
             "identifier": "",
@@ -2078,12 +2087,61 @@ def test_load_prior_successes_ignores_pre_migration_entries_with_no_live_field(t
     assert load_prior_successes(log_path, live=True) == set()
 
 
-def test_effective_identifier_prepends_zztest_when_not_live():
-    assert effective_identifier("lcps-astoriaphotos-00001", live=False) == "zztest-lcps-astoriaphotos-00001"
+def test_effective_identifier_prepends_zztest_and_the_given_stamp_when_not_live():
+    """See docs/DECISIONS.md, "Test identifiers carry a per-run stamp" - a
+    bare zztest- prefix made a test run's identifiers a pure function of the
+    real ones, so a fresh Sheet (always minting from 00001) reproduced the
+    exact identifiers of a prior run and collided with darkened items."""
+    assert (
+        effective_identifier("lcps-astoriaphotos-00001", live=False, stamp="20260819t144907")
+        == "zztest-20260819t144907-lcps-astoriaphotos-00001"
+    )
 
 
-def test_effective_identifier_returns_identifier_unchanged_when_live():
-    assert effective_identifier("lcps-astoriaphotos-00001", live=True) == "lcps-astoriaphotos-00001"
+def test_effective_identifier_ignores_the_stamp_and_returns_identifier_unchanged_when_live():
+    """The single most important property this task can produce: a --live
+    identifier is the permanent public address of an archival item and must
+    stay a pure function of the Sheet/CSV. A stamp leaking into it would be
+    worse than not doing this task at all - so this is asserted with the
+    stamp parameter actually supplied (not omitted), proving the live branch
+    receives it and still ignores it, rather than merely never being asked to
+    handle it."""
+    assert (
+        effective_identifier("lcps-astoriaphotos-00001", live=True, stamp="20260819t144907")
+        == "lcps-astoriaphotos-00001"
+    )
+
+
+def test_effective_identifier_applies_one_given_stamp_identically_across_different_identifiers():
+    """A run mints many identifiers but must compute run_stamp() only once -
+    this pins effective_identifier's half of that contract: handed the SAME
+    stamp twice, as a real run would, it embeds that exact stamp in both
+    results rather than anything call-order-dependent."""
+    stamp = "20260819t144907"
+    first = effective_identifier("lcps-astoriaphotos-00001", live=False, stamp=stamp)
+    second = effective_identifier("lcps-astoriaphotos-00002", live=False, stamp=stamp)
+    assert first == "zztest-20260819t144907-lcps-astoriaphotos-00001"
+    assert second == "zztest-20260819t144907-lcps-astoriaphotos-00002"
+
+
+def test_run_stamp_is_lowercase_and_ia_identifier_safe():
+    """IA identifiers are restricted to lowercase letters, digits, underscore,
+    period and hyphen. run_stamp() is spliced directly between two literal
+    hyphens in effective_identifier(), so anything outside [a-z0-9] in the
+    stamp itself (uppercase, a colon from a naive isoformat(), whitespace)
+    would produce a malformed identifier."""
+    assert re.fullmatch(r"[a-z0-9]+", run_stamp())
+
+
+def test_effective_identifier_requires_stamp_to_be_passed_explicitly():
+    """`stamp` is a required parameter, not a defaulted one - see
+    docs/DECISIONS.md, "Test identifiers carry a per-run stamp": a default
+    would leave every call site free to silently fall back to it, which
+    reopens exactly the collision this task exists to close. Calling with
+    only `identifier` and `live` must raise TypeError rather than quietly
+    succeeding."""
+    with pytest.raises(TypeError):
+        effective_identifier("lcps-astoriaphotos-00001", live=False)  # type: ignore[call-arg]
 
 
 def test_upload_row_succeeds_when_library_returns_ok_responses(tmp_path, monkeypatch):
@@ -2393,6 +2451,7 @@ def test_cmd_upload_prints_per_row_progress_and_summary(tmp_path, monkeypatch, c
             raise RuntimeError("boom")
 
     monkeypatch.setattr("ia_bulk.upload_row", fake_upload_row)
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
         csv=str(csv_path),
@@ -2408,8 +2467,8 @@ def test_cmd_upload_prints_per_row_progress_and_summary(tmp_path, monkeypatch, c
 
     out = capsys.readouterr().out
     assert exit_code == 1
-    assert "[1/2] uploading zztest-lcps-astoriaphotos-00001 (photo1.jpg)" in out
-    assert "[2/2] uploading zztest-lcps-astoriaphotos-00002 (photo2.jpg)" in out
+    assert f"[1/2] uploading zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001 (photo1.jpg)" in out
+    assert f"[2/2] uploading zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002 (photo2.jpg)" in out
     assert "1 file(s) uploaded successfully, 1 error(s)" in out
 
 
@@ -2439,6 +2498,7 @@ def test_cmd_upload_writes_success_log_with_test_prefixed_target_when_not_live(t
     log_dir = tmp_path / "logs"
 
     monkeypatch.setattr("ia_bulk.upload_row", lambda row, target_identifier, collection, files_dir: None)
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
         csv=str(csv_path),
@@ -2457,11 +2517,88 @@ def test_cmd_upload_writes_success_log_with_test_prefixed_target_when_not_live(t
     assert len(log_files) == 1
     entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
     assert entry["identifier"] == "lcps-astoriaphotos-00001"
-    assert entry["uploaded_as"] == "zztest-lcps-astoriaphotos-00001"
+    assert entry["uploaded_as"] == f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"
     assert entry["status"] == "success"
 
 
+def test_cmd_upload_csv_path_stamps_every_row_with_one_run_stamp_not_a_fresh_one_per_row(
+    tmp_path, monkeypatch
+):
+    """The CSV path shares run_rows/effective_identifier with the Sheet path
+    and has the same defect - see docs/DECISIONS.md, "Test identifiers carry
+    a per-run stamp". run_stamp() is faked to return a NEW value on every
+    call; if the implementation regressed to computing the stamp once per row
+    instead of once per run, row 2 would be logged under the second call's
+    value and this test would catch that mismatch instead of merely
+    confirming 'some stamp' is present."""
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    (tmp_path / "photo2.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            },
+            {
+                "identifier": "lcps-astoriaphotos-00002",
+                "file": "photo2.jpg",
+                "mediatype": "image",
+                "title": "Second photo",
+                "date": "1958",
+            },
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setattr("ia_bulk.upload_row", lambda row, target_identifier, collection, files_dir: None)
+    stamp_calls = []
+
+    def fake_run_stamp():
+        stamp_calls.append(len(stamp_calls))
+        return f"stamp{stamp_calls[-1]}"
+
+    monkeypatch.setattr("ia_bulk.run_stamp", fake_run_stamp)
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(log_dir),
+        resume_from=None,
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 0
+    assert stamp_calls == [0]
+    log_files = list(log_dir.glob("upload-*.jsonl"))
+    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").strip().splitlines()]
+    assert [entry["uploaded_as"] for entry in entries] == [
+        "zztest-stamp0-lcps-astoriaphotos-00001",
+        "zztest-stamp0-lcps-astoriaphotos-00002",
+    ]
+
+
 def test_cmd_upload_uses_real_identifier_as_target_when_live(tmp_path, monkeypatch):
+    """Doubles as the CSV path's live-purity guard: run_stamp() is faked to
+    return an obviously-wrong value, so if a stamp ever leaked into the live
+    branch it would show up verbatim in this exact-match assertion instead of
+    being masked by a stamp that happens to look plausible."""
     from ia_bulk import cmd_upload
 
     (tmp_path / "photo1.jpg").write_bytes(b"data")
@@ -2487,6 +2624,7 @@ def test_cmd_upload_uses_real_identifier_as_target_when_live(tmp_path, monkeypat
     log_dir = tmp_path / "logs"
 
     monkeypatch.setattr("ia_bulk.upload_row", lambda row, target_identifier, collection, files_dir: None)
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: "shouldneverappear")
 
     args = Namespace(
         csv=str(csv_path),
@@ -2605,6 +2743,79 @@ def test_cmd_upload_resume_from_skips_prior_successes(tmp_path, monkeypatch):
     assert uploaded == ["lcps-astoriaphotos-00002"]
 
 
+def test_cmd_upload_resume_from_skips_a_row_whose_prior_log_entry_carries_a_different_stamp(
+    tmp_path, monkeypatch
+):
+    """load_prior_successes() matches on the real `identifier`, never on
+    `uploaded_as` - see docs/DECISIONS.md, "Test identifiers carry a per-run
+    stamp". This run's own stamp (FIXED_STAMP) deliberately differs from the
+    stamp already recorded in the prior log's `uploaded_as`
+    (zztest-19990101t000000-...), so if --resume-from ever started matching
+    on uploaded_as instead of identifier, row 1 would look "not yet done"
+    under this run's different stamp and get re-uploaded."""
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    (tmp_path / "photo2.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            },
+            {
+                "identifier": "lcps-astoriaphotos-00002",
+                "file": "photo2.jpg",
+                "mediatype": "image",
+                "title": "Second photo",
+                "date": "1958",
+            },
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
+        encoding="utf-8",
+    )
+    prior_log = tmp_path / "prior.jsonl"
+    log_result(
+        prior_log,
+        "lcps-astoriaphotos-00001",
+        "photo1.jpg",
+        "success",
+        live=False,
+        uploaded_as="zztest-19990101t000000-lcps-astoriaphotos-00001",
+    )
+
+    uploaded = []
+    monkeypatch.setattr(
+        "ia_bulk.upload_row",
+        lambda row, target_identifier, collection, files_dir: uploaded.append(row["identifier"]),
+    )
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=False,
+        collection="lcps",
+        log_dir=str(tmp_path / "logs"),
+        resume_from=str(prior_log),
+    )
+
+    exit_code = cmd_upload(args)
+
+    assert exit_code == 0
+    assert uploaded == ["lcps-astoriaphotos-00002"]
+
+
 def test_cmd_upload_resume_from_a_test_mode_log_does_not_skip_a_live_run(tmp_path, monkeypatch):
     """A --resume-from log written by a non-live (test_collection) run only
     proves the zztest-prefixed item landed in the sandbox, never the real
@@ -2670,6 +2881,7 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
     log_dir = tmp_path / "logs"
 
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target_identifier: None)
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
         csv=str(csv_path),
@@ -2686,7 +2898,7 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
     assert len(log_files) == 1
     entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
     assert entry["status"] == "success"
-    assert entry["uploaded_as"] == "zztest-lcps-astoriaphotos-00001"
+    assert entry["uploaded_as"] == f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"
 
 
 def test_cmd_sync_metadata_treats_no_changes_as_unchanged_not_failure(tmp_path, monkeypatch, capsys):
@@ -3037,7 +3249,10 @@ def setup_sheet_upload(
     recording client monkeypatched over build_sheet_client (the single seam),
     and upload_row stubbed so nothing touches the network. Also pins the
     confirm timestamp so a confirm batch can be asserted as an exact ordered
-    sequence rather than 'a cell whose value is some string'."""
+    sequence rather than 'a cell whose value is some string', and pins
+    run_stamp() to FIXED_STAMP for the same reason - a caller that needs to
+    prove the stamp is computed once per run rather than once per row/chunk
+    re-monkeypatches ia_bulk.run_stamp itself after calling this."""
     for name in files:
         (tmp_path / name).write_bytes(b"x")
 
@@ -3071,6 +3286,7 @@ def setup_sheet_upload(
     monkeypatch.setattr("ia_bulk.build_sheet_client", fake_build_sheet_client)
     monkeypatch.setattr("ia_bulk.upload_row", make_upload_stub(recorder, fail_for, captured))
     monkeypatch.setattr("ia_bulk.upload_timestamp", fake_upload_timestamp)
+    monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     return recorder, client, registry_path, build_calls
 
@@ -3102,8 +3318,8 @@ def test_cmd_upload_default_mode_writes_nothing_to_the_sheet_and_only_uploads_pr
     assert recorder.kinds == ["read", "upload", "upload"]
     assert recorder.writes == []
     assert recorder.uploads == [
-        "zztest-lcps-astoriaphotos-00001",
-        "zztest-lcps-astoriaphotos-00002",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002",
     ]
     assert client.grid == [list(row) for row in grid]
 
@@ -3132,11 +3348,11 @@ def test_cmd_upload_with_write_identifier_reserves_then_uploads_then_confirms(
         [("C2", "lcps-astoriaphotos-00001")],
         [
             ("D2", FIXED_TIMESTAMP),
-            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("E2", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
             ("F2", "photo1.jpg"),
         ],
     ]
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
 
 
 def test_cmd_upload_reserved_row_uploads_under_its_existing_identifier_and_mints_nothing(
@@ -3156,14 +3372,14 @@ def test_cmd_upload_reserved_row_uploads_under_its_existing_identifier_and_mints
     capsys.readouterr()
 
     assert exit_code == 0
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00042"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00042"]
     # The pre-reserve read still happens (the guard runs whether or not there
     # is anything to reserve); the reserve WRITE does not.
     assert recorder.kinds == ["read", "read", "upload", "read", "write"]
     assert recorder.writes == [
         [
             ("D2", FIXED_TIMESTAMP),
-            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00042"),
+            ("E2", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00042"),
             ("F2", "photo1.jpg"),
         ]
     ]
@@ -3191,12 +3407,12 @@ def test_cmd_upload_skips_a_done_row_entirely_and_mints_above_its_number(
     capsys.readouterr()
 
     assert exit_code == 0
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00008"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00008"]
     assert recorder.writes == [
         [("C3", "lcps-astoriaphotos-00008")],
         [
             ("D3", FIXED_TIMESTAMP),
-            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00008"),
+            ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00008"),
             ("F3", "photo2.jpg"),
         ],
     ]
@@ -3224,12 +3440,12 @@ def test_cmd_upload_skips_an_invalid_row_uploads_the_valid_ones_and_exits_non_ze
     out = capsys.readouterr().out
 
     assert exit_code == 1
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
     assert recorder.writes == [
         [("C3", "lcps-astoriaphotos-00001")],
         [
             ("D3", FIXED_TIMESTAMP),
-            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
             ("F3", "photo2.jpg"),
         ],
     ]
@@ -3256,6 +3472,14 @@ def test_cmd_upload_dry_run_writes_nothing_uploads_nothing_and_prints_what_it_wo
     assert recorder.uploads == []
     assert "lcps-astoriaphotos-00001" in out
     assert "C2 = lcps-astoriaphotos-00001" in out
+    # The real run would upload under the STAMPED identifier, not the bare
+    # permanent one - a dry run that only ever showed the real identifier
+    # would misrepresent what --live's absence actually means. See
+    # docs/DECISIONS.md, "Test identifiers carry a per-run stamp".
+    assert (
+        f"would mint 'lcps-astoriaphotos-00001' and upload it as "
+        f"'zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001'"
+    ) in out
     assert not (tmp_path / "logs").exists()
 
 
@@ -3283,7 +3507,7 @@ def test_cmd_upload_dry_run_without_write_identifier_says_it_would_write_nothing
     "live,expected_sheet_id,expected_collection,expected_target",
     [
         (True, "REAL_SHEET_ID", "lcpsociety", "lcps-astoriaphotos-00001"),
-        (False, "TEST_SHEET_ID", "test_collection", "zztest-lcps-astoriaphotos-00001"),
+        (False, "TEST_SHEET_ID", "test_collection", f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
     ],
 )
 def test_cmd_upload_passes_the_live_flag_through_and_picks_the_matching_sheet_and_collection(
@@ -3373,12 +3597,12 @@ def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
     # whatever now sits at row 2" is the failure that matters, and an
     # exit-code assertion firing first would hide which one went wrong.
     assert recorder.uploads == [
-        "zztest-lcps-astoriaphotos-00001",
-        "zztest-lcps-astoriaphotos-00002",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002",
     ]
     assert recorder.writes[1] == [
         ("D3", FIXED_TIMESTAMP),
-        ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+        ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002"),
         ("F3", "photo2.jpg"),
     ]
     assert "row 2 is no longer the row this run planned for" in captured.err
@@ -3438,7 +3662,7 @@ def test_cmd_upload_with_no_csv_runs_against_the_sheet_instead_of_erroring(
     capsys.readouterr()
 
     assert exit_code == 0
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
 
 
 def test_cmd_upload_never_sends_tool_owned_or_held_back_columns_as_ia_metadata(
@@ -3625,7 +3849,7 @@ def test_cmd_upload_records_a_failed_upload_without_confirming_it(tmp_path, monk
         monkeypatch,
         grid,
         files=("photo1.jpg", "photo2.jpg"),
-        fail_for=("zztest-lcps-astoriaphotos-00001",),
+        fail_for=(f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",),
     )
 
     exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
@@ -3636,7 +3860,7 @@ def test_cmd_upload_records_a_failed_upload_without_confirming_it(tmp_path, monk
         [("C2", "lcps-astoriaphotos-00001"), ("C3", "lcps-astoriaphotos-00002")],
         [
             ("D3", FIXED_TIMESTAMP),
-            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+            ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002"),
             ("F3", "photo2.jpg"),
         ],
     ]
@@ -3913,16 +4137,61 @@ def test_cmd_upload_reserves_and_confirms_once_per_chunk_not_once_per_run(
         [("C2", "lcps-astoriaphotos-00001")],
         [
             ("D2", "2026-08-19T09:00:00"),
-            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("E2", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
             ("F2", "photo1.jpg"),
         ],
         [("C3", "lcps-astoriaphotos-00002")],
         [
             # Its own chunk's time, not the time chunk 1 started.
             ("D3", "2026-08-19T11:30:00"),
-            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+            ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002"),
             ("F3", "photo2.jpg"),
         ],
+    ]
+
+
+def test_cmd_upload_sheet_path_computes_run_stamp_once_for_the_whole_run_not_once_per_chunk(
+    tmp_path, monkeypatch, capsys
+):
+    """run_stamp() must be computed once per run and threaded through, never
+    recomputed per row or per chunk - see docs/DECISIONS.md, "Test
+    identifiers carry a per-run stamp". setup_sheet_upload's default
+    run_stamp fake always returns the same FIXED_STAMP, which cannot tell
+    'computed once' from 'computed twice and happened to agree' - a fake that
+    returns a NEW value on every call can. With CHUNK_SIZE forced to 1, this
+    run spans two chunks; if plan_upload_targets ever moved the run_stamp()
+    call from upload_from_sheet (once, before chunking starts) down into a
+    per-row or per-chunk position, chunk 2 would be stamped with the second
+    call's value and this test's ordered-sequence assertion would catch the
+    mismatch, not just note 'a stamp was present'."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+    monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)
+
+    stamp_calls = []
+
+    def fake_run_stamp():
+        stamp_calls.append(len(stamp_calls))
+        return f"stamp{stamp_calls[-1]}"
+
+    monkeypatch.setattr("ia_bulk.run_stamp", fake_run_stamp)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert stamp_calls == [0]
+    assert recorder.uploads == [
+        "zztest-stamp0-lcps-astoriaphotos-00001",
+        "zztest-stamp0-lcps-astoriaphotos-00002",
     ]
 
 
@@ -3947,7 +4216,7 @@ def test_cmd_upload_treats_a_number_in_an_invalid_row_as_spent(tmp_path, monkeyp
     capsys.readouterr()
 
     assert exit_code == 1  # the invalid row was skipped
-    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00051"]
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00051"]
     assert recorder.writes[0] == [("C3", "lcps-astoriaphotos-00051")]
 
 

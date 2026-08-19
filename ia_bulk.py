@@ -594,8 +594,34 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
     return successes
 
 
-def effective_identifier(identifier: str, live: bool) -> str:
-    return identifier if live else f"{TEST_IDENTIFIER_PREFIX}{identifier}"
+def run_stamp() -> str:
+    """A lowercase, IA-identifier-safe stamp unique to this invocation of the
+    script - e.g. "20260819t144907". Computed ONCE per run and threaded
+    through every effective_identifier() call that run makes, never
+    recomputed per row: a run's test items must group together under one
+    stamp, not scatter across however many rows it processed.
+
+    See docs/DECISIONS.md, "Test identifiers carry a per-run stamp" - without
+    this, a test run's identifiers were a pure function of the real ones, so a
+    fresh Sheet (which always mints from 00001) reproduced the exact same test
+    identifiers every time. Internet Archive never releases an identifier and
+    test_collection darkens items after ~30 days, so every rehearsal after the
+    first collided with a darkened item and failed outright."""
+    return time.strftime("%Y%m%dt%H%M%S")
+
+
+def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
+    """`stamp` is required, not defaulted - a default would leave the
+    collision described in run_stamp()'s docstring reachable again, and every
+    caller of this function lives in this same file.
+
+    Live is untouched: a live identifier is the permanent, public address of
+    an archival item and must stay a pure function of the Sheet/CSV, so the
+    live branch deliberately never looks at `stamp`. A stamp reaching a live
+    identifier would be the worst outcome this function could produce."""
+    if live:
+        return identifier
+    return f"{TEST_IDENTIFIER_PREFIX}{stamp}-{identifier}"
 
 
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
@@ -930,6 +956,7 @@ def run_rows(
     rows: list[dict],
     log_path: str | Path,
     live: bool,
+    stamp: str,
     action: str,
     process_row,
     describe,
@@ -939,7 +966,12 @@ def run_rows(
     cmd_sync_metadata - they differ only in how a row is processed, how its
     progress line reads, and what (if anything) goes in the log's file
     field. process_row(row, target_identifier) may raise MetadataUnchanged
-    to count as "unchanged" rather than "failure"."""
+    to count as "unchanged" rather than "failure".
+
+    `stamp` is computed once by the caller (run_stamp(), called once per
+    command invocation) and passed in rather than computed here, so every row
+    this run touches - across every chunk - shares one stamp. See
+    run_stamp()'s docstring for why that matters."""
     total = len(rows)
     counts = {"success": 0, "unchanged": 0, "failure": 0}
     position = 0
@@ -947,7 +979,7 @@ def run_rows(
         for row in chunk:
             position += 1
             identifier = row["identifier"].strip()
-            target_identifier = effective_identifier(identifier, live)
+            target_identifier = effective_identifier(identifier, live, stamp)
             file_value = file_value_for(row)
             print(f"[{position}/{total}] {action} {describe(row, target_identifier)}")
             try:
@@ -1214,6 +1246,7 @@ def plan_upload_targets(
     config: ProjectConfig,
     live: bool,
     fingerprints: dict[int, str],
+    stamp: str,
 ) -> list[UploadTarget]:
     """Decides what this run will upload and under which identifier.
 
@@ -1224,7 +1257,11 @@ def plan_upload_targets(
 
     `existing` deliberately spans EVERY row, including rows that failed
     validation and rows already DONE - a number that appears anywhere in the
-    Sheet is spent, whatever the state of the row holding it."""
+    Sheet is spent, whatever the state of the row holding it.
+
+    `stamp` is computed once by the caller (run_stamp(), called once per
+    upload_from_sheet() invocation) so every target this run plans - across
+    every chunk SheetUploadRun.execute() later processes - shares one stamp."""
     if len(rows) != len(row_results):
         raise ValueError(
             f"plan_upload_targets: got {len(rows)} row(s) but {len(row_results)} row_results - "
@@ -1256,7 +1293,7 @@ def plan_upload_targets(
                 row=row,
                 row_number=row_number,
                 identifier=identifier,
-                uploaded_as=effective_identifier(identifier, live),
+                uploaded_as=effective_identifier(identifier, live, stamp),
                 identifier_bib=(row.get(IA_IDENTIFIER_BIB_COLUMN) or "").strip(),
                 newly_minted=newly_minted,
                 source_fingerprint=fingerprints.get(row_number, ""),
@@ -1582,6 +1619,7 @@ def upload_from_csv(args, csv_path: str) -> int:
         to_upload,
         log_path,
         args.live,
+        run_stamp(),
         action="uploading",
         process_row=lambda row, target: upload_row(row, target, collection, files_dir),
         describe=lambda row, target: f"{target} ({row['file'].strip()})",
@@ -1734,7 +1772,7 @@ def upload_from_sheet(args) -> int:
         )
         print()
 
-    targets = plan_upload_targets(rows, row_results, config, live, source_fingerprints)
+    targets = plan_upload_targets(rows, row_results, config, live, source_fingerprints, run_stamp())
     collection = config.ia_collection if live else TEST_COLLECTION
 
     # `upload` is where something permanent happens, so it shows the same
@@ -1813,6 +1851,7 @@ def cmd_sync_metadata(args) -> int:
         to_sync,
         log_path,
         args.live,
+        run_stamp(),
         action="updating metadata for",
         process_row=lambda row, target: update_metadata_row(row, target),
         describe=lambda row, target: target,

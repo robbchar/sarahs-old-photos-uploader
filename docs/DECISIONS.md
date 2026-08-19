@@ -33,6 +33,40 @@ passed. **The same CSV file is used unchanged for both test and live runs.**
 `check_identifier` actively rejects a hand-written `zztest-` identifier, and
 there is a test asserting exactly that.
 
+## Test identifiers carry a per-run stamp
+
+*Added 2026-08-19, after a rehearsal failed against the tool's own earlier test
+items. Amends "Safety rail: prefix in code, never in the CSV" above.*
+
+`effective_identifier()` prepended a bare `zztest-` to the real identifier. That
+made a test run's identifiers a pure function of the real ones — and since a
+fresh Sheet always starts minting at `00001`, every test run from a fresh Sheet
+produced exactly the same test identifiers as the last one.
+
+Internet Archive never releases an identifier, and `test_collection` darkens its
+items after about thirty days. A darkened item cannot be uploaded to: the
+attempt fails with `Access Denied - This item has been taken offline`. So the
+first rehearsal permanently burned `zztest-lcps-sarahsoldphotos-00001`, and
+every later rehearsal of row 1 collided with it. A July run burned `00001`
+through `00009`; the next rehearsal, in August, could not upload a single row.
+
+A rehearsal mode you can only use once is not a rehearsal mode. Test identifiers
+therefore carry a stamp unique to the invocation:
+
+```
+zztest-20260819t144907-lcps-sarahsoldphotos-00001
+```
+
+One stamp per run, so a run's items group together in a listing. `zztest-` stays
+the leading marker so a test item is still recognisable at a glance. Live
+identifiers are untouched — they are the permanent ones and must remain a pure
+function of the Sheet.
+
+`--resume-from` is unaffected: `load_prior_successes` matches on the real
+`identifier`, not on `uploaded_as`, so resuming still works across runs whose
+stamps differ. The log's `uploaded_as` now records which stamped item a row
+actually landed on, which is the question you ask when checking a rehearsal.
+
 ## `--resume-from` filters on run mode
 
 A test-mode success and a live-mode success are indistinguishable by
