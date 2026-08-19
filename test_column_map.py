@@ -207,6 +207,25 @@ def test_check_file_template_names_a_missing_column_at_startup():
         check_file_template("{file_on_array}/{identifier}", column_map)
 
 
+def test_check_file_template_explains_the_normalized_form_and_lists_what_exists():
+    """The realistic mistake is writing raw header text in the template. An
+    operator hit exactly this with '{Folder on LaCie Drive}/{File Name}' against
+    a Sheet that genuinely had both columns, and the message gave them nothing
+    to act on."""
+    column_map = build_column_map(["Folder on LaCie Drive", "File Name", "Title"])
+
+    with pytest.raises(TemplateError) as excinfo:
+        check_file_template("{Folder on LaCie Drive}/{File Name}", column_map)
+
+    message = str(excinfo.value)
+    assert "NORMALIZED" in message
+    # names the correct form to use...
+    assert "folder_on_lacie_drive" in message
+    assert "file_name" in message
+    # ...and the rest of what is available, so the fix needs no guesswork
+    assert "title" in message
+
+
 def test_candidate_path_joins_the_two_columns():
     row = {"file_on_array": "SOP CD1", "identifier": "CD 1 01 53 58 1 Central SS"}
 

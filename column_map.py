@@ -203,9 +203,16 @@ def check_file_template(template: str, column_map: ColumnMap) -> None:
     missing = [name for name in referenced if name not in known_fields]
     if missing:
         column_list = ", ".join(f"'{name}'" for name in missing)
+        available = ", ".join(sorted(known_fields))
+        # The overwhelmingly likely cause is raw header text in the template
+        # ("{File Name}") where a normalized field name is required
+        # ("{file_name}"), so spell that out and list what is actually
+        # available rather than leaving the operator to guess the form.
         raise TemplateError(
             f"file_template references column(s) {column_list}, which the Sheet's header "
-            "row does not have"
+            "row does not have. Note that file_template uses NORMALIZED column names, not "
+            "the header text as typed: a header 'File Name' becomes 'file_name'. Available "
+            f"columns are: {available}"
         )
 
 

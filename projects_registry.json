@@ -6,10 +6,10 @@
       "mediatype": "image",
       "ia_collection": "lcpsdigitalcollection",
       "sheet_id": "REPLACE_WITH_REAL_SHEET_ID",
-      "test_sheet_id": "1WFxKiiBulrn3Wf2Bh4qyGjsCMhEvIR3wMWPpNzIvf1g",
-      "sheet_tab": "Sheet1",
+      "test_sheet_id": "1Kgm7pRJSN7WIYt5pMpI0krw4V6Bs9UrAfeeO7jFcXPI",
+      "sheet_tab": "TestSheet",
       "files_dir": "./data",
-      "file_template": "{file_on_array}/{identifier}"
+      "file_template": "{folder_on_lacie_drive}/{file_name}"
     }
   }
 }
