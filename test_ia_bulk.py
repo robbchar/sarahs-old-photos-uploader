@@ -1123,14 +1123,19 @@ def test_cmd_validate_does_not_treat_a_blank_ia_identifier_as_an_error(tmp_path,
     assert "missing required column" not in out
 
 
-def test_cmd_validate_uploads_a_donor_identifier_column_as_ordinary_metadata(
+def test_cmd_validate_does_not_scheme_check_a_donor_identifier_column_and_says_it_will_not_ship(
     tmp_path, monkeypatch, capsys
 ):
     """The real Sheet's own 'Identifier' column holds the donor's archival
-    reference (e.g. 'CD 1 01 53 58 1 Central SS'), not a minted IA
-    identifier - after Task 9 it must pass through as ordinary metadata
-    (appearing in the field receipt) and must NOT be checked against the
-    COLLECTIONKEY-PROJECTID-NUMBER scheme, which it would never match."""
+    reference (e.g. 'CD 1 01 53 58 1 Central SS'), not a minted IA identifier,
+    so it must NOT be checked against the COLLECTIONKEY-PROJECTID-NUMBER
+    scheme, which it would never match.
+
+    It also must not be advertised as a field that will upload. It never
+    does - upload_row strips the `identifier` key because that name is
+    Internet Archive's own item identifier - and this test previously asserted
+    the receipt listed it among the uploadable fields, which pinned the lie in
+    place. A receipt an operator learns to disbelieve is worse than none."""
     from ia_bulk import cmd_validate
 
     (tmp_path / "photo1.jpg").write_bytes(b"x")
@@ -1152,7 +1157,8 @@ def test_cmd_validate_uploads_a_donor_identifier_column_as_ordinary_metadata(
     assert exit_code == 0
     assert "1/1 rows passed" in out
     assert "does not match scheme" not in out
-    assert "will upload these metadata fields:\n  title, identifier" in out
+    assert "will upload these metadata fields:\n  title\n" in out
+    assert "NOT uploaded - Internet Archive reserves these names:\n  identifier" in out
 
 
 def test_cmd_validate_names_ia_identifier_not_identifier_in_a_duplicate_error(
@@ -2943,11 +2949,13 @@ class RecordingSheetClient:
     would. `before_read` is the hook a mid-run-edit test uses to change the
     grid out from under the run between two reads."""
 
-    def __init__(self, grid, recorder, before_read=None):
+    def __init__(self, grid, recorder, before_read=None, raise_on_write=None):
         self.grid = [list(row) for row in grid]
         self._recorder = recorder
         self._before_read = before_read
+        self._raise_on_write = raise_on_write
         self.read_count = 0
+        self.write_count = 0
 
     def read_grid(self):
         self.read_count += 1
@@ -2959,7 +2967,10 @@ class RecordingSheetClient:
     def write_cells(self, updates):
         pairs = [(update.a1, update.value) for update in updates]
         assert pairs, "write_cells must never be called with an empty batch"
+        self.write_count += 1
         self._recorder.events.append(("write", pairs))
+        if self._raise_on_write == self.write_count:
+            raise RuntimeError("Sheets API returned 503")
         for a1, value in pairs:
             column, row_index = _a1_to_indexes(a1)
             while len(self.grid) <= row_index:
@@ -3015,6 +3026,8 @@ def setup_sheet_upload(
     captured=None,
     before_read=None,
     registry=None,
+    raise_on_write=None,
+    timestamps=None,
 ):
     """Builds the whole Sheet-upload world: files on disk, a registry, a
     recording client monkeypatched over build_sheet_client (the single seam),
@@ -3030,16 +3043,26 @@ def setup_sheet_upload(
     )
 
     recorder = SheetUploadRecorder()
-    client = RecordingSheetClient(grid, recorder, before_read=before_read)
+    client = RecordingSheetClient(
+        grid, recorder, before_read=before_read, raise_on_write=raise_on_write
+    )
     build_calls = []
 
     def fake_build_sheet_client(config, live):
         build_calls.append((config, live))
         return client
 
+    # A list of timestamps hands out one per call, so a multi-chunk test can
+    # tell "stamped when its own chunk ran" from "stamped once for the whole
+    # run" - on a full-collection run those differ by hours.
+    remaining = list(timestamps or [])
+
+    def fake_upload_timestamp():
+        return remaining.pop(0) if remaining else FIXED_TIMESTAMP
+
     monkeypatch.setattr("ia_bulk.build_sheet_client", fake_build_sheet_client)
     monkeypatch.setattr("ia_bulk.upload_row", make_upload_stub(recorder, fail_for, captured))
-    monkeypatch.setattr("ia_bulk.upload_timestamp", lambda: FIXED_TIMESTAMP)
+    monkeypatch.setattr("ia_bulk.upload_timestamp", fake_upload_timestamp)
 
     return recorder, client, registry_path, build_calls
 
@@ -3084,7 +3107,9 @@ def test_cmd_upload_with_write_identifier_reserves_then_uploads_then_confirms(
     would let a crash strand an item on IA the Sheet has no record of, and the
     next run's max+1 would mint that same number onto a different photograph.
     The exact event sequence is asserted, so a reordering fails here even
-    though every individual call would still be 'present'."""
+    though every individual call would still be 'present'. The read before the
+    reserve write is the mid-run-edit guard: row numbers come from the initial
+    read and are re-verified against a fresh one before every write."""
     from ia_bulk import cmd_upload
 
     grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
@@ -3094,7 +3119,7 @@ def test_cmd_upload_with_write_identifier_reserves_then_uploads_then_confirms(
     capsys.readouterr()
 
     assert exit_code == 0
-    assert recorder.kinds == ["read", "write", "upload", "read", "write"]
+    assert recorder.kinds == ["read", "read", "write", "upload", "read", "write"]
     assert recorder.writes == [
         [("C2", "lcps-astoriaphotos-00001")],
         [
@@ -3124,7 +3149,9 @@ def test_cmd_upload_reserved_row_uploads_under_its_existing_identifier_and_mints
 
     assert exit_code == 0
     assert recorder.uploads == ["zztest-lcps-astoriaphotos-00042"]
-    assert recorder.kinds == ["read", "upload", "read", "write"]
+    # The pre-reserve read still happens (the guard runs whether or not there
+    # is anything to reserve); the reserve WRITE does not.
+    assert recorder.kinds == ["read", "read", "upload", "read", "write"]
     assert recorder.writes == [
         [
             ("D2", FIXED_TIMESTAMP),
@@ -3290,7 +3317,7 @@ def test_cmd_upload_live_writes_back_even_without_write_identifier(tmp_path, mon
     capsys.readouterr()
 
     assert exit_code == 0
-    assert recorder.kinds == ["read", "write", "upload", "read", "write"]
+    assert recorder.kinds == ["read", "read", "write", "upload", "read", "write"]
     assert recorder.writes[0] == [("C2", "lcps-astoriaphotos-00001")]
     assert recorder.writes[1] == [
         ("D2", FIXED_TIMESTAMP),
@@ -3315,7 +3342,10 @@ def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
     ]
 
     def edit_between_reserve_and_confirm(live_grid, read_count):
-        if read_count == 2:
+        # Read 1 is the initial grid read, read 2 the pre-reserve guard, read 3
+        # the pre-confirm guard - so editing on 3 lands in the reserve->confirm
+        # window specifically.
+        if read_count == 3:
             live_grid[1][2] = "lcps-astoriaphotos-99999"
 
     recorder, client, registry_path, _ = setup_sheet_upload(
@@ -3343,7 +3373,8 @@ def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
         ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
         ("F3", "photo2.jpg"),
     ]
-    assert "row 2 no longer holds" in captured.err
+    assert "row 2 is no longer the row this run planned for" in captured.err
+    assert "IS on Internet Archive" in captured.err
     assert exit_code == 1
 
     log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
@@ -3424,9 +3455,12 @@ def test_cmd_upload_never_sends_tool_owned_or_held_back_columns_as_ia_metadata(
 
     assert exit_code == 0
     metadata_row = captured[0]["row"]
-    assert sorted(metadata_row) == ["file", "identifier", "identifier-bib", "mediatype", "title"]
+    assert sorted(metadata_row) == ["file", "identifier-bib", "mediatype", "title"]
     assert metadata_row["identifier-bib"] == "photo1.jpg"
     assert metadata_row["mediatype"] == "image"
+    # files_dir must come from the registry, not a "." default - upload_row
+    # joins it to row['file'] to find the bytes it sends.
+    assert captured[0]["files_dir"] == str(tmp_path)
 
 
 def test_cmd_upload_refuses_a_sheet_without_the_ia_write_back_columns(
@@ -3598,6 +3632,260 @@ def test_cmd_upload_records_a_failed_upload_without_confirming_it(tmp_path, monk
             ("F3", "photo2.jpg"),
         ],
     ]
+
+
+def test_cmd_upload_does_not_reserve_onto_a_row_that_shifted_after_the_initial_read(
+    tmp_path, monkeypatch, capsys
+):
+    """The read->reserve window, which the confirm guard cannot cover.
+
+    `read_grid()` fires once, then chunk N's reserve write fires after chunks
+    1..N-1 have finished uploading - hours later on a full-collection run. If
+    someone deletes a row in between, every row below shifts up and the reserve
+    write lands on a different photograph. Checking `ia_identifier` at confirm
+    time cannot catch it: reserve wrote that value at that index moments
+    earlier, so the check would be verifying its own write.
+
+    Here the human deletes row 2. Row 4 (already DONE, holding the permanent
+    identifier ...-00007 and its live archive.org URL) slides up into row 3,
+    which is the row this run planned to reserve ...-00008 onto. Unguarded,
+    that overwrites a completed row's permanent identifier and URL and exits
+    0. The fingerprint - the file_template columns, which this tool never
+    writes - is what notices."""
+    from ia_bulk import cmd_upload
+
+    done_row = [
+        "Done photo",
+        "photo3.jpg",
+        "lcps-astoriaphotos-00007",
+        "2026-01-01T00:00:00",
+        "https://archive.org/details/lcps-astoriaphotos-00007",
+        "photo3.jpg",
+    ]
+    grid = [
+        SHEET_HEADER,
+        ["Filler photo", "photo1.jpg", "lcps-astoriaphotos-00006", "2026-01-01T00:00:00", "u", "photo1.jpg"],
+        ["Photo one", "photo2.jpg", "", "", "", ""],
+        list(done_row),
+    ]
+
+    def human_deletes_row_two(live_grid, read_count):
+        if read_count == 2:
+            del live_grid[1]
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+        before_read=human_deletes_row_two,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    # The completed row is untouched: same permanent identifier, same URL.
+    assert client.grid[2] == done_row
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "row 3 is no longer the row this run planned for" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_upload_catches_a_shift_that_an_identifier_check_alone_cannot_see(
+    tmp_path, monkeypatch, capsys
+):
+    """The de-tautologising case, isolated.
+
+    Deleting row 2 slides two *unassigned* rows up one. Every candidate row
+    still has a blank `ia_identifier`, so a guard that only looked at that
+    column would wave both through and reserve ...-00007 onto the photograph
+    that was supposed to get ...-00008. Only the fingerprint - the
+    file_template columns, which this tool never writes - notices that row 3
+    now describes a different photograph."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["Filler", "photo1.jpg", "lcps-astoriaphotos-00006", "2026-01-01T00:00:00", "u", "photo1.jpg"],
+        ["Photo one", "photo2.jpg", "", "", "", ""],
+        ["Photo two", "photo3.jpg", "", "", "", ""],
+    ]
+
+    def human_deletes_row_two(live_grid, read_count):
+        if read_count == 2:
+            del live_grid[1]
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+        before_read=human_deletes_row_two,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "row 3 is no longer the row this run planned for" in captured.err
+    assert "row 4 is no longer the row this run planned for" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_upload_does_not_write_after_a_column_is_inserted_mid_run(
+    tmp_path, monkeypatch, capsys
+):
+    """Column positions are cached from the initial read too. A column
+    inserted mid-run shifts every write-back column one to the right, so every
+    cell this run would write lands in the wrong column - not just the wrong
+    row."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+
+    def human_inserts_a_column(live_grid, read_count):
+        if read_count == 2:
+            for row in live_grid:
+                row.insert(1, "Photographer" if row is live_grid[0] else "unknown")
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, before_read=human_inserts_a_column
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "no longer the row this run planned for" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_upload_reserves_and_confirms_once_per_chunk_not_once_per_run(
+    tmp_path, monkeypatch, capsys
+):
+    """Every other Sheet test runs 1-3 rows against CHUNK_SIZE = 500, so none
+    of them ever reaches a second chunk - and both "hoist the reserve into one
+    batch for the whole run" and "defer every confirm to the end" survive them
+    untouched. The second is a shippable defect: one confirm batch of 10,000
+    rows x 3 cells would likely exceed the Sheets request limit and lose the
+    entire run's write-back.
+
+    The full ordered sequence is asserted, chunk boundaries included."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        timestamps=["2026-08-19T09:00:00", "2026-08-19T11:30:00"],
+    )
+    monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.kinds == [
+        "read",
+        "read", "write", "upload", "read", "write",
+        "read", "write", "upload", "read", "write",
+    ]
+    assert recorder.writes == [
+        [("C2", "lcps-astoriaphotos-00001")],
+        [
+            ("D2", "2026-08-19T09:00:00"),
+            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("F2", "photo1.jpg"),
+        ],
+        [("C3", "lcps-astoriaphotos-00002")],
+        [
+            # Its own chunk's time, not the time chunk 1 started.
+            ("D3", "2026-08-19T11:30:00"),
+            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+            ("F3", "photo2.jpg"),
+        ],
+    ]
+
+
+def test_cmd_upload_treats_a_number_in_an_invalid_row_as_spent(tmp_path, monkeypatch, capsys):
+    """A number that appears anywhere in the Sheet is spent, whatever the state
+    of the row holding it. Minting from valid rows only would re-issue a number
+    an invalid row already holds - which is the permanent collision the whole
+    reserve-first design exists to prevent."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        # No title, so it fails validation - but it still holds ...-00050.
+        ["", "photo1.jpg", "lcps-astoriaphotos-00050", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 1  # the invalid row was skipped
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00051"]
+    assert recorder.writes[0] == [("C3", "lcps-astoriaphotos-00051")]
+
+
+def test_cmd_upload_reports_a_sheets_write_failure_instead_of_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """A 503, an expired token or a revoked share during the confirm write is
+    an ordinary operational event. The operator still needs the summary and the
+    log path - recovery is correct either way (the row stays RESERVED and the
+    next run reuses the identifier), but they should not have to derive that
+    from a stack trace."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, raise_on_write=2
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Sheets API returned 503" in captured.err
+    assert "1 file(s) uploaded successfully" in captured.out
+    assert "log written to" in captured.out
+
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    assert [entry["status"] for entry in entries] == ["success", "unconfirmed"]
+
+
+def test_cmd_upload_prints_the_field_receipt_before_uploading(tmp_path, monkeypatch, capsys):
+    """`upload` is where something permanent happens, so it must show the same
+    receipt `validate` does rather than assume the operator ran validate first
+    and remembers what it said."""
+    from ia_bulk import cmd_upload
+
+    header = SHEET_HEADER + ["Donor notes (LCPS Internal)", "Identifier"]
+    grid = [header, ["First photo", "photo1.jpg", "", "", "", "", "private", "CD 1 01"]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "will upload these metadata fields:\n  title\n" in out
+    assert "NOT uploaded - Internet Archive reserves these names:\n  identifier" in out
+    assert "held back (LCPS Internal):\n  Donor notes (LCPS Internal)" in out
 
 
 def test_validate_sheet_rows_and_validate_csv_rows_keep_their_two_different_answers(tmp_path):

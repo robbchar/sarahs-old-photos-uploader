@@ -279,6 +279,34 @@ Because the resolved name is the real one, `ia_identifier_bib` records
 `folder/resolved-filename`, which can differ from what the Sheet says. That is
 the point: it records what was uploaded, not what someone typed.
 
+## A row's identity is its `file_template` columns, not its `ia_identifier`
+
+*Decided 2026-08-16, after review found the first version of the mid-run-edit
+guard was checking its own write.*
+
+The guard's first version compared `ia_identifier` at the target row against
+the value the run reserved. That is tautological on the reserve→confirm leg:
+reserve had written that exact value at that exact index moments earlier, so
+the check could only ever pass. It also ran only before the confirm, leaving
+the read→reserve window — which is the *whole run*, since row numbers are
+fixed by one initial read and the last chunk's reserve write happens hours
+later — entirely unguarded. A row deleted in that window shifts a completed
+row up into a target's position, and the reserve write overwrites a permanent
+identifier and its live archive.org URL, silently, exit 0.
+
+A row's identity has to be something this tool never writes, or the check is
+circular. The `file_template` columns are exactly that: they are the operator's
+own data, the tool only ever reads them, and they are already in memory per
+row. So the fingerprint is the row's template candidate, captured from the raw
+cells before resolution rewrites them, and it is re-checked before **both**
+writes. `ia_identifier` is still checked alongside it — blank for a row about
+to be reserved, ours once reserved — because it catches a different thing:
+somebody else claiming the row.
+
+The residual gap is two rows whose template columns are identical. That is the
+same latent "two rows resolving to the same photograph" case recorded in
+`KNOWN-ISSUES.md`, not a new one.
+
 ## A bad row is skipped; a bad header stops the whole run
 
 *Decided 2026-08-16, alongside "upload uploads the valid rows and reports the
@@ -329,6 +357,19 @@ what may be uploaded, and already excluding both categories) and adding the
 generated `identifier-bib` and `mediatype`. Filtering here rather than inside
 `upload_row` leaves the CSV path's behavior untouched and keeps the rule next
 to the ColumnMap that defines it.
+
+`identifier` and `file` are subtracted too, via `DROPPED_BY_UPLOAD_ROW`. Those
+are the two keys `upload_row` strips on its own — `file` is a local path and
+`identifier` is Internet Archive's own item identifier, so a Sheet column of
+that name cannot ship under it. Naming them in one place lets the field receipt
+say so out loud. It previously listed `identifier` among the fields that would
+upload, which was simply untrue, and a test asserted that wording and so pinned
+the lie in place. **The consequence is real and still open**: on a Sheet with a
+donor `Identifier` column, that archival reference now reaches Internet Archive
+in no form at all — the registry's `file_template` names different columns, so
+`identifier-bib` does not carry it either. Repairable after the fact with
+`sync-metadata`, but it needs a deliberate answer (a non-colliding field name)
+rather than a silent drop.
 
 ## `identifier-bib` and `mediatype` are generated, not columns
 

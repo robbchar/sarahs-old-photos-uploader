@@ -90,6 +90,14 @@ WRITE_BACK_COLUMNS = (
     IA_IDENTIFIER_BIB_COLUMN,
 )
 ITEM_URL_PREFIX = "https://archive.org/details/"
+# upload_row() strips these two keys from the metadata it sends, so a column
+# normalizing to one of them never reaches Internet Archive whatever the
+# receipt might otherwise imply. `file` is the local path, not metadata.
+# `identifier` IS Internet Archive's own item identifier, so a Sheet column of
+# that name - on the real Sheet, the donor's archival reference - cannot be
+# uploaded under it. Named here so the receipt can say so out loud instead of
+# listing a field that silently never ships.
+DROPPED_BY_UPLOAD_ROW = frozenset({"identifier", "file"})
 
 _ChunkItem = TypeVar("_ChunkItem")
 
@@ -409,10 +417,23 @@ def sheet_structure_validation(column_map: ColumnMap, grid: list[list[str]]) -> 
 
 def format_field_receipt(column_map: ColumnMap) -> str:
     """Printed before anything permanent happens, so the transformation from
-    Sheet header to IA field name is reviewable by a human."""
+    Sheet header to IA field name is reviewable by a human.
+
+    The "not uploaded" section is not decoration. A Sheet column named
+    `Identifier` (the real one has one, holding the donor's archival reference)
+    normalizes to `identifier`, which upload_row strips because that name is
+    Internet Archive's own item identifier. The receipt used to list it among
+    the fields that would upload, which was simply untrue - and a receipt an
+    operator learns to disbelieve is worse than no receipt."""
+    all_fields = column_map.uploadable_fields()
+    fields = [name for name in all_fields if name not in DROPPED_BY_UPLOAD_ROW]
+    dropped = [name for name in all_fields if name in DROPPED_BY_UPLOAD_ROW]
+
     lines = ["will upload these metadata fields:"]
-    fields = column_map.uploadable_fields()
     lines.append("  " + ", ".join(fields) if fields else "  (none)")
+    if dropped:
+        lines.append("NOT uploaded - Internet Archive reserves these names:")
+        lines.append(f"  {', '.join(dropped)}")
     if column_map.held_back:
         lines.append("held back (LCPS Internal):")
         lines.append("  " + ", ".join(column_map.held_back))
@@ -1008,6 +1029,10 @@ class UploadTarget:
     uploaded_as: str
     identifier_bib: str
     newly_minted: bool
+    # What this row's file_template columns said when the run read the Sheet.
+    # Re-checked against a fresh read before every write - see
+    # split_moved_targets().
+    source_fingerprint: str
 
 
 def item_url(uploaded_as: str) -> str:
@@ -1072,18 +1097,85 @@ def cell_value(grid: list[list[str]], row_number: int, column_index: int) -> str
     return (row[column_index] if column_index < len(row) else "").strip()
 
 
+def sheet_row_fingerprints(
+    rows: list[dict[str, str]], file_template: str
+) -> dict[int, str]:
+    """row_number -> the row's `file_template` candidate, as a fingerprint for
+    "is this still the same row?".
+
+    The template's columns are the right fingerprint for one specific reason:
+    this tool never writes them. Checking `ia_identifier` instead would be
+    tautological on the reserve->confirm leg, because reserve is what put that
+    value there - the check would be verifying its own write.
+
+    Must be computed from the RAW cells, before resolve_sheet_files() rewrites
+    row['file'] to the resolved name: the comparison is against a fresh read of
+    the Sheet, which has raw cells in it, and comparing a resolved name to a
+    raw one would report every row as moved.
+
+    A row whose template columns have vanished fingerprints as "" and can
+    therefore never match, which is the safe direction."""
+    fingerprints: dict[int, str] = {}
+    for offset, row in enumerate(rows):
+        try:
+            fingerprints[offset + 2] = candidate_path(file_template, row)
+        except (KeyError, IndexError):
+            fingerprints[offset + 2] = ""
+    return fingerprints
+
+
+@dataclass(frozen=True)
+class SheetSnapshot:
+    """A fresh read of the Sheet, reduced to what the mid-run-edit guard needs:
+    where the write-back columns are now, what each row's fingerprint is now,
+    and the grid itself for reading `ia_identifier` back."""
+
+    columns: SheetColumns
+    grid: list[list[str]]
+    fingerprints: dict[int, str]
+
+
+def read_sheet_snapshot(client: SheetClient, file_template: str) -> SheetSnapshot:
+    grid = client.read_grid()
+    column_map, rows = grid_to_rows(grid)
+    return SheetSnapshot(
+        columns=locate_write_back_columns(column_map),
+        grid=grid,
+        fingerprints=sheet_row_fingerprints(rows, file_template),
+    )
+
+
 def split_moved_targets(
-    targets: list[UploadTarget], columns: SheetColumns, grid: list[list[str]]
+    targets: list[UploadTarget], snapshot: SheetSnapshot, reserved_already: bool
 ) -> tuple[list[UploadTarget], list[UploadTarget]]:
-    """Returns (still_at_their_row, moved). Row numbers are positional, so a
-    human inserting or deleting a row mid-run shifts every row below it. Before
-    writing a URL the run re-reads the Sheet and checks the target row still
-    holds the identifier it reserved; a mismatch means the write would land on
-    a different photograph, so it is withheld and reported instead."""
+    """Returns (still_at_their_row, moved).
+
+    Row numbers are positional. A human inserting or deleting a row shifts
+    every row below it, and the run holds row numbers from a read that may be
+    hours old on a full-collection run - the initial read fixes them, and the
+    last chunk's reserve write uses them. So this check runs before BOTH
+    writes, not just before the confirm.
+
+    Two things must agree. The fingerprint (the file_template columns, which
+    this tool never writes) says the row still describes the same photograph.
+    `ia_identifier` says nobody else has claimed it: blank for a row about to
+    be reserved, and equal to ours once reserved. Checking the identifier alone
+    would be tautological after reserve; checking the fingerprint alone would
+    miss a row someone else assigned a number to in the meantime."""
     still_there: list[UploadTarget] = []
     moved: list[UploadTarget] = []
     for target in targets:
-        if cell_value(grid, target.row_number, columns.ia_identifier) == target.identifier:
+        expected_identifier = (
+            target.identifier if reserved_already or not target.newly_minted else ""
+        )
+        fingerprint_now = snapshot.fingerprints.get(target.row_number, "")
+        matches = (
+            bool(fingerprint_now)
+            and fingerprint_now == target.source_fingerprint
+            and cell_value(snapshot.grid, target.row_number, snapshot.columns.ia_identifier)
+            == expected_identifier
+        )
+        if matches:
             still_there.append(target)
         else:
             moved.append(target)
@@ -1108,12 +1200,11 @@ def sheet_upload_metadata(
     zztest-lcps-sarahsoldphotos-00005 carries a permanently misspelled
     `indentifier-bib` because a header typo shipped once; a generated field
     name cannot do that."""
-    uploadable = set(column_map.uploadable_fields())
+    uploadable = set(column_map.uploadable_fields()) - DROPPED_BY_UPLOAD_ROW
     metadata_row = {key: value for key, value in target.row.items() if key in uploadable}
     metadata_row["mediatype"] = mediatype
     metadata_row["identifier-bib"] = target.identifier_bib
     metadata_row["file"] = target.row["file"]
-    metadata_row["identifier"] = target.identifier
     return metadata_row
 
 
@@ -1122,6 +1213,7 @@ def plan_upload_targets(
     row_results: list[RowValidation],
     config: ProjectConfig,
     live: bool,
+    fingerprints: dict[int, str],
 ) -> list[UploadTarget]:
     """Decides what this run will upload and under which identifier.
 
@@ -1167,6 +1259,7 @@ def plan_upload_targets(
                 uploaded_as=effective_identifier(identifier, live),
                 identifier_bib=(row.get(IA_IDENTIFIER_BIB_COLUMN) or "").strip(),
                 newly_minted=newly_minted,
+                source_fingerprint=fingerprints.get(row_number, ""),
             )
         )
     return targets
@@ -1190,6 +1283,7 @@ class SheetUploadRun:
     columns: SheetColumns
     column_map: ColumnMap
     mediatype: str
+    file_template: str
     files_dir: str
     collection: str
     live: bool
@@ -1197,24 +1291,43 @@ class SheetUploadRun:
     log_path: Path
 
     def execute(self, targets: list[UploadTarget]) -> dict[str, int]:
-        """One chunk at a time: reserve, upload, confirm, having logged each
-        row's outcome as it happened.
+        """One chunk at a time: verify, reserve, upload, verify, confirm,
+        having logged each row's outcome as it happened.
 
         Chunking is what keeps this inside the Sheets API's 60 writes per
         minute per user - a batch counts as one request, so ~10,000 rows cost
-        about 40 requests instead of 10,000."""
-        counts = {"success": 0, "failure": 0, "unconfirmed": 0}
-        uploaded_at = upload_timestamp()
+        about 40 requests instead of 10,000. It is also why the guard has to
+        run per chunk: the last chunk's reserve write can be hours after the
+        read that fixed its row numbers.
+
+        `CHUNK_SIZE` is read here rather than taken as chunk_rows' default so
+        the chunk boundary is reachable in a test - a protocol that is only
+        ever exercised with a single chunk is a protocol nobody has tested."""
+        counts = {"success": 0, "failure": 0, "unconfirmed": 0, "not_attempted": 0}
         total = len(targets)
         position = 0
+        done = 0
 
-        for chunk in chunk_rows(targets):
+        for chunk in chunk_rows(targets, CHUNK_SIZE):
+            # Every chunk gets a fresh timestamp. One timestamp for the whole
+            # run would stamp chunk 20 with the time chunk 1 started, which on
+            # a full-collection run is hours wrong.
+            uploaded_at = upload_timestamp()
+
             if self.write_back:
-                write_cells_if_any(self.client, reserve_updates(chunk, self.columns))
+                reservable, moved = self._verify(chunk, reserved_already=False)
+                for target in moved:
+                    counts["not_attempted"] += 1
+                    self._report_moved(target, uploaded=False)
+                if not self._write(reserve_updates(reservable, self.columns), "reserve"):
+                    counts["not_attempted"] += len(targets) - done - len(moved)
+                    return counts
+                chunk = reservable
 
             succeeded: list[UploadTarget] = []
             for target in chunk:
                 position += 1
+                done += 1
                 print(f"[{position}/{total}] uploading {target.uploaded_as} ({target.row['file']})")
                 try:
                     upload_row(
@@ -1232,27 +1345,64 @@ class SheetUploadRun:
                 succeeded.append(target)
 
             if self.write_back and succeeded:
-                counts["unconfirmed"] += self._confirm(succeeded, uploaded_at)
+                confirmable, moved = self._verify(succeeded, reserved_already=True)
+                for target in moved:
+                    counts["unconfirmed"] += 1
+                    self._report_moved(target, uploaded=True)
+                if not self._write(confirm_updates(confirmable, self.columns, uploaded_at), "confirm"):
+                    counts["unconfirmed"] += len(confirmable)
+                    for target in confirmable:
+                        self._log(target, "unconfirmed", error="the Sheet write failed")
+                    return counts
 
         return counts
 
-    def _confirm(self, succeeded: list[UploadTarget], uploaded_at: str) -> int:
-        current_grid = self.client.read_grid()
-        confirmable, moved = split_moved_targets(succeeded, self.columns, current_grid)
+    def _verify(
+        self, targets: list[UploadTarget], reserved_already: bool
+    ) -> tuple[list[UploadTarget], list[UploadTarget]]:
+        """Re-reads the Sheet and splits the targets into those still at the
+        row this run planned for them and those that have moved. Runs before
+        BOTH writes - see split_moved_targets for why the fingerprint, and not
+        `ia_identifier`, is what makes the check meaningful."""
+        snapshot = read_sheet_snapshot(self.client, self.file_template)
+        if snapshot.columns != self.columns:
+            # A column was inserted, deleted or renamed. Every cached column
+            # index is now wrong, so every write this run could make would land
+            # in the wrong column - not just for this chunk.
+            return [], list(targets)
+        return split_moved_targets(targets, snapshot, reserved_already)
 
-        for target in moved:
-            message = (
-                f"row {target.row_number} no longer holds '{target.identifier}' in "
-                f"'{IA_IDENTIFIER_COLUMN}' - the Sheet changed while this run was uploading, so "
-                f"the result is NOT recorded there. The item is on Internet Archive as "
-                f"'{target.uploaded_as}'; rerun once the Sheet has settled and the row will be "
-                "picked up as reserved-but-unconfirmed."
+    def _report_moved(self, target: UploadTarget, uploaded: bool) -> None:
+        outcome = (
+            f"The item IS on Internet Archive as '{target.uploaded_as}' but is NOT recorded in "
+            "the Sheet."
+            if uploaded
+            else "Nothing was uploaded for it."
+        )
+        message = (
+            f"row {target.row_number} is no longer the row this run planned for "
+            f"'{target.identifier}' - the Sheet was edited while the run was in progress, so "
+            f"writing there would land on a different photograph. {outcome} Rerun once the "
+            "Sheet has settled."
+        )
+        print(message, file=sys.stderr)
+        self._log(target, "unconfirmed" if uploaded else "skipped", error=message)
+
+    def _write(self, updates: list[CellUpdate], step: str) -> bool:
+        """A Sheets write failing (a 503, an expired token, a revoked share) is
+        an ordinary operational event, not a reason to hand the operator a
+        traceback in place of the run summary and the log path."""
+        try:
+            write_cells_if_any(self.client, updates)
+        except Exception as exc:
+            print(
+                f"the Sheet {step} write failed: {exc}. Stopping here rather than uploading more "
+                "items this run cannot record. Nothing is lost - rerun once the Sheet is "
+                "reachable and every unrecorded row is picked up from where it stopped.",
+                file=sys.stderr,
             )
-            print(message, file=sys.stderr)
-            self._log(target, "unconfirmed", error=message)
-
-        write_cells_if_any(self.client, confirm_updates(confirmable, self.columns, uploaded_at))
-        return len(moved)
+            return False
+        return True
 
     def _log(self, target: UploadTarget, status: str, error: str | None = None) -> None:
         log_result(
@@ -1487,6 +1637,11 @@ def upload_from_sheet(args) -> int:
         print(f"project '{config.project_id}': {exc}", file=sys.stderr)
         return 1
 
+    # Fingerprints come from the RAW cells, so they must be taken before
+    # resolve_sheet_files() rewrites row['file'] to the resolved name. They are
+    # what every later mid-run-edit check compares against.
+    source_fingerprints = sheet_row_fingerprints(rows, config.file_template)
+
     file_resolution_errors = resolve_sheet_files(rows, config)
     header_results, row_results = validate_sheet_grid(
         rows, registry, config, structure_results, file_resolution_errors
@@ -1515,8 +1670,14 @@ def upload_from_sheet(args) -> int:
         )
         print()
 
-    targets = plan_upload_targets(rows, row_results, config, live)
+    targets = plan_upload_targets(rows, row_results, config, live, source_fingerprints)
     collection = config.ia_collection if live else TEST_COLLECTION
+
+    # `upload` is where something permanent happens, so it shows the same
+    # field receipt `validate` does rather than assuming the operator ran
+    # validate first and remembers what it said.
+    print(format_field_receipt(column_map))
+    print()
 
     if dry_run:
         print_dry_run(targets, columns, write_back, upload_timestamp())
@@ -1532,6 +1693,7 @@ def upload_from_sheet(args) -> int:
         columns=columns,
         column_map=column_map,
         mediatype=config.mediatype,
+        file_template=config.file_template,
         files_dir=config.files_dir,
         collection=collection,
         live=live,
@@ -1545,10 +1707,18 @@ def upload_from_sheet(args) -> int:
             f"{_pluralize(counts['unconfirmed'], 'item')} uploaded but NOT recorded in the Sheet "
             "- see the messages above"
         )
+    if counts["not_attempted"]:
+        print(
+            f"{_pluralize(counts['not_attempted'], 'row')} not attempted - see the messages above"
+        )
     if skipped:
         print(f"{_pluralize(len(skipped), 'row')} skipped (failed validation)")
     print(f"log written to {log_path}")
-    return 1 if (counts["failure"] or counts["unconfirmed"] or skipped) else 0
+    return (
+        1
+        if (counts["failure"] or counts["unconfirmed"] or counts["not_attempted"] or skipped)
+        else 0
+    )
 
 
 def cmd_sync_metadata(args) -> int:

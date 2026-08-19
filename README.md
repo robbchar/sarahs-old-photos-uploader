@@ -148,10 +148,23 @@ A row is chosen by what its two tool-owned columns already hold:
 The Sheet must already have all four `ia_` columns as headers
 (`ia_identifier`, `ia_uploaded`, `ia_url`, `ia_identifier_bib`); `upload`
 refuses in every mode until they exist, so a rehearsal never succeeds where
-the real run would fail. Before writing a row's URL, the run re-reads the
-Sheet and checks that row still holds the identifier it reserved — if someone
-inserted or deleted rows mid-run the indices have shifted, and the result is
-reported rather than written onto the wrong photograph.
+the real run would fail.
+
+**Editing the Sheet while a run is in progress.** Row numbers are positional,
+so inserting or deleting a row shifts every row below it — and a run holds row
+numbers from the read it started with, which on a full-collection run is hours
+before the last chunk writes. Before **every** write, reserve and confirm
+alike, the run re-reads the Sheet and checks two things about each target row:
+that its `file_template` columns still describe the same photograph (a
+fingerprint this tool never writes, so the check cannot pass by verifying its
+own earlier write), and that `ia_identifier` is blank or already ours. A
+mismatch — including a column inserted or removed — is reported and the write
+is withheld, rather than landing on a different photograph. Nothing is lost:
+rerun once the Sheet has settled and every unrecorded row is picked up.
+
+That said, the check is a safety net, not a licence. It cannot distinguish two
+rows whose `file_template` columns are identical, so **avoid editing the Sheet
+while a run is in progress.**
 
 **A failing row is skipped, not fatal.** One unresolvable file in row 9,000
 does not block the other 9,999; the failures are listed with their errors, the
