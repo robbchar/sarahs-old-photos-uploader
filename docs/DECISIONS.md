@@ -303,9 +303,18 @@ writes. `ia_identifier` is still checked alongside it — blank for a row about
 to be reserved, ours once reserved — because it catches a different thing:
 somebody else claiming the row.
 
-The residual gap is two rows whose template columns are identical. That is the
-same latent "two rows resolving to the same photograph" case recorded in
-`KNOWN-ISSUES.md`, not a new one.
+The residual gap is two rows whose template columns are identical — the same
+latent "two rows resolving to the same photograph" case recorded in
+`KNOWN-ISSUES.md`. **Its consequence is a misattributed write, not a withheld
+one.** With two UNASSIGNED rows pointing at the same file and a row deleted
+above them, the fingerprints still match after the shift, so the guard passes:
+the item uploads carrying one row's metadata while the identifier, timestamp,
+URL and bib land on the *other* row, leaving the first unassigned and due to
+be re-minted next run. Bounded — the same bytes reach Internet Archive, and it
+cannot touch a DONE or RESERVED row, since those are excluded from the run
+before the guard ever sees them — but it is a wrong write, not a refusal, and
+the note should not be read as saying otherwise. Fixing it needs a row
+identity that does not depend on `file_template` being unique.
 
 ## A bad row is skipped; a bad header stops the whole run
 

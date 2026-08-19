@@ -1275,6 +1275,22 @@ def write_cells_if_any(client: SheetClient, updates: list[CellUpdate]) -> None:
 
 
 @dataclass(frozen=True)
+class VerifyOutcome:
+    """The result of re-reading the Sheet before a write.
+
+    `stop_reason` distinguishes "these particular rows moved" (None - carry on
+    with the rest) from "something happened to the whole Sheet" (a message -
+    stop the run). The second case cannot be expressed as a per-row verdict: a
+    failed read or a shifted column is equally true of every remaining chunk,
+    so continuing would re-read and re-report the entire Sheet on the way to
+    the same conclusion."""
+
+    ok: list[UploadTarget]
+    moved: list[UploadTarget]
+    stop_reason: str | None
+
+
+@dataclass(frozen=True)
 class SheetUploadRun:
     """Everything the reserve -> upload -> confirm loop needs that does not
     change from row to row."""
@@ -1306,28 +1322,35 @@ class SheetUploadRun:
         counts = {"success": 0, "failure": 0, "unconfirmed": 0, "not_attempted": 0}
         total = len(targets)
         position = 0
-        done = 0
+        # Targets that already have a verdict of any kind - uploaded, failed, or
+        # reported as moved. `total - settled` is therefore exactly what a
+        # run-stopping problem leaves unattempted, with nothing counted twice.
+        settled = 0
 
         for chunk in chunk_rows(targets, CHUNK_SIZE):
             # Every chunk gets a fresh timestamp. One timestamp for the whole
             # run would stamp chunk 20 with the time chunk 1 started, which on
             # a full-collection run is hours wrong.
             uploaded_at = upload_timestamp()
+            working = chunk
 
             if self.write_back:
-                reservable, moved = self._verify(chunk, reserved_already=False)
-                for target in moved:
+                outcome = self._verify(chunk, reserved_already=False)
+                for target in outcome.moved:
                     counts["not_attempted"] += 1
-                    self._report_moved(target, uploaded=False)
-                if not self._write(reserve_updates(reservable, self.columns), "reserve"):
-                    counts["not_attempted"] += len(targets) - done - len(moved)
+                    settled += 1
+                    self._report_moved(target, uploaded=False, cause=outcome.stop_reason)
+                if outcome.stop_reason is not None or not self._write(
+                    reserve_updates(outcome.ok, self.columns), "reserve"
+                ):
+                    counts["not_attempted"] += total - settled
                     return counts
-                chunk = reservable
+                working = outcome.ok
 
             succeeded: list[UploadTarget] = []
-            for target in chunk:
+            for target in working:
                 position += 1
-                done += 1
+                settled += 1
                 print(f"[{position}/{total}] uploading {target.uploaded_as} ({target.row['file']})")
                 try:
                     upload_row(
@@ -1345,34 +1368,76 @@ class SheetUploadRun:
                 succeeded.append(target)
 
             if self.write_back and succeeded:
-                confirmable, moved = self._verify(succeeded, reserved_already=True)
-                for target in moved:
+                outcome = self._verify(succeeded, reserved_already=True)
+                for target in outcome.moved:
                     counts["unconfirmed"] += 1
-                    self._report_moved(target, uploaded=True)
-                if not self._write(confirm_updates(confirmable, self.columns, uploaded_at), "confirm"):
-                    counts["unconfirmed"] += len(confirmable)
-                    for target in confirmable:
+                    self._report_moved(target, uploaded=True, cause=outcome.stop_reason)
+                if outcome.stop_reason is not None:
+                    counts["not_attempted"] += total - settled
+                    return counts
+                if not self._write(confirm_updates(outcome.ok, self.columns, uploaded_at), "confirm"):
+                    counts["unconfirmed"] += len(outcome.ok)
+                    for target in outcome.ok:
                         self._log(target, "unconfirmed", error="the Sheet write failed")
+                    counts["not_attempted"] += total - settled
                     return counts
 
         return counts
 
-    def _verify(
-        self, targets: list[UploadTarget], reserved_already: bool
-    ) -> tuple[list[UploadTarget], list[UploadTarget]]:
+    def _verify(self, targets: list[UploadTarget], reserved_already: bool) -> VerifyOutcome:
         """Re-reads the Sheet and splits the targets into those still at the
         row this run planned for them and those that have moved. Runs before
         BOTH writes - see split_moved_targets for why the fingerprint, and not
-        `ia_identifier`, is what makes the check meaningful."""
-        snapshot = read_sheet_snapshot(self.client, self.file_template)
+        `ia_identifier`, is what makes the check meaningful.
+
+        This step added two Sheets READS per chunk - roughly 80 across a
+        full-collection run spanning hours - so one transient 503 among them is
+        likely rather than exotic, and it must not end a run that has already
+        created thousands of permanent Internet Archive items with a stack
+        trace. Both failure modes below stop the run cleanly instead: the
+        caller still prints the summary and the log path, and every affected
+        row is logged."""
+        try:
+            snapshot = read_sheet_snapshot(self.client, self.file_template)
+        except MissingWriteBackColumns as exc:
+            return VerifyOutcome([], list(targets), f"a column this run writes to is gone: {exc}")
+        except Exception as exc:
+            return VerifyOutcome([], list(targets), f"the Sheet could not be re-read: {exc}")
+
         if snapshot.columns != self.columns:
             # A column was inserted, deleted or renamed. Every cached column
             # index is now wrong, so every write this run could make would land
-            # in the wrong column - not just for this chunk.
-            return [], list(targets)
-        return split_moved_targets(targets, snapshot, reserved_already)
+            # in the wrong column - which is true for every remaining chunk,
+            # not just this one, hence a stop_reason rather than a per-row
+            # verdict that would re-read and re-report the whole Sheet 20 more
+            # times on the way to the same conclusion.
+            return VerifyOutcome(
+                [],
+                list(targets),
+                "the Sheet's columns moved while this run was in progress, so every cell it "
+                "would write now lands in the wrong column",
+            )
 
-    def _report_moved(self, target: UploadTarget, uploaded: bool) -> None:
+        ok, moved = split_moved_targets(targets, snapshot, reserved_already)
+        return VerifyOutcome(ok, moved, None)
+
+    def _report_moved(
+        self, target: UploadTarget, uploaded: bool, cause: str | None = None
+    ) -> None:
+        """`cause` names a whole-Sheet problem (a failed read, a moved column)
+        when there is one. Without it this said "row N is no longer the row
+        this run planned for" for a COLUMN change too, which is wrong in kind
+        and sends the operator to look at the wrong thing.
+
+        The filename is on screen, not just in the log, because for a row that
+        was never uploaded the identifier exists nowhere yet and the row number
+        is precisely what has gone stale - `file` is the only durable handle
+        the operator has left."""
+        what_changed = cause or (
+            f"row {target.row_number} is no longer the row this run planned for "
+            f"'{target.identifier}' - the Sheet was edited while the run was in progress, so "
+            "writing there would land on a different photograph"
+        )
         outcome = (
             f"The item IS on Internet Archive as '{target.uploaded_as}' but is NOT recorded in "
             "the Sheet."
@@ -1380,10 +1445,9 @@ class SheetUploadRun:
             else "Nothing was uploaded for it."
         )
         message = (
-            f"row {target.row_number} is no longer the row this run planned for "
-            f"'{target.identifier}' - the Sheet was edited while the run was in progress, so "
-            f"writing there would land on a different photograph. {outcome} Rerun once the "
-            "Sheet has settled."
+            f"{what_changed}. {outcome} File: '{target.row['file']}' (planned row "
+            f"{target.row_number}, identifier '{target.identifier}'). Rerun once the Sheet has "
+            "settled."
         )
         print(message, file=sys.stderr)
         self._log(target, "unconfirmed" if uploaded else "skipped", error=message)
@@ -1705,11 +1769,12 @@ def upload_from_sheet(args) -> int:
     if counts["unconfirmed"]:
         print(
             f"{_pluralize(counts['unconfirmed'], 'item')} uploaded but NOT recorded in the Sheet "
-            "- see the messages above"
+            "- each one is named on stderr above, and in the log"
         )
     if counts["not_attempted"]:
         print(
-            f"{_pluralize(counts['not_attempted'], 'row')} not attempted - see the messages above"
+            f"{_pluralize(counts['not_attempted'], 'row')} not attempted - the run stopped early; "
+            "see the reason on stderr above"
         )
     if skipped:
         print(f"{_pluralize(len(skipped), 'row')} skipped (failed validation)")

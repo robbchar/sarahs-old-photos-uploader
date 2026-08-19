@@ -2949,11 +2949,12 @@ class RecordingSheetClient:
     would. `before_read` is the hook a mid-run-edit test uses to change the
     grid out from under the run between two reads."""
 
-    def __init__(self, grid, recorder, before_read=None, raise_on_write=None):
+    def __init__(self, grid, recorder, before_read=None, raise_on_write=None, raise_on_read=None):
         self.grid = [list(row) for row in grid]
         self._recorder = recorder
         self._before_read = before_read
         self._raise_on_write = raise_on_write
+        self._raise_on_read = raise_on_read
         self.read_count = 0
         self.write_count = 0
 
@@ -2962,6 +2963,8 @@ class RecordingSheetClient:
         if self._before_read is not None:
             self._before_read(self.grid, self.read_count)
         self._recorder.events.append(("read", None))
+        if self._raise_on_read == self.read_count:
+            raise RuntimeError("Sheets API returned 503")
         return [list(row) for row in self.grid]
 
     def write_cells(self, updates):
@@ -3027,6 +3030,7 @@ def setup_sheet_upload(
     before_read=None,
     registry=None,
     raise_on_write=None,
+    raise_on_read=None,
     timestamps=None,
 ):
     """Builds the whole Sheet-upload world: files on disk, a registry, a
@@ -3044,7 +3048,11 @@ def setup_sheet_upload(
 
     recorder = SheetUploadRecorder()
     client = RecordingSheetClient(
-        grid, recorder, before_read=before_read, raise_on_write=raise_on_write
+        grid,
+        recorder,
+        before_read=before_read,
+        raise_on_write=raise_on_write,
+        raise_on_read=raise_on_read,
     )
     build_calls = []
 
@@ -3734,16 +3742,29 @@ def test_cmd_upload_catches_a_shift_that_an_identifier_check_alone_cannot_see(
     assert exit_code == 1
 
 
-def test_cmd_upload_does_not_write_after_a_column_is_inserted_mid_run(
+def test_cmd_upload_aborts_the_whole_run_when_a_column_is_inserted_mid_run(
     tmp_path, monkeypatch, capsys
 ):
     """Column positions are cached from the initial read too. A column
     inserted mid-run shifts every write-back column one to the right, so every
     cell this run would write lands in the wrong column - not just the wrong
-    row."""
+    row.
+
+    That is equally true of every remaining chunk, so the run stops rather
+    than re-reading and re-reporting the whole Sheet on the way to the same
+    conclusion (20 reads and 10,000 stderr lines on a full run). Two rows and
+    CHUNK_SIZE 1: the sequence must stop at the first verify read.
+
+    The message must also say a COLUMN moved - "row N is no longer the row
+    this run planned for" is wrong in kind here and sends the operator to look
+    at the wrong thing."""
     from ia_bulk import cmd_upload
 
-    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
 
     def human_inserts_a_column(live_grid, read_count):
         if read_count == 2:
@@ -3751,16 +3772,105 @@ def test_cmd_upload_does_not_write_after_a_column_is_inserted_mid_run(
                 row.insert(1, "Photographer" if row is live_grid[0] else "unknown")
 
     recorder, client, registry_path, _ = setup_sheet_upload(
-        tmp_path, monkeypatch, grid, before_read=human_inserts_a_column
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        before_read=human_inserts_a_column,
+    )
+    monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert recorder.kinds == ["read", "read"]
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "the Sheet's columns moved" in captured.err
+    assert "no longer the row this run planned for" not in captured.err
+    # The filename is the only durable handle left: nothing was uploaded, so
+    # the identifier exists nowhere, and the row number is what went stale.
+    assert "File: 'photo1.jpg'" in captured.err
+    assert "2 rows not attempted" in captured.out
+    assert "log written to" in captured.out
+    assert exit_code == 1
+
+
+def test_cmd_upload_reports_a_sheets_read_failure_during_verify_instead_of_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """The same defect as the write-failure one, on the other half of the same
+    step: the guard added two Sheets READS per chunk - roughly 80 across a
+    full-collection run spanning hours - and one transient 503 among them must
+    not end a run that has already created thousands of permanent Internet
+    Archive items with a stack trace.
+
+    Read 3 is the pre-confirm verify, so both items are on Internet Archive by
+    the time it fails."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg"), raise_on_read=3
     )
 
     exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
     captured = capsys.readouterr()
 
+    assert exit_code == 1
+    # Reserve was written; the confirm batch never was.
+    assert recorder.writes == [
+        [("C2", "lcps-astoriaphotos-00001"), ("C3", "lcps-astoriaphotos-00002")]
+    ]
+    assert "the Sheet could not be re-read" in captured.err
+    assert "Sheets API returned 503" in captured.err
+    assert "2 file(s) uploaded successfully" in captured.out
+    assert "uploaded but NOT recorded in the Sheet" in captured.out
+    assert "stderr" in captured.out
+    assert "log written to" in captured.out
+
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    assert [entry["status"] for entry in entries] == [
+        "success",
+        "success",
+        "unconfirmed",
+        "unconfirmed",
+    ]
+
+
+def test_cmd_upload_reports_a_deleted_ia_column_instead_of_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """Renaming one of the four ia_ columns mid-run makes
+    locate_write_back_columns raise inside the guard. Nothing is written, so it
+    is fail-safe on data, but an unhandled MissingWriteBackColumns is still a
+    bare traceback - and README promises a mismatch is *reported*."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+
+    def human_renames_the_url_column(live_grid, read_count):
+        if read_count == 2:
+            live_grid[0][4] = "Notes"
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, before_read=human_renames_the_url_column
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
     assert recorder.writes == []
     assert recorder.uploads == []
-    assert "no longer the row this run planned for" in captured.err
-    assert exit_code == 1
+    assert "a column this run writes to is gone" in captured.err
+    assert "ia_url" in captured.err
+    assert "log written to" in captured.out
 
 
 def test_cmd_upload_reserves_and_confirms_once_per_chunk_not_once_per_run(

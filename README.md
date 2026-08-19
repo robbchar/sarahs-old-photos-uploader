@@ -162,9 +162,16 @@ mismatch — including a column inserted or removed — is reported and the writ
 is withheld, rather than landing on a different photograph. Nothing is lost:
 rerun once the Sheet has settled and every unrecorded row is picked up.
 
+If the Sheet becomes unreadable mid-run, or one of the four `ia_` columns is
+renamed or deleted, the run stops cleanly with the reason on stderr, still
+prints its summary and log path, and exits non-zero.
+
 That said, the check is a safety net, not a licence. It cannot distinguish two
-rows whose `file_template` columns are identical, so **avoid editing the Sheet
-while a run is in progress.**
+rows whose `file_template` columns are identical — if a shift moves one onto
+the other, the guard passes and the identifier and URL are written to the
+wrong row (the file itself still uploads correctly, and rows already marked
+uploaded cannot be touched). So: **avoid editing the Sheet while a run is in
+progress.**
 
 **A failing row is skipped, not fatal.** One unresolvable file in row 9,000
 does not block the other 9,999; the failures are listed with their errors, the
