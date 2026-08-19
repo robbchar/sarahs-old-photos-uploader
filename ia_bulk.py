@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, TypeVar
 
 import googleapiclient.discovery
 import internetarchive
@@ -33,9 +33,9 @@ from column_map import (
     resolve_file,
 )
 from ia_fields import suggest_standard_fields
-from identifiers import RowState, classify_row
+from identifiers import RowState, classify_row, next_identifiers
 from project_config import ProjectConfig, load_project_config
-from sheet_client import SheetClient
+from sheet_client import CellUpdate, SheetClient, column_letter
 
 IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
@@ -74,8 +74,29 @@ UNDATED_PLACEHOLDER = "[n.d.]"
 # the fix (edit the registry) instead of an opaque 404/permission error.
 PLACEHOLDER_SHEET_ID_PREFIX = "REPLACE_WITH"
 
+# The four columns this tool writes. All `ia_`-prefixed so they cannot collide
+# with a header a Sheet author already uses - the real LCPS Sheet's own
+# `Identifier` column holds the donor's archival reference, and an unprefixed
+# `identifier` column would have been overwritten by the first upload. See
+# docs/DECISIONS.md, "Tool-owned Sheet columns are all `ia_`-prefixed".
+IA_IDENTIFIER_COLUMN = "ia_identifier"
+IA_UPLOADED_COLUMN = "ia_uploaded"
+IA_URL_COLUMN = "ia_url"
+IA_IDENTIFIER_BIB_COLUMN = "ia_identifier_bib"
+WRITE_BACK_COLUMNS = (
+    IA_IDENTIFIER_COLUMN,
+    IA_UPLOADED_COLUMN,
+    IA_URL_COLUMN,
+    IA_IDENTIFIER_BIB_COLUMN,
+)
+ITEM_URL_PREFIX = "https://archive.org/details/"
 
-def chunk_rows(rows: list[dict], chunk_size: int = CHUNK_SIZE) -> "Iterator[list[dict]]":
+_ChunkItem = TypeVar("_ChunkItem")
+
+
+def chunk_rows(
+    rows: list[_ChunkItem], chunk_size: int = CHUNK_SIZE
+) -> "Iterator[list[_ChunkItem]]":
     for start in range(0, len(rows), chunk_size):
         yield rows[start : start + chunk_size]
 
@@ -297,6 +318,54 @@ def validate_rows(
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
     return results
+
+
+def validate_csv_rows(
+    rows: list[dict[str, str]],
+    files_dir: str | Path,
+    registry: dict,
+    skip_identifiers: frozenset[str] = frozenset(),
+) -> list[RowValidation]:
+    """The CSV path's answer, named. `identifier`, `file`, `mediatype` and
+    `title` are all required: a CSV is a small file somebody prepared by hand
+    for one batch, its identifiers are pre-assigned and permanent, and a blank
+    one is a defect rather than a starting state."""
+    return validate_rows(
+        rows,
+        files_dir,
+        registry,
+        skip_identifiers=skip_identifiers,
+        required_columns=REQUIRED_UPLOAD_COLUMNS,
+        check_file_exists=True,
+        identifier_column="identifier",
+    )
+
+
+def validate_sheet_rows(
+    rows: list[dict[str, str]],
+    files_dir: str | Path,
+    registry: dict,
+    skip_identifiers: frozenset[str] = frozenset(),
+) -> list[RowValidation]:
+    """The Sheet path's answer, named. It differs from the CSV path's in
+    exactly two ways, both of which used to travel as loose parameters at
+    every call site:
+
+    - the tool's minted identifier lives in `ia_identifier`, never
+      `identifier` (which on the real Sheet is the donor's own archival
+      reference and would fail the COLLECTIONKEY-PROJECTID-NUMBER regex on
+      every row);
+    - `ia_identifier` is not required, because blank is the normal starting
+      state of a new row - RowState.UNASSIGNED, not an error."""
+    return validate_rows(
+        rows,
+        files_dir,
+        registry,
+        skip_identifiers=skip_identifiers,
+        required_columns=SHEET_REQUIRED_COLUMNS,
+        check_file_exists=True,
+        identifier_column=IA_IDENTIFIER_COLUMN,
+    )
 
 
 _GRID_SHAPE_ROW_NUMBER_RE = re.compile(r"^row (\d+) ")
@@ -631,6 +700,88 @@ def build_sheet_client(config: ProjectConfig, live: bool) -> SheetClient:
     return SheetClient(service, config.sheet_id_for(live), config.sheet_tab)
 
 
+def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> dict[int, str]:
+    """Resolves each row's file against disk BEFORE validation runs, so a row
+    either carries a real, disk-verified 'file' value (and the resolved name,
+    which may differ from what the Sheet cell says - see resolve_file() - also
+    becomes 'ia_identifier_bib') or is recorded here with the resolver's own
+    message. Returns row_number -> message for the rows that failed.
+
+    Shared by `validate` and `upload` deliberately: the value `upload` records
+    in `ia_identifier_bib` has to be the same resolved name `validate` showed
+    the operator, and two copies of this loop would eventually disagree.
+
+    On failure the Sheet cell's raw, UNVERIFIED candidate must not survive as
+    row['file'] - left in place it would coincidentally resolve as a literal
+    path for the later disk check (or for an upload), silently masking the
+    fact that resolution never actually confirmed this file exists."""
+    listing_cache: dict[Path, list[str]] = {}
+    file_resolution_errors: dict[int, str] = {}
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2  # header is row 1
+        candidate = candidate_path(config.file_template, row)
+        try:
+            resolved = resolve_file(config.files_dir, candidate, listing_cache)
+        except FileResolutionError as exc:
+            file_resolution_errors[row_number] = str(exc)
+            row["file"] = ""
+            continue
+        row["file"] = resolved
+        row[IA_IDENTIFIER_BIB_COLUMN] = resolved
+
+    return file_resolution_errors
+
+
+def validate_sheet_grid(
+    rows: list[dict[str, str]],
+    registry: dict,
+    config: ProjectConfig,
+    structure_results: list[RowValidation],
+    file_resolution_errors: dict[int, str],
+) -> tuple[list[RowValidation], list[RowValidation]]:
+    """Returns (header_results, row_results). row_results holds exactly one
+    entry per row in `rows`, in the same order - which is what
+    format_lifecycle_summary requires and what lets a caller pair a row with
+    its verdict by index.
+
+    A structural problem with one specific data row (a long row) belongs IN
+    that row's own result, not in a second entry printed beside it. Filing it
+    separately made the row appear twice with opposite verdicts ("[FAIL] row
+    9" from check_grid_shape, "[PASS] row 9" from validate_rows), inflated
+    format_report's denominator past the number of data rows the Sheet
+    actually has, and - worst - left the row counted as "ready to upload" by
+    the lifecycle summary, which reads row_results alone. check_grid_shape and
+    validate_rows both number rows `offset + 2`, so row_number - 2 indexes
+    row_results exactly. Anything outside that range is header-level and keeps
+    its own row-1 entry (as does _GRID_SHAPE_ROW_NUMBER_RE's row-1 fallback) -
+    the bounds check is load-bearing, not defensive: a bare row_number - 2
+    would quietly fold row 1 into the LAST data row via negative indexing."""
+    row_results = validate_sheet_rows(rows, config.files_dir, registry)
+
+    for row_number, message in file_resolution_errors.items():
+        # The resolver's own message first: it names the folder and the name
+        # that was looked for, which is the actionable part. The generic
+        # "missing required column 'file'" that follows from required_columns
+        # (row['file'] was never set - see resolve_sheet_files) merely
+        # restates that the row has no file.
+        row_result = row_results[row_number - 2]
+        row_result.errors = [message] + row_result.errors
+
+    header_results: list[RowValidation] = []
+    for entry in structure_results:
+        index = entry.row_number - 2
+        if 0 <= index < len(row_results):
+            row_result = row_results[index]
+            # structural errors first: a long row's mis-attributed values are
+            # the likely cause of whatever content errors follow.
+            row_result.errors = entry.errors + row_result.errors
+        else:
+            header_results.append(entry)
+
+    return header_results, row_results
+
+
 def cmd_validate(args) -> int:
     # `is not None`, not truthiness: --csv "" must be an explicit (if
     # useless) request to read a CSV named "", and fail as such, rather than
@@ -728,73 +879,13 @@ def cmd_validate(args) -> int:
         )
         return 1
 
-    # Resolves each row's file against disk BEFORE validate_rows runs, so a
-    # row either carries a real, disk-verified 'file' value (and the
-    # resolved name, which may differ from what the Sheet cell says - see
-    # resolve_file() - also becomes 'ia_identifier_bib') or is recorded
-    # here with the resolver's own message, which is filed into that row's
-    # result below rather than left to the generic "missing required
-    # column 'file'" alone. See docs/DECISIONS.md, "A file is found by
-    # resolution, not by constructing a path".
-    listing_cache: dict[Path, list[str]] = {}
-    file_resolution_errors: dict[int, str] = {}
-    for offset, row in enumerate(rows):
-        row_number = offset + 2  # header is row 1
-        candidate = candidate_path(config.file_template, row)
-        try:
-            resolved = resolve_file(config.files_dir, candidate, listing_cache)
-        except FileResolutionError as exc:
-            file_resolution_errors[row_number] = str(exc)
-            # The Sheet cell's raw, UNVERIFIED candidate must not survive as
-            # row['file'] here - left in place, it would coincidentally
-            # resolve as a literal path for validate_rows' own disk check
-            # (or even for a future upload step), silently masking the fact
-            # that resolution never actually confirmed this file exists.
-            row["file"] = ""
-            continue
-        row["file"] = resolved
-        row["ia_identifier_bib"] = resolved
-
-    row_results = validate_rows(
-        rows,
-        config.files_dir,
-        registry,
-        required_columns=SHEET_REQUIRED_COLUMNS,
-        check_file_exists=True,
-        identifier_column="ia_identifier",
+    # See docs/DECISIONS.md, "A file is found by resolution, not by
+    # constructing a path". `upload` runs the identical two steps, so the
+    # value it records in ia_identifier_bib is the one shown here.
+    file_resolution_errors = resolve_sheet_files(rows, config)
+    header_results, row_results = validate_sheet_grid(
+        rows, registry, config, structure_results, file_resolution_errors
     )
-    for row_number, message in file_resolution_errors.items():
-        # The resolver's own message first: it names the folder and the
-        # name that was looked for, which is the actionable part. The
-        # generic "missing required column 'file'" that follows from
-        # required_columns (row['file'] was never set - see above) merely
-        # restates that the row has no file.
-        row_result = row_results[row_number - 2]
-        row_result.errors = [message] + row_result.errors
-
-    # A structural problem with one specific data row (a long row) belongs
-    # IN that row's own result, not in a second entry printed beside it.
-    # Filing it separately made the row appear twice with opposite verdicts
-    # ("[FAIL] row 9" from check_grid_shape, "[PASS] row 9" from
-    # validate_rows), inflated format_report's denominator past the number
-    # of data rows the Sheet actually has, and - worst - left the row
-    # counted as "ready to upload" by the lifecycle summary, which reads
-    # row_results alone. check_grid_shape and validate_rows both number
-    # rows `offset + 2`, so row_number - 2 indexes row_results exactly.
-    # Anything outside that range is header-level and keeps its own row-1
-    # entry (as does _GRID_SHAPE_ROW_NUMBER_RE's row-1 fallback) - the
-    # bounds check is load-bearing, not defensive: a bare row_number - 2
-    # would quietly fold row 1 into the LAST data row via negative indexing.
-    header_results: list[RowValidation] = []
-    for entry in structure_results:
-        index = entry.row_number - 2
-        if 0 <= index < len(row_results):
-            row_result = row_results[index]
-            # structural errors first: a long row's mis-attributed values
-            # are the likely cause of whatever content errors follow.
-            row_result.errors = entry.errors + row_result.errors
-        else:
-            header_results.append(entry)
 
     results = header_results + row_results
     print(format_report(results))
@@ -853,8 +944,402 @@ def run_rows(
     return counts
 
 
+class MissingWriteBackColumns(Exception):
+    """The Sheet has no column for something `upload` must record. Checked
+    once, before anything is uploaded, because a run that uploaded first and
+    then discovered it had nowhere to record the identifier would leave items
+    on Internet Archive the Sheet has no record of - the exact outcome the
+    reserve-first ordering exists to prevent."""
+
+
+@dataclass(frozen=True)
+class SheetColumns:
+    """Zero-based grid indexes of the four columns this tool writes."""
+
+    ia_identifier: int
+    ia_uploaded: int
+    ia_url: int
+    ia_identifier_bib: int
+
+    def cell(self, column_index: int, row_number: int) -> str:
+        return f"{column_letter(column_index)}{row_number}"
+
+
+def locate_write_back_columns(column_map: ColumnMap) -> SheetColumns:
+    """Every write-back column is required in ALL modes, including the default
+    read-only one. A rehearsal that succeeds against a Sheet the real run would
+    refuse is not a rehearsal, so the check does not vary with --live or
+    --write-identifier."""
+    indexes: dict[str, int] = {}
+    for index, header in enumerate(column_map.headers):
+        field_name = column_map.field_names[header]
+        if field_name in WRITE_BACK_COLUMNS and field_name not in indexes:
+            indexes[field_name] = index
+
+    missing = [name for name in WRITE_BACK_COLUMNS if name not in indexes]
+    if missing:
+        raise MissingWriteBackColumns(
+            f"the Sheet has no column(s) named {', '.join(missing)}. `upload` records what it "
+            f"did in {', '.join(WRITE_BACK_COLUMNS)}; add them as header cells (any position, "
+            "spelling exactly as shown) before uploading."
+        )
+
+    return SheetColumns(
+        ia_identifier=indexes[IA_IDENTIFIER_COLUMN],
+        ia_uploaded=indexes[IA_UPLOADED_COLUMN],
+        ia_url=indexes[IA_URL_COLUMN],
+        ia_identifier_bib=indexes[IA_IDENTIFIER_BIB_COLUMN],
+    )
+
+
+@dataclass(frozen=True)
+class UploadTarget:
+    """One row this run intends to upload.
+
+    `identifier` is always the real, permanent one; `uploaded_as` is what
+    actually goes over the wire, which is the same string only under --live.
+    Both are kept because they answer different questions - the Sheet records
+    the permanent identifier, while the URL has to point at the item that
+    really exists."""
+
+    row: dict[str, str]
+    row_number: int
+    identifier: str
+    uploaded_as: str
+    identifier_bib: str
+    newly_minted: bool
+
+
+def item_url(uploaded_as: str) -> str:
+    return f"{ITEM_URL_PREFIX}{uploaded_as}"
+
+
+def upload_timestamp() -> str:
+    """Its own function so a test can pin it and assert a confirm batch as an
+    exact ordered sequence rather than "a cell holding some string"."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def reserve_updates(targets: list[UploadTarget], columns: SheetColumns) -> list[CellUpdate]:
+    """Step 1 of the protocol: claim the minted numbers in the Sheet BEFORE
+    anything is uploaded. A crash after this point leaves an unused gap in the
+    sequence, which is harmless; a crash after uploading but before reserving
+    would leave an item on Internet Archive the Sheet has no record of, and the
+    next run's max+1 would mint that same number onto a different photograph -
+    permanently.
+
+    RESERVED rows are skipped: their identifier is already in the Sheet and
+    rewriting it would be a no-op at best."""
+    return [
+        CellUpdate(columns.cell(columns.ia_identifier, target.row_number), target.identifier)
+        for target in targets
+        if target.newly_minted
+    ]
+
+
+def confirm_updates(
+    targets: list[UploadTarget], columns: SheetColumns, uploaded_at: str
+) -> list[CellUpdate]:
+    """Step 3: record what actually happened. `ia_uploaded` is what turns a
+    row DONE for every later run, so it is written only for rows whose upload
+    genuinely succeeded.
+
+    ia_identifier_bib carries the RESOLVED path, which routinely differs from
+    the filename the Sheet holds (225 of 234 real rows carry no extension) -
+    it records what was uploaded, not what someone typed."""
+    updates: list[CellUpdate] = []
+    for target in targets:
+        updates.append(CellUpdate(columns.cell(columns.ia_uploaded, target.row_number), uploaded_at))
+        updates.append(
+            CellUpdate(columns.cell(columns.ia_url, target.row_number), item_url(target.uploaded_as))
+        )
+        updates.append(
+            CellUpdate(
+                columns.cell(columns.ia_identifier_bib, target.row_number), target.identifier_bib
+            )
+        )
+    return updates
+
+
+def cell_value(grid: list[list[str]], row_number: int, column_index: int) -> str:
+    """A missing row or a short row reads as "" rather than raising - the
+    Sheets API omits trailing empty cells, so a genuinely blank cell and a cell
+    past the end of a row are the same thing."""
+    index = row_number - 1
+    if index < 0 or index >= len(grid):
+        return ""
+    row = grid[index]
+    return (row[column_index] if column_index < len(row) else "").strip()
+
+
+def split_moved_targets(
+    targets: list[UploadTarget], columns: SheetColumns, grid: list[list[str]]
+) -> tuple[list[UploadTarget], list[UploadTarget]]:
+    """Returns (still_at_their_row, moved). Row numbers are positional, so a
+    human inserting or deleting a row mid-run shifts every row below it. Before
+    writing a URL the run re-reads the Sheet and checks the target row still
+    holds the identifier it reserved; a mismatch means the write would land on
+    a different photograph, so it is withheld and reported instead."""
+    still_there: list[UploadTarget] = []
+    moved: list[UploadTarget] = []
+    for target in targets:
+        if cell_value(grid, target.row_number, columns.ia_identifier) == target.identifier:
+            still_there.append(target)
+        else:
+            moved.append(target)
+    return still_there, moved
+
+
+def sheet_upload_metadata(
+    target: UploadTarget, column_map: ColumnMap, mediatype: str
+) -> dict[str, str]:
+    """The row dict handed to upload_row on the Sheet path.
+
+    upload_row turns every key it is given (bar `identifier` and `file`) into
+    an Internet Archive metadata field, and IA metadata is permanent - so the
+    tool's own bookkeeping columns and anything a Sheet author marked (LCPS
+    Internal) have to be filtered out HERE, before upload_row ever sees them.
+    ColumnMap.uploadable_fields() is the single definition of what may be
+    uploaded and already excludes both.
+
+    `identifier-bib` and `mediatype` are generated rather than read from a
+    column - see docs/DECISIONS.md, "`identifier-bib` and `mediatype` are
+    generated, not columns". The surviving test item
+    zztest-lcps-sarahsoldphotos-00005 carries a permanently misspelled
+    `indentifier-bib` because a header typo shipped once; a generated field
+    name cannot do that."""
+    uploadable = set(column_map.uploadable_fields())
+    metadata_row = {key: value for key, value in target.row.items() if key in uploadable}
+    metadata_row["mediatype"] = mediatype
+    metadata_row["identifier-bib"] = target.identifier_bib
+    metadata_row["file"] = target.row["file"]
+    metadata_row["identifier"] = target.identifier
+    return metadata_row
+
+
+def plan_upload_targets(
+    rows: list[dict[str, str]],
+    row_results: list[RowValidation],
+    config: ProjectConfig,
+    live: bool,
+) -> list[UploadTarget]:
+    """Decides what this run will upload and under which identifier.
+
+    Numbers are minted for the whole run up front, before any chunk is
+    reserved: minting is pure arithmetic with no side effect, and doing it once
+    means a later chunk cannot re-mint an earlier chunk's numbers by reading a
+    Sheet that has not been written yet.
+
+    `existing` deliberately spans EVERY row, including rows that failed
+    validation and rows already DONE - a number that appears anywhere in the
+    Sheet is spent, whatever the state of the row holding it."""
+    if len(rows) != len(row_results):
+        raise ValueError(
+            f"plan_upload_targets: got {len(rows)} row(s) but {len(row_results)} row_results - "
+            "they must be the same length, in the same order."
+        )
+
+    existing = [row.get(IA_IDENTIFIER_COLUMN) or "" for row in rows]
+
+    pending: list[tuple[int, dict[str, str], RowState]] = []
+    for offset, (row, result) in enumerate(zip(rows, row_results)):
+        if not result.is_valid:
+            continue
+        state = classify_row(row)
+        if state is RowState.DONE:
+            continue
+        pending.append((offset + 2, row, state))
+
+    unassigned_count = sum(1 for _, _, state in pending if state is RowState.UNASSIGNED)
+    minted = iter(
+        next_identifiers(existing, config.collection_key, config.project_id, unassigned_count)
+    )
+
+    targets: list[UploadTarget] = []
+    for row_number, row, state in pending:
+        newly_minted = state is RowState.UNASSIGNED
+        identifier = next(minted) if newly_minted else (row.get(IA_IDENTIFIER_COLUMN) or "").strip()
+        targets.append(
+            UploadTarget(
+                row=row,
+                row_number=row_number,
+                identifier=identifier,
+                uploaded_as=effective_identifier(identifier, live),
+                identifier_bib=(row.get(IA_IDENTIFIER_BIB_COLUMN) or "").strip(),
+                newly_minted=newly_minted,
+            )
+        )
+    return targets
+
+
+def write_cells_if_any(client: SheetClient, updates: list[CellUpdate]) -> None:
+    """An empty batch is not sent at all. SheetClient.write_cells already
+    returns early on an empty list, but the call still shows up in any record
+    of what this run did to the Sheet - and "this run issued exactly these
+    writes, in this order" is the property the protocol is asserted on."""
+    if updates:
+        client.write_cells(updates)
+
+
+@dataclass(frozen=True)
+class SheetUploadRun:
+    """Everything the reserve -> upload -> confirm loop needs that does not
+    change from row to row."""
+
+    client: SheetClient
+    columns: SheetColumns
+    column_map: ColumnMap
+    mediatype: str
+    files_dir: str
+    collection: str
+    live: bool
+    write_back: bool
+    log_path: Path
+
+    def execute(self, targets: list[UploadTarget]) -> dict[str, int]:
+        """One chunk at a time: reserve, upload, confirm, having logged each
+        row's outcome as it happened.
+
+        Chunking is what keeps this inside the Sheets API's 60 writes per
+        minute per user - a batch counts as one request, so ~10,000 rows cost
+        about 40 requests instead of 10,000."""
+        counts = {"success": 0, "failure": 0, "unconfirmed": 0}
+        uploaded_at = upload_timestamp()
+        total = len(targets)
+        position = 0
+
+        for chunk in chunk_rows(targets):
+            if self.write_back:
+                write_cells_if_any(self.client, reserve_updates(chunk, self.columns))
+
+            succeeded: list[UploadTarget] = []
+            for target in chunk:
+                position += 1
+                print(f"[{position}/{total}] uploading {target.uploaded_as} ({target.row['file']})")
+                try:
+                    upload_row(
+                        sheet_upload_metadata(target, self.column_map, self.mediatype),
+                        target.uploaded_as,
+                        self.collection,
+                        self.files_dir,
+                    )
+                except Exception as exc:
+                    counts["failure"] += 1
+                    self._log(target, "failure", error=str(exc))
+                    continue
+                counts["success"] += 1
+                self._log(target, "success")
+                succeeded.append(target)
+
+            if self.write_back and succeeded:
+                counts["unconfirmed"] += self._confirm(succeeded, uploaded_at)
+
+        return counts
+
+    def _confirm(self, succeeded: list[UploadTarget], uploaded_at: str) -> int:
+        current_grid = self.client.read_grid()
+        confirmable, moved = split_moved_targets(succeeded, self.columns, current_grid)
+
+        for target in moved:
+            message = (
+                f"row {target.row_number} no longer holds '{target.identifier}' in "
+                f"'{IA_IDENTIFIER_COLUMN}' - the Sheet changed while this run was uploading, so "
+                f"the result is NOT recorded there. The item is on Internet Archive as "
+                f"'{target.uploaded_as}'; rerun once the Sheet has settled and the row will be "
+                "picked up as reserved-but-unconfirmed."
+            )
+            print(message, file=sys.stderr)
+            self._log(target, "unconfirmed", error=message)
+
+        write_cells_if_any(self.client, confirm_updates(confirmable, self.columns, uploaded_at))
+        return len(moved)
+
+    def _log(self, target: UploadTarget, status: str, error: str | None = None) -> None:
+        log_result(
+            self.log_path,
+            target.identifier,
+            target.row["file"],
+            status,
+            self.live,
+            error=error,
+            uploaded_as=target.uploaded_as,
+        )
+
+
+def print_dry_run(
+    targets: list[UploadTarget], columns: SheetColumns, write_back: bool, uploaded_at: str
+) -> None:
+    if not targets:
+        print("nothing to upload")
+        return
+
+    print(f"would upload {_pluralize(len(targets), 'item')}:")
+    for target in targets:
+        if target.newly_minted:
+            print(
+                f"  row {target.row_number}: would mint '{target.identifier}' and upload it as "
+                f"'{target.uploaded_as}' ({target.row['file']})"
+            )
+        else:
+            print(
+                f"  row {target.row_number}: would upload under its existing identifier "
+                f"'{target.identifier}', as '{target.uploaded_as}' ({target.row['file']})"
+            )
+    print()
+
+    if not write_back:
+        print(
+            "would write nothing to the Sheet - neither --live nor --write-identifier was passed"
+        )
+        return
+
+    print("would write these cells:")
+    for update in reserve_updates(targets, columns) + confirm_updates(targets, columns, uploaded_at):
+        print(f"  {update.a1} = {update.value}")
+
+
 def cmd_upload(args) -> int:
-    data = read_csv(args.csv)
+    # `is not None`, not truthiness, and matching cmd_validate: --csv "" must
+    # be an explicit (if useless) request to read a CSV named "", and fail as
+    # such, rather than silently falling through to the Sheet path because an
+    # empty string is falsy.
+    csv_path = getattr(args, "csv", None)
+    if csv_path is not None:
+        return upload_from_csv(args, csv_path)
+    return upload_from_sheet(args)
+
+
+def upload_from_csv(args, csv_path: str) -> int:
+    """Unchanged in behavior: a CSV is small and hand-prepared, so any failing
+    row means the file is wrong and nothing is uploaded. See docs/DECISIONS.md,
+    "On the Sheet path, `upload` uploads the valid rows and reports the rest"
+    for why the Sheet path deliberately does the opposite."""
+    if getattr(args, "write_identifier", False) or getattr(args, "dry_run", False):
+        print(
+            "--write-identifier and --dry-run describe what happens to the project's Sheet, so "
+            "they apply to the Sheet path only. Drop --csv to run against the Sheet.",
+            file=sys.stderr,
+        )
+        return 1
+
+    files_dir = getattr(args, "files_dir", None) or "."
+    collection = TEST_COLLECTION
+    if args.live:
+        collection = getattr(args, "collection", None)
+        if not collection:
+            # The old "lcps" default was not a real Internet Archive
+            # collection: a --live run pushed real files at a collection that
+            # does not exist and reported success. Guessing is worse than
+            # refusing.
+            print(
+                "--live needs an explicit --collection on the --csv path; there is no default "
+                "any more. Drop --csv to take the collection from the project's registry entry "
+                "instead.",
+                file=sys.stderr,
+            )
+            return 1
+
+    data = read_csv(csv_path)
     rows = data.rows
     registry = load_registry(args.registry)
 
@@ -864,8 +1349,8 @@ def cmd_upload(args) -> int:
 
     to_upload = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
-    validation_results = header_validation(data.fieldnames) + validate_rows(
-        rows, args.files_dir, registry, frozenset(skip_identifiers)
+    validation_results = header_validation(data.fieldnames) + validate_csv_rows(
+        rows, files_dir, registry, frozenset(skip_identifiers)
     )
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
@@ -874,8 +1359,6 @@ def cmd_upload(args) -> int:
             file=sys.stderr,
         )
         return 1
-
-    collection = args.collection if args.live else TEST_COLLECTION
 
     log_path = open_log(args.log_dir, "upload")
     for identifier in skip_identifiers:
@@ -886,7 +1369,7 @@ def cmd_upload(args) -> int:
         log_path,
         args.live,
         action="uploading",
-        process_row=lambda row, target: upload_row(row, target, collection, args.files_dir),
+        process_row=lambda row, target: upload_row(row, target, collection, files_dir),
         describe=lambda row, target: f"{target} ({row['file'].strip()})",
         file_value_for=lambda row: row["file"].strip(),
     )
@@ -894,6 +1377,178 @@ def cmd_upload(args) -> int:
     print(f"{counts['success']} file(s) uploaded successfully, {counts['failure']} error(s)")
     print(f"log written to {log_path}")
     return 1 if counts["failure"] else 0
+
+
+def upload_from_sheet(args) -> int:
+    registry = load_registry(args.registry)
+    config = load_project_config(registry, args.project)
+
+    live = bool(args.live)
+    dry_run = bool(getattr(args, "dry_run", False))
+    # --live always records. An item that exists on Internet Archive under a
+    # permanent identifier the Sheet does not know about is precisely what the
+    # reserve-first ordering exists to prevent, so there is no live-without-
+    # write-back mode to opt into.
+    write_back = live or bool(getattr(args, "write_identifier", False))
+    sheet_id = config.sheet_id_for(live)
+    mode = "live" if live else "test"
+
+    print(
+        f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', "
+        f"tab '{config.sheet_tab}'"
+    )
+    if dry_run:
+        print("--dry-run: nothing is uploaded, and nothing is written to the Sheet")
+    elif write_back:
+        print(f"results WILL be written back to spreadsheet '{sheet_id}'")
+    else:
+        print(
+            "nothing will be written back to the Sheet - pass --write-identifier to record "
+            "identifiers there"
+        )
+    print()
+
+    for flag, value in (
+        ("--collection", getattr(args, "collection", None)),
+        ("--files-dir", getattr(args, "files_dir", None)),
+    ):
+        # Silently ignoring an explicit flag is its own trap, and this one used
+        # to be the dangerous kind: --collection defaulting to "lcps" would
+        # have sent real photographs to a collection that does not exist.
+        if value:
+            print(
+                f"{flag} is a --csv-path override; on the Sheet path this comes from project "
+                f"'{config.project_id}' in {args.registry}. Remove {flag}, or change the "
+                "registry.",
+                file=sys.stderr,
+            )
+            return 1
+
+    if getattr(args, "resume_from", None):
+        print(
+            "--resume-from is a --csv-path flag. On the Sheet path the 'ia_uploaded' column is "
+            "the record of what is already done, so a rerun picks up where the last one stopped "
+            "by itself.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
+        print(
+            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
+            f"placeholder '{sheet_id}' - edit it in {args.registry} to the real Google Sheet ID "
+            "before running upload.",
+            file=sys.stderr,
+        )
+        return 1
+
+    client = build_sheet_client(config, live)
+    try:
+        grid = client.read_grid()
+    except HttpError as exc:
+        print(
+            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
+            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
+            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
+            "been shared with the service account.",
+            file=sys.stderr,
+        )
+        return 1
+
+    column_map, rows = grid_to_rows(grid)
+    for row in rows:
+        row["mediatype"] = config.mediatype
+
+    structure_results = sheet_structure_validation(column_map, grid)
+
+    if not rows:
+        if structure_results:
+            print("\n".join(_format_result_lines(structure_results)))
+            print()
+        print(
+            "the Sheet has no data rows (only a header, or nothing at all) - check that "
+            "'sheet_tab' in the project's registry entry names the right tab, and that "
+            "the Sheet has actually been populated and shared"
+        )
+        return 1
+
+    try:
+        check_file_template(config.file_template, column_map)
+    except TemplateError as exc:
+        print(
+            f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        columns = locate_write_back_columns(column_map)
+    except MissingWriteBackColumns as exc:
+        print(f"project '{config.project_id}': {exc}", file=sys.stderr)
+        return 1
+
+    file_resolution_errors = resolve_sheet_files(rows, config)
+    header_results, row_results = validate_sheet_grid(
+        rows, registry, config, structure_results, file_resolution_errors
+    )
+
+    if header_results:
+        # A header defect (two columns normalizing to the same IA field name,
+        # a column normalizing to nothing) silently corrupts EVERY row, so
+        # unlike a bad row it cannot be routed around by skipping it.
+        print("\n".join(_format_result_lines(header_results)))
+        print()
+        print(
+            "the Sheet's header row has problems that affect every row - refusing to upload "
+            "anything until they are fixed",
+            file=sys.stderr,
+        )
+        return 1
+
+    skipped = [result for result in row_results if not result.is_valid]
+    if skipped:
+        print("\n".join(_format_result_lines(skipped)))
+        print(
+            f"{_pluralize(len(skipped), 'row')} failed validation and will be skipped; the rest "
+            "are uploaded, and this command still exits non-zero so a partial run is never "
+            "mistaken for a clean one"
+        )
+        print()
+
+    targets = plan_upload_targets(rows, row_results, config, live)
+    collection = config.ia_collection if live else TEST_COLLECTION
+
+    if dry_run:
+        print_dry_run(targets, columns, write_back, upload_timestamp())
+        return 1 if skipped else 0
+
+    if not targets:
+        print("nothing to upload - every valid row is already marked uploaded")
+        return 1 if skipped else 0
+
+    log_path = open_log(args.log_dir, "upload")
+    counts = SheetUploadRun(
+        client=client,
+        columns=columns,
+        column_map=column_map,
+        mediatype=config.mediatype,
+        files_dir=config.files_dir,
+        collection=collection,
+        live=live,
+        write_back=write_back,
+        log_path=log_path,
+    ).execute(targets)
+
+    print(f"{counts['success']} file(s) uploaded successfully, {counts['failure']} error(s)")
+    if counts["unconfirmed"]:
+        print(
+            f"{_pluralize(counts['unconfirmed'], 'item')} uploaded but NOT recorded in the Sheet "
+            "- see the messages above"
+        )
+    if skipped:
+        print(f"{_pluralize(len(skipped), 'row')} skipped (failed validation)")
+    print(f"log written to {log_path}")
+    return 1 if (counts["failure"] or counts["unconfirmed"] or skipped) else 0
 
 
 def cmd_sync_metadata(args) -> int:
@@ -961,15 +1616,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read the project's real Sheet instead of its test Sheet (ignored with --csv)",
     )
 
-    upload_parser = subparsers.add_parser("upload", help="Upload items from a validated CSV")
-    upload_parser.add_argument("csv", help="Path to the validated CSV")
+    upload_parser = subparsers.add_parser(
+        "upload", help="Upload items from a project's Sheet, or from an offline CSV"
+    )
     upload_parser.add_argument("--project", required=True, help="Project ID from the registry")
-    upload_parser.add_argument("--files-dir", default=".", help="Base directory the 'file' column is resolved against")
+    upload_parser.add_argument(
+        "--csv", default=None, help="Upload from this CSV instead of the project's Sheet"
+    )
+    # No defaults on --files-dir/--collection. Both are technical
+    # configuration that belongs in the registry, confirmed once in version
+    # control per project, rather than retyped correctly on every run forever;
+    # --collection's old "lcps" default was not even a real Internet Archive
+    # collection. See docs/DECISIONS.md, "Technical configuration lives in the
+    # registry, not the command line".
+    upload_parser.add_argument(
+        "--files-dir",
+        default=None,
+        help="Base directory the 'file' column is resolved against (--csv only; the Sheet path takes it from the registry)",
+    )
     upload_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
-    upload_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
-    upload_parser.add_argument("--collection", default="lcps", help="Collection to upload to when --live is passed")
+    upload_parser.add_argument("--live", action="store_true", help="Target the real Sheet and the registry's real collection instead of the test Sheet and test_collection")
+    upload_parser.add_argument(
+        "--collection",
+        default=None,
+        help="Collection to upload to when --live is passed (--csv only; the Sheet path takes it from the registry's ia_collection)",
+    )
+    upload_parser.add_argument(
+        "--write-identifier",
+        action="store_true",
+        help="Write minted identifiers and results back to the TEST Sheet (--live always writes back)",
+    )
+    upload_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Upload nothing and write nothing; print the identifiers that would be minted and the cells that would be written",
+    )
     upload_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
-    upload_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped")
+    upload_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped (--csv only)")
 
     sync_parser = subparsers.add_parser("sync-metadata", help="Update metadata on already-uploaded items")
     sync_parser.add_argument("csv", help="Path to the CSV of identifier + changed metadata columns")

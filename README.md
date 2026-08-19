@@ -96,24 +96,83 @@ Then, per row:
 Prints a pass/fail report per row (header problems are reported as row 1) and
 exits non-zero if anything fails. Always run this before `upload`.
 
-### `upload` — upload a validated CSV
+### `upload` — mint identifiers, upload, record the result
 
-`--project` is required here too (registry lookup), but this command still
-only reads from a CSV — it does not yet read or write the Sheet.
+Reads the project's Sheet by default; `--csv` switches to the offline path.
 
 ```bash
-python ia_bulk.py upload items.csv --project sarahsoldphotos --files-dir ./photos
+# rehearse against the test Sheet: uploads as zztest-…, writes nothing back
+python ia_bulk.py upload --project sarahsoldphotos
+
+# same, but record the minted identifiers in the TEST Sheet
+python ia_bulk.py upload --project sarahsoldphotos --write-identifier
+
+# see what it would do without doing any of it
+python ia_bulk.py upload --project sarahsoldphotos --dry-run
+
+# upload from an offline CSV instead
+python ia_bulk.py upload --csv items.csv --project sarahsoldphotos --files-dir ./photos
 ```
 
-- Re-validates the CSV before any network call
+| Mode | Reads | Uploads as | Writes back |
+|---|---|---|---|
+| default | test Sheet | `zztest-…` → `test_collection` | nothing |
+| `--write-identifier` | test Sheet | `zztest-…` → `test_collection` | test Sheet |
+| `--live` | real Sheet | real identifier → registry's `ia_collection` | real Sheet, always |
+| `--dry-run` | either | nothing | nothing — prints the intended writes |
+
+Per chunk of 500 rows the Sheet path does four things **in this order**:
+
+1. **reserve** — one batch write putting the minted `ia_identifier` in the Sheet
+2. **upload** — row by row, to Internet Archive, under that identifier
+3. **confirm** — one batch write of `ia_uploaded`, `ia_url` and
+   `ia_identifier_bib`, but only for rows whose upload succeeded
+4. **log** — per-row outcomes appended to the JSONL log
+
+Reserving first is deliberate. Uploading first would let a crash strand an
+item on Internet Archive that the Sheet has no record of, and the next run's
+`max+1` would then mint that same number onto a different photograph —
+permanently. Reserving first degrades the same crash into an unused gap in the
+sequence, which is harmless. Batching matters too: the Sheets API allows 60
+writes per minute per user and counts a batch as one request, so ~10,000 rows
+cost about 40 requests rather than 10,000.
+
+A row is chosen by what its two tool-owned columns already hold:
+
+| `ia_identifier` | `ia_uploaded` | Action |
+|---|---|---|
+| blank | blank | mint, reserve, upload |
+| set | blank | upload under the **existing** identifier, never re-mint |
+| set | set | skip entirely |
+
+The Sheet must already have all four `ia_` columns as headers
+(`ia_identifier`, `ia_uploaded`, `ia_url`, `ia_identifier_bib`); `upload`
+refuses in every mode until they exist, so a rehearsal never succeeds where
+the real run would fail. Before writing a row's URL, the run re-reads the
+Sheet and checks that row still holds the identifier it reserved — if someone
+inserted or deleted rows mid-run the indices have shifted, and the result is
+reported rather than written onto the wrong photograph.
+
+**A failing row is skipped, not fatal.** One unresolvable file in row 9,000
+does not block the other 9,999; the failures are listed with their errors, the
+valid rows upload, and the command exits non-zero so a partial run is never
+mistaken for a clean one. The `--csv` path keeps the opposite behavior — it
+refuses to upload anything if any row fails.
+
+Other behavior, both paths:
+
 - Processes rows in chunks of 500 (Internet Archive's per-run batch limit)
 - Uploads each row via the `internetarchive` Python library (not the `ia`
   CLI), so per-row success/failure is captured directly
 - Writes a timestamped JSONL log to `logs/upload-<timestamp>.jsonl`, one
   line per row: `{identifier, file, status, error, uploaded_as, live, timestamp}`
-- `--resume-from <log>` skips identifiers already marked `"success"` or
-  `"unchanged"` **in the same mode** (test vs. `--live`) as this run, and
-  still writes a complete log of its own
+- `--collection` and `--files-dir` are `--csv`-path overrides only; on the
+  Sheet path they come from the project's registry entry, and passing them
+  is an error rather than a silently ignored flag
+- `--resume-from <log>` (`--csv` only) skips identifiers already marked
+  `"success"` or `"unchanged"` **in the same mode** (test vs. `--live`) as
+  this run, and still writes a complete log of its own. The Sheet path needs
+  no such flag: `ia_uploaded` is already the record of what is done
 
 ### `sync-metadata` — update metadata on already-uploaded items
 
@@ -132,24 +191,27 @@ literal value `REMOVE_TAG` in that cell (the same sentinel the official
 
 ## Safety rail
 
-By default every command targets IA's `test_collection` sandbox. The CSV's
-`identifier` column always holds the real, permanent identifier — never
-author a `zztest-` identifier by hand in the CSV. Instead, `upload` and
-`sync-metadata` automatically prepend `zztest-` to the real identifier for
-every network call (e.g. `lcps-astoriaphotos-00001` becomes
-`zztest-lcps-astoriaphotos-00001`) unless `--live` is passed. Pass `--live`
-to target the real collection with the real identifier as-is — do this
-deliberately, never as a default.
+By default every command targets IA's `test_collection` sandbox. The Sheet's
+`ia_identifier` column (and the CSV's `identifier` column) always holds the
+real, permanent identifier — never author a `zztest-` identifier by hand.
+Instead, `upload` and `sync-metadata` automatically prepend `zztest-` to the
+real identifier for every network call (e.g. `lcps-astoriaphotos-00001`
+becomes `zztest-lcps-astoriaphotos-00001`) unless `--live` is passed. Pass
+`--live` to target the real collection with the real identifier as-is — do
+this deliberately, never as a default.
 
 ```bash
-python ia_bulk.py upload items.csv --project sarahsoldphotos --live --collection lcps
+python ia_bulk.py upload --project sarahsoldphotos --live
 ```
 
-**Before any `--live` run**, double-check both of these by hand — neither
-is validated automatically, and both default to placeholder values (see
+**Before any `--live` run**, confirm both of these by hand — neither is
+validated automatically, and both ship as placeholders (see
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#known-gaps)):
 - `projects_registry.json`'s `collection_key`
-- `upload`'s `--collection` flag
+- the project's `ia_collection` in `projects_registry.json`
+
+`--dry-run` is the cheapest way to check the second one: it prints every
+identifier it would mint and every cell it would write, and touches nothing.
 
 ## Known limitation: raw Sheet export needs preparation
 

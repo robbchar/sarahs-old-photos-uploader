@@ -48,8 +48,20 @@ wrong field still passes. See [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1).
 ## 3. Test run
 
 ```bash
-python ia_bulk.py upload data/upload.csv --files-dir data
+# against the project's test Sheet (the normal path)
+python ia_bulk.py upload --project sarahsoldphotos
+
+# ...and again, recording the minted identifiers in the test Sheet
+python ia_bulk.py upload --project sarahsoldphotos --write-identifier
+
+# against an offline CSV
+python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data
 ```
+
+On the Sheet path, run it once without `--write-identifier` first: that mode
+issues zero writes to the Sheet, so it is a rehearsal you can repeat freely.
+`--dry-run` goes further and uploads nothing at all, printing the identifiers
+it would mint and the cells it would write.
 
 With no `--live`, the tool targets IA's `test_collection` sandbox and prepends
 `zztest-` to each identifier before every network call. The CSV keeps its
@@ -62,7 +74,10 @@ the metadata fields are the ones you meant, with the values you meant.
 ## 4. Live run
 
 ```bash
-python ia_bulk.py upload data/upload.csv --files-dir data --live --collection lcps
+python ia_bulk.py upload --project sarahsoldphotos --live
+
+# ...or from an offline CSV, where --live must name the collection itself
+python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data --live --collection lcpsdigitalcollection
 ```
 
 ### Pre-live checklist
@@ -109,15 +124,23 @@ day-sized files yourself, or run it in sittings and rely on `--resume-from`.
 Every run writes `logs/<command>-<timestamp>.jsonl`, one line per row:
 
 ```json
-{"identifier": "...", "file": "...", "status": "success|unchanged|failure",
+{"identifier": "...", "file": "...", "status": "success|unchanged|failure|unconfirmed",
  "error": null, "uploaded_as": "...", "live": false, "timestamp": "..."}
 ```
 
-`identifier` is the real CSV identifier; `uploaded_as` is what was actually
-sent to IA. To pick up after failures:
+`identifier` is the real, permanent identifier; `uploaded_as` is what was
+actually sent to IA. `unconfirmed` is Sheet-path-only and means the item
+reached Internet Archive but the Sheet could not be updated, because the row
+no longer held the identifier the run reserved — someone edited the Sheet
+mid-run. Rerun once it has settled; the row is picked up as reserved-but-
+unconfirmed and retried under the same identifier.
+
+On the Sheet path, `ia_uploaded` is the record of what is done, so a rerun
+resumes by itself and `--resume-from` is refused there. On the `--csv` path,
+to pick up after failures:
 
 ```bash
-python ia_bulk.py upload data/upload.csv --files-dir data --resume-from logs/upload-20260712T125326.jsonl
+python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data --resume-from logs/upload-20260712T125326.jsonl
 ```
 
 Rows marked `success` or `unchanged` **in the same mode** are skipped. Test-mode

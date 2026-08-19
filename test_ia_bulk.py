@@ -2813,7 +2813,7 @@ def test_build_parser_validate_subcommand_omits_csv_to_select_the_sheet_path():
     "subcommand,extra_args",
     [
         ("validate", []),
-        ("upload", ["items.csv"]),
+        ("upload", ["--csv", "items.csv"]),
         ("sync-metadata", ["updates.csv"]),
     ],
 )
@@ -2823,13 +2823,22 @@ def test_build_parser_requires_project_on_every_subcommand(subcommand, extra_arg
         parser.parse_args([subcommand, *extra_args])
 
 
-def test_build_parser_upload_subcommand_defaults_to_not_live():
+def test_build_parser_upload_subcommand_defaults_to_the_sheet_and_no_collection():
+    """`--collection` no longer defaults to "lcps" (not a real Internet
+    Archive collection) and `--files-dir` no longer defaults to "." - both are
+    --csv-path overrides now, and on the Sheet path they come from the
+    registry. `csv` is likewise no longer a required positional, so
+    `upload --project X` selects the Sheet rather than failing."""
     parser = build_parser()
-    args = parser.parse_args(["upload", "items.csv", "--project", "astoriaphotos"])
+    args = parser.parse_args(["upload", "--project", "astoriaphotos"])
     assert args.command == "upload"
     assert args.project == "astoriaphotos"
+    assert args.csv is None
     assert args.live is False
-    assert args.collection == "lcps"
+    assert args.collection is None
+    assert args.files_dir is None
+    assert args.write_identifier is False
+    assert args.dry_run is False
     assert args.resume_from is None
 
 
@@ -2838,6 +2847,7 @@ def test_build_parser_upload_subcommand_accepts_live_and_resume_from():
     args = parser.parse_args(
         [
             "upload",
+            "--csv",
             "items.csv",
             "--project",
             "astoriaphotos",
@@ -2846,8 +2856,18 @@ def test_build_parser_upload_subcommand_accepts_live_and_resume_from():
             "logs/upload-x.jsonl",
         ]
     )
+    assert args.csv == "items.csv"
     assert args.live is True
     assert args.resume_from == "logs/upload-x.jsonl"
+
+
+def test_build_parser_upload_subcommand_accepts_write_identifier_and_dry_run():
+    parser = build_parser()
+    args = parser.parse_args(
+        ["upload", "--project", "astoriaphotos", "--write-identifier", "--dry-run"]
+    )
+    assert args.write_identifier is True
+    assert args.dry_run is True
 
 
 def test_build_parser_sync_metadata_subcommand_defaults():
@@ -2870,3 +2890,734 @@ def test_main_dispatches_to_cmd_validate(monkeypatch, tmp_path):
 
     assert exit_code == 0
     assert calls == [str(csv_path)]
+
+
+# ---------------------------------------------------------------------------
+# Task 10: the Sheet path's reserve -> upload -> confirm protocol.
+#
+# Every assertion below that matters is an ORDERED SEQUENCE, not a membership
+# or substring check. The safety argument for this whole command is that the
+# reserve write lands BEFORE the upload, and `"write" in kinds` cannot tell
+# [read, write, upload] from [read, upload, write].
+# ---------------------------------------------------------------------------
+
+_A1_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+
+def _a1_to_indexes(a1):
+    match = _A1_RE.match(a1)
+    assert match, f"not an A1 reference: {a1!r}"
+    column = 0
+    for character in match.group(1):
+        column = column * 26 + (ord(character) - ord("A") + 1)
+    return column - 1, int(match.group(2)) - 1
+
+
+class SheetUploadRecorder:
+    """One ordered event log spanning BOTH the Sheet client and upload_row.
+
+    Keeping reads, writes and uploads in a single list is the point: the
+    reserve/confirm protocol is a claim about ORDER across two different
+    collaborators, and two separate per-collaborator lists cannot express it."""
+
+    def __init__(self):
+        self.events = []
+
+    @property
+    def kinds(self):
+        return [event[0] for event in self.events]
+
+    @property
+    def writes(self):
+        return [event[1] for event in self.events if event[0] == "write"]
+
+    @property
+    def uploads(self):
+        return [event[1] for event in self.events if event[0] == "upload"]
+
+
+class RecordingSheetClient:
+    """Stands in for SheetClient on the upload path. Unlike FakeSheetClient it
+    also accepts writes, and APPLIES them to its own grid - so the confirm
+    step's re-read sees what the reserve step wrote, exactly as a real Sheet
+    would. `before_read` is the hook a mid-run-edit test uses to change the
+    grid out from under the run between two reads."""
+
+    def __init__(self, grid, recorder, before_read=None):
+        self.grid = [list(row) for row in grid]
+        self._recorder = recorder
+        self._before_read = before_read
+        self.read_count = 0
+
+    def read_grid(self):
+        self.read_count += 1
+        if self._before_read is not None:
+            self._before_read(self.grid, self.read_count)
+        self._recorder.events.append(("read", None))
+        return [list(row) for row in self.grid]
+
+    def write_cells(self, updates):
+        pairs = [(update.a1, update.value) for update in updates]
+        assert pairs, "write_cells must never be called with an empty batch"
+        self._recorder.events.append(("write", pairs))
+        for a1, value in pairs:
+            column, row_index = _a1_to_indexes(a1)
+            while len(self.grid) <= row_index:
+                self.grid.append([])
+            row = self.grid[row_index]
+            while len(row) <= column:
+                row.append("")
+            row[column] = value
+
+
+def make_upload_stub(recorder, fail_for=(), captured=None):
+    def fake_upload_row(row, target_identifier, collection, files_dir):
+        recorder.events.append(("upload", target_identifier))
+        if captured is not None:
+            captured.append(
+                {"row": dict(row), "collection": collection, "files_dir": str(files_dir)}
+            )
+        if target_identifier in fail_for:
+            raise RuntimeError("boom")
+
+    return fake_upload_row
+
+
+# A=Title, B=file, C=ia_identifier, D=ia_uploaded, E=ia_url, F=ia_identifier_bib
+SHEET_HEADER = ["Title", "file", "ia_identifier", "ia_uploaded", "ia_url", "ia_identifier_bib"]
+FIXED_TIMESTAMP = "2026-08-19T09:00:00"
+
+
+def make_upload_args(tmp_path, registry_path, **overrides):
+    args = Namespace(
+        csv=None,
+        project="astoriaphotos",
+        registry=str(registry_path),
+        files_dir=None,
+        collection=None,
+        live=False,
+        write_identifier=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def setup_sheet_upload(
+    tmp_path,
+    monkeypatch,
+    grid,
+    files=("photo1.jpg",),
+    fail_for=(),
+    captured=None,
+    before_read=None,
+    registry=None,
+):
+    """Builds the whole Sheet-upload world: files on disk, a registry, a
+    recording client monkeypatched over build_sheet_client (the single seam),
+    and upload_row stubbed so nothing touches the network. Also pins the
+    confirm timestamp so a confirm batch can be asserted as an exact ordered
+    sequence rather than 'a cell whose value is some string'."""
+    for name in files:
+        (tmp_path / name).write_bytes(b"x")
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(registry or make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+
+    recorder = SheetUploadRecorder()
+    client = RecordingSheetClient(grid, recorder, before_read=before_read)
+    build_calls = []
+
+    def fake_build_sheet_client(config, live):
+        build_calls.append((config, live))
+        return client
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", fake_build_sheet_client)
+    monkeypatch.setattr("ia_bulk.upload_row", make_upload_stub(recorder, fail_for, captured))
+    monkeypatch.setattr("ia_bulk.upload_timestamp", lambda: FIXED_TIMESTAMP)
+
+    return recorder, client, registry_path, build_calls
+
+
+def test_cmd_upload_default_mode_writes_nothing_to_the_sheet_and_only_uploads_prefixed_identifiers(
+    tmp_path, monkeypatch, capsys
+):
+    """The single most important property of this command: with neither
+    --live nor --write-identifier, the operator's Sheet is untouched and
+    nothing reaches Internet Archive under a real, permanent identifier.
+    Asserted as 'the recorded call list holds exactly one read and no writes
+    at all', not as 'no write of the wrong thing' - the latter still passes if
+    a write happens with contents the test did not think to check."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.kinds == ["read", "upload", "upload"]
+    assert recorder.writes == []
+    assert recorder.uploads == [
+        "zztest-lcps-astoriaphotos-00001",
+        "zztest-lcps-astoriaphotos-00002",
+    ]
+    assert client.grid == [list(row) for row in grid]
+
+
+def test_cmd_upload_with_write_identifier_reserves_then_uploads_then_confirms(
+    tmp_path, monkeypatch, capsys
+):
+    """Reserve BEFORE upload is the entire ordering argument: uploading first
+    would let a crash strand an item on IA the Sheet has no record of, and the
+    next run's max+1 would mint that same number onto a different photograph.
+    The exact event sequence is asserted, so a reordering fails here even
+    though every individual call would still be 'present'."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.kinds == ["read", "write", "upload", "read", "write"]
+    assert recorder.writes == [
+        [("C2", "lcps-astoriaphotos-00001")],
+        [
+            ("D2", FIXED_TIMESTAMP),
+            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("F2", "photo1.jpg"),
+        ],
+    ]
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+
+
+def test_cmd_upload_reserved_row_uploads_under_its_existing_identifier_and_mints_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """RESERVED is the crash-recovery state: a number reached the Sheet but
+    the upload never confirmed. Re-minting would burn a second permanent
+    number on the same photograph, so the run must reuse the existing one and
+    issue NO reserve write at all - which is why the event sequence has no
+    write before the upload."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "lcps-astoriaphotos-00042", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00042"]
+    assert recorder.kinds == ["read", "upload", "read", "write"]
+    assert recorder.writes == [
+        [
+            ("D2", FIXED_TIMESTAMP),
+            ("E2", "https://archive.org/details/zztest-lcps-astoriaphotos-00042"),
+            ("F2", "photo1.jpg"),
+        ]
+    ]
+    assert client.grid[1][2] == "lcps-astoriaphotos-00042"
+
+
+def test_cmd_upload_skips_a_done_row_entirely_and_mints_above_its_number(
+    tmp_path, monkeypatch, capsys
+):
+    """A DONE row is not re-uploaded, and its number still counts when the
+    next one is minted - otherwise the run would hand an already-used
+    permanent identifier to a different photograph."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["Done photo", "photo1.jpg", "lcps-astoriaphotos-00007", "2026-01-01", "u", "photo1.jpg"],
+        ["New photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00008"]
+    assert recorder.writes == [
+        [("C3", "lcps-astoriaphotos-00008")],
+        [
+            ("D3", FIXED_TIMESTAMP),
+            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00008"),
+            ("F3", "photo2.jpg"),
+        ],
+    ]
+
+
+def test_cmd_upload_skips_an_invalid_row_uploads_the_valid_ones_and_exits_non_zero(
+    tmp_path, monkeypatch, capsys
+):
+    """The Sheet path's deliberate opposite of the CSV path: one typo in row
+    9,000 must not block the other 9,999, but a partial run must never be
+    mistaken for a clean one. See docs/DECISIONS.md, "On the Sheet path,
+    `upload` uploads the valid rows and reports the rest"."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+    assert recorder.writes == [
+        [("C3", "lcps-astoriaphotos-00001")],
+        [
+            ("D3", FIXED_TIMESTAMP),
+            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00001"),
+            ("F3", "photo2.jpg"),
+        ],
+    ]
+    assert "[FAIL] row 2" in out
+    assert "missing required column 'title'" in out
+
+
+def test_cmd_upload_dry_run_writes_nothing_uploads_nothing_and_prints_what_it_would_mint(
+    tmp_path, monkeypatch, capsys
+):
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, dry_run=True)
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert recorder.kinds == ["read"]
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "lcps-astoriaphotos-00001" in out
+    assert "C2 = lcps-astoriaphotos-00001" in out
+    assert not (tmp_path / "logs").exists()
+
+
+def test_cmd_upload_dry_run_without_write_identifier_says_it_would_write_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """Pins the false branch of --write-identifier under --dry-run too: a
+    rehearsal that describes writes it would never actually make is worse
+    than no rehearsal."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert recorder.writes == []
+    assert "would write nothing to the Sheet" in out
+    assert "C2 = " not in out
+
+
+@pytest.mark.parametrize(
+    "live,expected_sheet_id,expected_collection,expected_target",
+    [
+        (True, "REAL_SHEET_ID", "lcpsociety", "lcps-astoriaphotos-00001"),
+        (False, "TEST_SHEET_ID", "test_collection", "zztest-lcps-astoriaphotos-00001"),
+    ],
+)
+def test_cmd_upload_passes_the_live_flag_through_and_picks_the_matching_sheet_and_collection(
+    tmp_path, monkeypatch, capsys, live, expected_sheet_id, expected_collection, expected_target
+):
+    """Both directions, deliberately: Task 8 shipped a version that hardcoded
+    build_sheet_client(config, True) - always the production Sheet - and
+    passed all 167 tests because only live=True was ever exercised."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    captured = []
+    recorder, client, registry_path, build_calls = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, captured=captured
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, live=live))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert len(build_calls) == 1
+    config, passed_live = build_calls[0]
+    assert passed_live is live
+    assert config.sheet_id_for(passed_live) == expected_sheet_id
+    assert [call["collection"] for call in captured] == [expected_collection]
+    assert recorder.uploads == [expected_target]
+
+
+def test_cmd_upload_live_writes_back_even_without_write_identifier(tmp_path, monkeypatch, capsys):
+    """--live always records: an item that exists on Internet Archive under a
+    permanent identifier the Sheet does not know about is the one outcome
+    this protocol exists to prevent."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, live=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.kinds == ["read", "write", "upload", "read", "write"]
+    assert recorder.writes[0] == [("C2", "lcps-astoriaphotos-00001")]
+    assert recorder.writes[1] == [
+        ("D2", FIXED_TIMESTAMP),
+        ("E2", "https://archive.org/details/lcps-astoriaphotos-00001"),
+        ("F2", "photo1.jpg"),
+    ]
+
+
+def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
+    tmp_path, monkeypatch, capsys
+):
+    """If a human inserts or deletes rows mid-run the indices shift, and the
+    confirm batch would otherwise stamp one photograph's URL onto another's
+    row. The identifier at the target row is re-read and compared before
+    anything is written there."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+
+    def edit_between_reserve_and_confirm(live_grid, read_count):
+        if read_count == 2:
+            live_grid[1][2] = "lcps-astoriaphotos-99999"
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        before_read=edit_between_reserve_and_confirm,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    # Row 2 uploaded fine; only its Sheet write-back is withheld. Row 3 is
+    # untouched by the edit and is confirmed normally. The confirm batch is
+    # asserted BEFORE the exit code deliberately: "it wrote row 2's URL onto
+    # whatever now sits at row 2" is the failure that matters, and an
+    # exit-code assertion firing first would hide which one went wrong.
+    assert recorder.uploads == [
+        "zztest-lcps-astoriaphotos-00001",
+        "zztest-lcps-astoriaphotos-00002",
+    ]
+    assert recorder.writes[1] == [
+        ("D3", FIXED_TIMESTAMP),
+        ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+        ("F3", "photo2.jpg"),
+    ]
+    assert "row 2 no longer holds" in captured.err
+    assert exit_code == 1
+
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    statuses = {entry["identifier"]: entry["status"] for entry in entries}
+    assert statuses["lcps-astoriaphotos-00001"] == "unconfirmed"
+    assert statuses["lcps-astoriaphotos-00002"] == "success"
+
+
+def test_cmd_upload_writes_the_resolved_path_to_ia_identifier_bib_not_the_sheets_raw_cell(
+    tmp_path, monkeypatch, capsys
+):
+    """225 of 234 filenames in the real Sheet carry no extension, so the
+    reference that was actually uploaded differs from what the Sheet says.
+    ia_identifier_bib must record what was uploaded, and a stale value already
+    sitting in that column must not survive."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "Liberty", "", "", "", "STALE/whatever"]]
+    captured = []
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("Liberty.tif",), captured=captured
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.writes[1][2] == ("F2", "Liberty.tif")
+    assert captured[0]["row"]["identifier-bib"] == "Liberty.tif"
+
+
+def test_cmd_upload_with_no_csv_runs_against_the_sheet_instead_of_erroring(
+    tmp_path, monkeypatch, capsys
+):
+    """`upload --project X` used to fail with "the following arguments are
+    required: csv". Driven through main() so the parser change is what is
+    under test, not just cmd_upload."""
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = main(
+        [
+            "upload",
+            "--project",
+            "astoriaphotos",
+            "--registry",
+            str(registry_path),
+            "--log-dir",
+            str(tmp_path / "logs"),
+        ]
+    )
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.uploads == ["zztest-lcps-astoriaphotos-00001"]
+
+
+def test_cmd_upload_never_sends_tool_owned_or_held_back_columns_as_ia_metadata(
+    tmp_path, monkeypatch, capsys
+):
+    """upload_row turns every key it is handed into an Internet Archive
+    metadata field, and IA metadata is permanent. The tool's own ia_ columns
+    and anything marked (LCPS Internal) must be filtered out before it ever
+    sees them; identifier-bib and mediatype are generated instead of read from
+    a column. See docs/DECISIONS.md."""
+    from ia_bulk import cmd_upload
+
+    header = SHEET_HEADER + ["Donor notes (LCPS Internal)"]
+    grid = [header, ["First photo", "photo1.jpg", "", "", "", "", "do not publish"]]
+    captured = []
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, captured=captured
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    metadata_row = captured[0]["row"]
+    assert sorted(metadata_row) == ["file", "identifier", "identifier-bib", "mediatype", "title"]
+    assert metadata_row["identifier-bib"] == "photo1.jpg"
+    assert metadata_row["mediatype"] == "image"
+
+
+def test_cmd_upload_refuses_a_sheet_without_the_ia_write_back_columns(
+    tmp_path, monkeypatch, capsys
+):
+    from ia_bulk import cmd_upload
+
+    grid = [["Title", "file"], ["First photo", "photo1.jpg"]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.uploads == []
+    assert recorder.writes == []
+    assert "ia_identifier" in captured.err
+    assert "ia_uploaded" in captured.err
+
+
+def test_cmd_upload_refuses_a_header_collision_before_uploading_anything(
+    tmp_path, monkeypatch, capsys
+):
+    """A header-level defect silently overwrites one column's data on EVERY
+    row, so unlike a bad row it cannot be routed around by skipping."""
+    from ia_bulk import cmd_upload
+
+    header = SHEET_HEADER + ["Title!"]
+    grid = [header, ["First photo", "photo1.jpg", "", "", "", "", "collides"]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.uploads == []
+    assert recorder.writes == []
+    assert "normalize to field name 'title'" in captured.out
+
+
+def test_cmd_upload_sheet_path_refuses_a_collection_override(tmp_path, monkeypatch, capsys):
+    """--collection used to default to "lcps", which is not a real Internet
+    Archive collection - a --live run would have pushed real photographs at a
+    non-existent collection and reported success. On the Sheet path the value
+    comes from the registry, and silently ignoring an explicit --collection
+    would be its own trap."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, collection="lcps"))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.events == []
+    assert "--collection" in captured.err
+
+
+def test_cmd_upload_sheet_path_refuses_resume_from(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, resume_from=str(tmp_path / "prior.jsonl"))
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.events == []
+    assert "--resume-from" in captured.err
+
+
+def test_cmd_upload_sheet_path_refuses_an_unreplaced_placeholder_sheet_id(
+    tmp_path, monkeypatch, capsys
+):
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    registry = make_sheet_registry(files_dir=str(tmp_path), sheet_id="REPLACE_WITH_REAL_SHEET_ID")
+    recorder, client, registry_path, build_calls = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, registry=registry
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, live=True))
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert build_calls == []
+    assert recorder.events == []
+    assert "placeholder" in captured.err
+
+
+def test_cmd_upload_csv_path_refuses_live_without_an_explicit_collection(tmp_path, monkeypatch):
+    """The "lcps" default is gone; --live on the CSV path must now name the
+    collection rather than silently inventing one."""
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title", "date"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-00001",
+                "file": "photo1.jpg",
+                "mediatype": "image",
+                "title": "First photo",
+                "date": "1958",
+            }
+        ],
+    )
+    registry_path = tmp_path / "projects_registry.json"
+    registry_path.write_text(
+        json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}), encoding="utf-8"
+    )
+
+    uploaded = []
+    monkeypatch.setattr(
+        "ia_bulk.upload_row",
+        lambda row, target_identifier, collection, files_dir: uploaded.append(target_identifier),
+    )
+
+    args = Namespace(
+        csv=str(csv_path),
+        files_dir=str(tmp_path),
+        registry=str(registry_path),
+        live=True,
+        collection=None,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+    )
+
+    assert cmd_upload(args) == 1
+    assert uploaded == []
+
+
+def test_cmd_upload_records_a_failed_upload_without_confirming_it(tmp_path, monkeypatch, capsys):
+    """A row whose upload raised is reserved (the number is spent - gaps are
+    harmless, collisions are not) but never confirmed, so the next run sees it
+    as RESERVED and retries under the same identifier."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        fail_for=("zztest-lcps-astoriaphotos-00001",),
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.writes == [
+        [("C2", "lcps-astoriaphotos-00001"), ("C3", "lcps-astoriaphotos-00002")],
+        [
+            ("D3", FIXED_TIMESTAMP),
+            ("E3", "https://archive.org/details/zztest-lcps-astoriaphotos-00002"),
+            ("F3", "photo2.jpg"),
+        ],
+    ]
+
+
+def test_validate_sheet_rows_and_validate_csv_rows_keep_their_two_different_answers(tmp_path):
+    """Part B split validate_rows' path-mode parameters into two named
+    wrappers. The wrappers must keep disagreeing in exactly the way the two
+    paths need: a blank ia_identifier is the normal start of a Sheet row,
+    while a blank identifier is a defect in a hand-prepared CSV."""
+    from ia_bulk import validate_csv_rows, validate_sheet_rows
+
+    (tmp_path / "photo1.jpg").write_bytes(b"x")
+    row = {
+        "identifier": "",
+        "ia_identifier": "",
+        "file": "photo1.jpg",
+        "mediatype": "image",
+        "title": "T",
+    }
+
+    sheet_results = validate_sheet_rows([dict(row)], tmp_path, make_registry())
+    csv_results = validate_csv_rows([dict(row)], tmp_path, make_registry())
+
+    assert sheet_results[0].errors == []
+    assert csv_results[0].errors == ["missing required column 'identifier'"]

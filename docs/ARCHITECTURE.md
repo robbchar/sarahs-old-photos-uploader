@@ -137,14 +137,17 @@ Verified defects with reproductions live in
 just reject every real identifier), but it needs to be right before real
 uploads can pass `validate`.
 
-`upload`'s `--collection` flag also defaults to `"lcps"` (see `build_parser`
-in `ia_bulk.py`) and is used as-is on `--live` runs. Unlike the
-`collection_key` placeholder above, nothing validates this value — a wrong
-or stale `--collection` on a `--live` run will silently push real files to
-the wrong IA collection instead of failing. Double-check `--collection`
-by hand before every `--live upload` run. The default is intentionally left
-as `"lcps"` (matches the original plan); this is a documentation warning,
-not a call to change the CLI's behavior.
+The target IA collection is the project's `ia_collection` in
+`projects_registry.json`. `upload`'s `--collection` flag no longer defaults
+to `"lcps"` — that string is not a real Internet Archive collection, and a
+`--live` run would have pushed real photographs at a collection that does
+not exist and reported success. The flag survives only as an explicit
+override on the `--csv` path, where `--live` now refuses to run without it;
+on the Sheet path passing it is an error rather than a silently ignored
+value. Nothing still validates `ia_collection` against IA itself, so confirm
+it by hand once, in version control, before the first `--live` run —
+`upload --dry-run` prints everything the run would do without doing any of
+it. See `DECISIONS.md`, "Technical configuration lives in the registry".
 
 The production CSV export from the LCPS Google Sheet
 (`data/LCPS Digital Archive Metadata Spreadsheet - Sheet1.csv`) does not

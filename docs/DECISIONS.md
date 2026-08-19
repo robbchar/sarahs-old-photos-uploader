@@ -184,6 +184,29 @@ The same reasoning puts `files_dir` and `file_template` there. A row's file
 path is assembled from a root plus one or more Sheet columns, which is
 plumbing; the people maintaining the Sheet should never have to think about it.
 
+## On the Sheet path, `upload` uploads the valid rows and reports the rest
+
+*Decided 2026-08-16. The CSV path keeps the opposite behavior.*
+
+`upload` has always refused to run if any row failed validation. That is right
+for a CSV somebody prepared by hand for one batch: the file is small, the
+operator just built it, and a bad row means the file is wrong.
+
+It is wrong for the Sheet. The Sheet is a living document of ~10,000 rows filled
+in over months, against an archive whose files arrive in instalments. One typo
+in row 9,000 blocking the other 9,999 would mean the collection could never go
+out incrementally — and during early testing, with only a handful of photos on
+the machine, every unresolvable row would block the few that do resolve.
+
+So on the Sheet path a run uploads every row that passes, lists every row that
+fails with its errors, and exits non-zero so a failure is never mistaken for a
+clean run. The `ia_uploaded` column already makes this safe: a skipped row is
+simply one that has no confirmation yet, and the next run picks it up once its
+file appears or its metadata is fixed.
+
+The CSV path is unchanged and still refuses. The two sources have genuinely
+different shapes and deserve different answers.
+
 ## Tool-owned Sheet columns are all `ia_`-prefixed
 
 *Decided 2026-08-16, after the first run against a real copy of the LCPS Sheet.*
@@ -255,6 +278,57 @@ scan per folder rather than one per row.
 Because the resolved name is the real one, `ia_identifier_bib` records
 `folder/resolved-filename`, which can differ from what the Sheet says. That is
 the point: it records what was uploaded, not what someone typed.
+
+## A bad row is skipped; a bad header stops the whole run
+
+*Decided 2026-08-16, alongside "upload uploads the valid rows and reports the
+rest" — which is about rows, and says nothing about headers.*
+
+Skipping works because a bad row is contained: it is one photograph, it is
+named in the report, and the next run picks it up once fixed. A header defect
+is not contained. Two headers normalizing to the same IA field name silently
+overwrite one another on *every* row, so there is no subset of rows that is
+still trustworthy — skipping the affected rows would mean skipping all of
+them, and uploading the rest means uploading data that is already wrong.
+
+So `upload` refuses outright on a header-level error and skips only row-level
+ones. The split already existed inside `validate` (`header_results` vs
+`row_results`); `upload` reuses that same partition rather than inventing a
+second opinion about which is which.
+
+## The four `ia_` columns are required in every mode, including the safe one
+
+*Decided 2026-08-16, when `upload` first wrote to a Sheet.*
+
+`upload` needs somewhere to put `ia_identifier`, `ia_uploaded`, `ia_url` and
+`ia_identifier_bib`. The obvious rule — require the columns only when actually
+writing — makes the default, no-`--write-identifier` mode succeed against a
+Sheet that `--live` would reject. That is worse than useless: the whole point
+of the default mode is to be a rehearsal, and a rehearsal that passes where
+the performance fails is a false negative on the one run an operator trusts.
+
+So the check does not vary with the mode, and it runs before anything is
+uploaded rather than after — a run that uploaded first and only then noticed
+it had nowhere to record the identifier would produce exactly the stranded
+item the reserve-first ordering exists to prevent.
+
+## Sheet metadata is filtered at the upload boundary, not in `upload_row`
+
+*Decided 2026-08-16.*
+
+`upload_row` turns every key it is handed (bar `identifier` and `file`) into an
+Internet Archive metadata field. That is correct for the CSV path, where the
+CSV's columns are exactly the fields the operator wants uploaded. It is wrong
+for the Sheet, which also carries the tool's own `ia_` bookkeeping columns and
+whatever a Sheet author marked `(LCPS Internal)` — none of which belong on a
+public item, and all of which would be permanent once there.
+
+`sheet_upload_metadata()` therefore builds the dict `upload_row` receives,
+keeping only `ColumnMap.uploadable_fields()` (already the single definition of
+what may be uploaded, and already excluding both categories) and adding the
+generated `identifier-bib` and `mediatype`. Filtering here rather than inside
+`upload_row` leaves the CSV path's behavior untouched and keeps the rule next
+to the ColumnMap that defines it.
 
 ## `identifier-bib` and `mediatype` are generated, not columns
 
