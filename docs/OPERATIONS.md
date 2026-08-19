@@ -64,12 +64,21 @@ issues zero writes to the Sheet, so it is a rehearsal you can repeat freely.
 it would mint and the cells it would write.
 
 With no `--live`, the tool targets IA's `test_collection` sandbox and prepends
-`zztest-` to each identifier before every network call. The CSV keeps its
-real, permanent identifiers — never hand-write a `zztest-` identifier.
+`zztest-<run's stamp>-` to each identifier before every network call — the
+stamp is unique per invocation, so this run's items never collide with a
+prior rehearsal's (see [`docs/DECISIONS.md`](DECISIONS.md), "Test identifiers
+carry a per-run stamp"). The CSV keeps its real, permanent identifiers —
+never hand-write a `zztest-` identifier.
 
-Test items land at `https://archive.org/details/zztest-<identifier>` and
-auto-expire after roughly 30 days. Spot-check a few in a browser and confirm
-the metadata fields are the ones you meant, with the values you meant.
+Test items auto-expire after roughly 30 days. **Do not construct the URL by
+hand from `zztest-<identifier>`** — the stamp makes that guess wrong, and
+it will land you on a different (possibly already-darkened) run's item
+instead of your own. Get the real URL from the run itself: each row's
+progress line and the log's `uploaded_as` field both print the full stamped
+identifier, and on the Sheet path the row's `ia_url` cell holds the exact
+link once `--write-identifier` (or `--live`) has run. Spot-check a few of
+those URLs in a browser and confirm the metadata fields are the ones you
+meant, with the values you meant.
 
 ## 4. Live run
 

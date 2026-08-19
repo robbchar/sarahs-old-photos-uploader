@@ -121,11 +121,24 @@ already correct doesn't inflate the error count or flip the exit code.
 ## Safety rail
 Default target is `test_collection`; `--live` is required to target the
 real collection and use the real identifier as-is. When not `--live`,
-`effective_identifier()` prepends `zztest-` to the real identifier for
-every network call (`zztest-lcps-sarahsoldphotos-00001`) — this happens
+`effective_identifier()` prepends `zztest-<run's stamp>-` to the real
+identifier for every network call (e.g.
+`zztest-20260819t144907-lcps-sarahsoldphotos-00001`) — this happens
 automatically, in code, rather than requiring the CSV to already contain
 test-prefixed identifiers. The CSV itself never needs to change between a
 test run and a `--live` run.
+
+The stamp (`run_stamp()`) is computed once per invocation and shared by
+every row that run touches, so a rehearsal's items group together and never
+collide with a previous rehearsal's — see
+[`docs/DECISIONS.md`](DECISIONS.md#test-identifiers-carry-a-per-run-stamp)
+for why a bare `zztest-` prefix made every fresh-Sheet rehearsal collide
+with the last one. (A *resumed* run is its own invocation with its own
+stamp, so its items land under a second stamp, not the original run's —
+`--resume-from` still recognizes them as done since it matches on the real
+`identifier`, never on the stamped `uploaded_as`.) `--live` identifiers
+never carry a stamp: they are the permanent, public ones and must stay a
+pure function of the Sheet/CSV.
 
 ## Known gaps
 Verified defects with reproductions live in

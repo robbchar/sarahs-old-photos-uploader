@@ -214,11 +214,15 @@ literal value `REMOVE_TAG` in that cell (the same sentinel the official
 By default every command targets IA's `test_collection` sandbox. The Sheet's
 `ia_identifier` column (and the CSV's `identifier` column) always holds the
 real, permanent identifier — never author a `zztest-` identifier by hand.
-Instead, `upload` and `sync-metadata` automatically prepend `zztest-` to the
-real identifier for every network call (e.g. `lcps-astoriaphotos-00001`
-becomes `zztest-lcps-astoriaphotos-00001`) unless `--live` is passed. Pass
-`--live` to target the real collection with the real identifier as-is — do
-this deliberately, never as a default.
+Instead, `upload` and `sync-metadata` automatically prepend
+`zztest-<run's stamp>-` to the real identifier for every network call (e.g.
+`lcps-astoriaphotos-00001` becomes
+`zztest-20260819t144907-lcps-astoriaphotos-00001`) unless `--live` is
+passed. The stamp is unique per invocation, so a rehearsal never collides
+with a previous rehearsal's items — see
+[`docs/DECISIONS.md`](docs/DECISIONS.md#test-identifiers-carry-a-per-run-stamp).
+Pass `--live` to target the real collection with the real identifier as-is,
+with no stamp — do this deliberately, never as a default.
 
 ```bash
 python ia_bulk.py upload --project sarahsoldphotos --live

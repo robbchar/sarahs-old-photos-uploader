@@ -599,7 +599,16 @@ def run_stamp() -> str:
     script - e.g. "20260819t144907". Computed ONCE per run and threaded
     through every effective_identifier() call that run makes, never
     recomputed per row: a run's test items must group together under one
-    stamp, not scatter across however many rows it processed.
+    stamp, not scatter across however many rows it processed. (A *resumed*
+    run is a separate invocation with its own stamp, so its items land under
+    a second stamp rather than the original run's - that's correct, not a
+    bug: --resume-from still recognizes them as done because it matches on
+    the real `identifier`, never on the stamped `uploaded_as`.)
+
+    Uses UTC (time.gmtime), not local time: local time repeats an hour's
+    worth of timestamps during the DST fall-back transition, which would
+    make two rehearsals started an hour apart during that transition mint
+    the same stamp - defeating the reason this function exists.
 
     See docs/DECISIONS.md, "Test identifiers carry a per-run stamp" - without
     this, a test run's identifiers were a pure function of the real ones, so a
@@ -607,7 +616,7 @@ def run_stamp() -> str:
     identifiers every time. Internet Archive never releases an identifier and
     test_collection darkens items after ~30 days, so every rehearsal after the
     first collided with a darkened item and failed outright."""
-    return time.strftime("%Y%m%dt%H%M%S")
+    return time.strftime("%Y%m%dt%H%M%S", time.gmtime())
 
 
 def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
