@@ -4288,3 +4288,33 @@ def test_validate_sheet_rows_and_validate_csv_rows_keep_their_two_different_answ
 
     assert sheet_results[0].errors == []
     assert csv_results[0].errors == ["missing required column 'identifier'"]
+
+
+def test_row_validation_is_ready_when_no_fields_missing():
+    from ia_bulk import Readiness
+
+    result = RowValidation(row_number=2, identifier="")
+    assert result.readiness is Readiness.READY
+    assert result.missing_fields == []
+
+
+def test_row_validation_is_not_ready_when_fields_missing():
+    from ia_bulk import Readiness
+
+    result = RowValidation(row_number=2, identifier="", missing_fields=["title"])
+    assert result.readiness is Readiness.NOT_READY
+
+
+def test_readiness_is_independent_of_validity():
+    """The combination that motivates the whole design: a row nobody has
+    catalogued yet whose filename is also wrong."""
+    from ia_bulk import Readiness
+
+    result = RowValidation(
+        row_number=2,
+        identifier="",
+        errors=["no file found in '/data' matching 'Finnis.jpg'"],
+        missing_fields=["title"],
+    )
+    assert result.readiness is Readiness.NOT_READY
+    assert result.is_valid is False

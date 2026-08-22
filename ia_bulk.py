@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Iterator, TypeVar
 
@@ -244,15 +245,33 @@ def check_row_shape(row: dict) -> list[str]:
     return errors
 
 
+class Readiness(Enum):
+    """Whether a human has filled in the fields a row needs before it can be
+    uploaded. Deliberately NOT a member of RowState: RowState answers "has
+    this been minted and uploaded", readiness answers "has a person filled
+    it in", and a not-ready row IS RowState.UNASSIGNED. They are different
+    questions, not alternatives - see docs/DECISIONS.md."""
+
+    READY = "ready"
+    NOT_READY = "not_ready"
+
+
 @dataclass
 class RowValidation:
     row_number: int
     identifier: str
     errors: list[str] = field(default_factory=list)
+    missing_fields: list[str] = field(default_factory=list)
 
     @property
     def is_valid(self) -> bool:
         return not self.errors
+
+    @property
+    def readiness(self) -> Readiness:
+        """Derived, never stored: `missing_fields` being non-empty IS what
+        not-ready means, so a second stored field could only drift from it."""
+        return Readiness.NOT_READY if self.missing_fields else Readiness.READY
 
 
 def validate_rows(
