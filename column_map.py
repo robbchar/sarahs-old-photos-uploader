@@ -4,6 +4,7 @@ docs/DECISIONS.md, "The Sheet is read live"."""
 from __future__ import annotations
 
 import re
+import string
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -214,6 +215,16 @@ def check_file_template(template: str, column_map: ColumnMap) -> None:
             "the header text as typed: a header 'File Name' becomes 'file_name'. Available "
             f"columns are: {available}"
         )
+
+
+def template_fields(template: str) -> tuple[str, ...]:
+    """The field names `file_template` substitutes, in order.
+
+    Used to answer "which cell is blank" when a row has no file, so the
+    report can say `missing file_name` rather than a generic "no file" -
+    and so the readiness breakdown is derived from the registry's template
+    rather than a hardcoded pair of column names."""
+    return tuple(name for _, name, _, _ in string.Formatter().parse(template) if name)
 
 
 def candidate_path(template: str, row: dict[str, str]) -> str:

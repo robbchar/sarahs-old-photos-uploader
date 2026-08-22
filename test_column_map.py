@@ -463,3 +463,24 @@ def test_resolve_file_still_searches_files_dirs_root_for_a_single_segment_templa
     (tmp_path / "Liberty.jpg").write_bytes(b"x")
 
     assert resolve_file(tmp_path, "Liberty", {}) == "Liberty.jpg"
+
+
+def test_template_fields_returns_substituted_names_in_order():
+    from column_map import template_fields
+
+    assert template_fields("{folder_on_lacie_drive}/{file_name}") == (
+        "folder_on_lacie_drive",
+        "file_name",
+    )
+
+
+def test_template_fields_ignores_literal_text():
+    from column_map import template_fields
+
+    assert template_fields("photos/{file_name}.jpg") == ("file_name",)
+
+
+def test_template_fields_of_a_template_with_no_fields_is_empty():
+    from column_map import template_fields
+
+    assert template_fields("static/path.jpg") == ()
