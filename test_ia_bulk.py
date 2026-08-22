@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import csv
 import re
@@ -122,8 +123,16 @@ def _sheet_config(**overrides) -> ProjectConfig:
     ProjectConfig directly) rather than a registry dict routed through
     load_project_config(). Every field is overridable, not only
     required_for_upload - files_dir and file_template are exercised by other
-    tasks in this same plan that reuse this helper."""
-    defaults = dict(
+    tasks in this same plan that reuse this helper.
+
+    Built via dataclasses.replace() on a fully-typed base rather than
+    ProjectConfig(**defaults): unpacking a plain dict mixing str and
+    tuple[str] values makes every field's type just "str | tuple[str]" to a
+    type checker, which cannot narrow any individual parameter at the `**`
+    unpack - ProjectConfig is a frozen dataclass, so replace() is both the
+    idiomatic way to override a subset of fields and the one that keeps each
+    field's real type intact."""
+    base = ProjectConfig(
         project_id="astoriaphotos",
         collection_key="lcps",
         mediatype="image",
@@ -135,8 +144,7 @@ def _sheet_config(**overrides) -> ProjectConfig:
         file_template="{file}",
         required_for_upload=("title",),
     )
-    defaults.update(overrides)
-    return ProjectConfig(**defaults)
+    return dataclasses.replace(base, **overrides)
 
 
 class FakeSheetClient:
