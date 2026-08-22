@@ -4779,3 +4779,61 @@ def test_breakdown_field_list_follows_the_data_not_a_hardcoded_pair():
 
 def test_breakdown_is_empty_when_every_row_is_ready():
     assert format_readiness_breakdown([RowValidation(2, "")]) == ""
+
+
+def test_breakdown_omits_the_overlap_parenthetical_when_every_row_misses_exactly_one_field():
+    """Guards the `if any(len(result.missing_fields) > 1 ...)` in
+    format_readiness_breakdown: delete that `if` mentally and every test
+    above still passes, because each of them has at least one row missing
+    more than one field. Here two not-ready rows each miss exactly one
+    (different) field, so 1 + 1 == 2 - the per-field counts genuinely sum
+    to the not-ready total - and the overlap parenthetical, which exists
+    to warn that they DON'T sum, must be absent entirely. An
+    always-printed parenthetical would tell the operator the numbers
+    don't add up when they do, which is actively wrong here."""
+    results = [
+        RowValidation(2, "", missing_fields=["title"]),
+        RowValidation(3, "", missing_fields=["file_name"]),
+    ]
+    lines = format_readiness_breakdown(results).splitlines()
+    assert lines == [
+        "2 rows not yet catalogued",
+        "    1 missing file_name",
+        "    1 missing title",
+    ]
+
+
+def test_breakdown_orders_by_count_then_breaks_ties_alphabetically():
+    """Every other assertion in this file checks `"..." in lines`
+    (membership), never position - a mutation collapsing the sort key to
+    `item[0]` alone (plain alphabetical) would still pass all of them,
+    because membership doesn't care what order the lines come in. This
+    pins the full ordered output: title (count 2) must sort before
+    file_name/theme (both count 1, tied) - proving count-descending is
+    applied at all - and file_name must sort before theme within that
+    tie - proving the tie-break is alphabetical, not insertion order or
+    anything else."""
+    results = [
+        RowValidation(2, "", missing_fields=["title", "theme"]),
+        RowValidation(3, "", missing_fields=["title", "file_name"]),
+    ]
+    lines = format_readiness_breakdown(results).splitlines()
+    assert lines == [
+        "2 rows not yet catalogued",
+        "    2 missing title",
+        "    1 missing file_name",
+        "    1 missing theme",
+        "    (a row missing more than one field appears in more than one "
+        "count above, so these do not sum to 2)",
+    ]
+
+
+def test_breakdown_uses_the_singular_header_for_one_not_ready_row():
+    """No existing fixture produces exactly one not-ready row - every one
+    of them uses two or three - so the singular branch of the "N row(s)
+    not yet catalogued" header (from _pluralize) has never been rendered
+    by a test. Pins it explicitly."""
+    lines = format_readiness_breakdown(
+        [RowValidation(2, "", missing_fields=["title"])]
+    ).splitlines()
+    assert lines == ["1 row not yet catalogued", "    1 missing title"]
