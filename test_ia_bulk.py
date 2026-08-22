@@ -33,6 +33,9 @@ from ia_bulk import (
     format_readiness_breakdown,
     _format_result_lines,
     main,
+    CHUNK_SIZE,
+    is_rate_limit_error,
+    RateLimited,
 )
 from project_config import ProjectConfig
 
@@ -2284,6 +2287,12 @@ def test_run_header_is_the_first_line_of_the_log(tmp_path):
     }
     assert header["held_back"] == ["Notes (LCPS Internal)"]
     assert header["required_for_upload"] == ["title"]
+    # Task 12: a run that stopped at --limit, or used a non-default
+    # --chunk-size, is not reconstructable without both numbers recorded
+    # alongside everything else the header already captures. Neither flag
+    # was passed here, so both read as "the run's own default".
+    assert header["limit"] is None
+    assert header["chunk_size"] == CHUNK_SIZE
     assert json.loads(second)["status"] == "success"
 
 
@@ -3628,6 +3637,10 @@ def test_cmd_upload_writes_the_run_header_as_the_first_line_of_the_sheet_path_lo
     assert header["collection"] == "lcpsociety"
     assert header["required_for_upload"] == ["title"]
     assert header["columns"]["Title"] == "title"
+    # Task 12: neither --limit nor --chunk-size was passed, so the header
+    # records the run's own defaults rather than omitting the fields.
+    assert header["limit"] is None
+    assert header["chunk_size"] == CHUNK_SIZE
 
     result = json.loads(lines[1])
     assert result["status"] == "success"
@@ -4608,6 +4621,268 @@ def test_cmd_upload_reports_a_sheets_write_failure_instead_of_a_traceback(
     logged = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
     entries = [entry for entry in logged if entry.get("record") != "run_header"]
     assert [entry["status"] for entry in entries] == ["success", "unconfirmed"]
+
+
+# ---------------------------------------------------------------------------
+# Task 12: --limit, --chunk-size, and Internet Archive rate-limit detection.
+#
+# The brief this task started from predates SheetUploadRun/plan_upload_targets
+# and assumed a run_rows()-based upload path with a `sheet_setup` fixture that
+# no longer exists; these tests instead drive the real entry point
+# (cmd_upload -> upload_from_sheet -> SheetUploadRun.execute) through the same
+# setup_sheet_upload()/make_upload_args() helpers Task 10's tests use.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("failed with status 503: SlowDown", True),
+        ("failed with status 429: Too Many Requests", True),
+        ("failed with status 404: not found", False),
+        ("connection reset by peer", False),
+    ],
+)
+def test_is_rate_limit_error(message, expected):
+    """Matches only on the HTTP status number embedded in upload_row()'s own
+    `f"failed with status {response.status_code}: {response.text}"` message -
+    the one representation of an IA failure this codebase actually
+    constructs and can vouch for. See task-12-report.md for what could and
+    could not be verified about what a live rate-limit response looks like
+    once it has passed through the installed `internetarchive` library."""
+    assert is_rate_limit_error(RuntimeError(message)) is expected
+
+
+def test_rate_limited_carries_the_original_message():
+    """RateLimited is the documented public interface's second half: a
+    dedicated exception type SheetUploadRun.execute() raises internally once
+    is_rate_limit_error() has already matched, so the rest of that method can
+    tell 'stop the whole run' from 'log this row and continue' by type
+    rather than re-running the detector a second time. str() is unchanged
+    from the original exception, so a rate-limited row's logged error message
+    reads identically to an ordinary failure's."""
+    assert issubclass(RateLimited, Exception)
+    original = RuntimeError("failed with status 503: SlowDown")
+    wrapped = RateLimited(str(original))
+    assert str(wrapped) == str(original)
+
+
+def test_cmd_upload_limit_stops_after_n_planned_targets(tmp_path, monkeypatch, capsys):
+    """--limit counts PLANNED upload targets (valid, ready, not already
+    done) - not Sheet rows scanned. Five ready, unassigned rows with
+    --limit 2 must upload exactly the first two, in row order, and leave the
+    rest untouched and unmarked."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in range(1, 6)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=tuple(f"photo{n}.jpg" for n in range(1, 6)),
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, limit=2)
+    )
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.uploads == [
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002",
+    ]
+    # Rows 3-5 were never reserved: the Sheet cells for them are untouched.
+    assert client.grid[3] == ["Photo 3", "photo3.jpg", "", "", "", ""]
+    assert client.grid[4] == ["Photo 4", "photo4.jpg", "", "", "", ""]
+    assert client.grid[5] == ["Photo 5", "photo5.jpg", "", "", "", ""]
+
+
+def test_cmd_upload_stops_the_run_on_a_rate_limit_instead_of_grinding_through_failures(
+    tmp_path, monkeypatch, capsys
+):
+    """Without this the run would attempt all 5 rows against a server that
+    has already said 'slow down', reporting 3 more unexplained failures and
+    burning through however much of today's 5,000-item quota happens to
+    remain."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in range(1, 6)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=tuple(f"photo{n}.jpg" for n in range(1, 6)),
+    )
+
+    def fake_upload_row(row, target_identifier, collection, files_dir):
+        recorder.events.append(("upload", target_identifier))
+        if target_identifier.endswith("00003"):
+            raise RuntimeError("failed with status 503: SlowDown")
+
+    monkeypatch.setattr("ia_bulk.upload_row", fake_upload_row)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert recorder.uploads == [
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-0000{n}" for n in (1, 2, 3)
+    ]
+    assert (
+        "stopped: Internet Archive reported a rate limit after 3 items"
+        in captured.err.splitlines()
+    )
+    assert "2 uploaded this run - resume by re-running tomorrow" in captured.out.splitlines()
+    assert exit_code == 1
+
+
+def test_cmd_upload_confirms_successes_that_happened_before_a_rate_limit_stopped_the_run(
+    tmp_path, monkeypatch, capsys
+):
+    """A rate-limit stop must not leave the rows that DID upload stuck
+    RESERVED-but-unconfirmed - see SheetUploadRun.execute's own reserve ->
+    upload -> confirm protocol. Skipping this would make tomorrow's run
+    re-upload photo1.jpg and photo2.jpg under a second identifier, because
+    their ia_uploaded cell would still read blank."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in range(1, 6)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=tuple(f"photo{n}.jpg" for n in range(1, 6)),
+    )
+
+    def fake_upload_row(row, target_identifier, collection, files_dir):
+        recorder.events.append(("upload", target_identifier))
+        if target_identifier.endswith("00003"):
+            raise RuntimeError("failed with status 503: SlowDown")
+
+    monkeypatch.setattr("ia_bulk.upload_row", fake_upload_row)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    capsys.readouterr()
+
+    assert exit_code == 1
+    assert recorder.writes == [
+        [
+            ("C2", "lcps-astoriaphotos-00001"),
+            ("C3", "lcps-astoriaphotos-00002"),
+            ("C4", "lcps-astoriaphotos-00003"),
+            ("C5", "lcps-astoriaphotos-00004"),
+            ("C6", "lcps-astoriaphotos-00005"),
+        ],
+        [
+            ("D2", FIXED_TIMESTAMP),
+            ("E2", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
+            ("F2", "photo1.jpg"),
+            ("D3", FIXED_TIMESTAMP),
+            ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002"),
+            ("F3", "photo2.jpg"),
+        ],
+    ]
+
+
+def test_cmd_upload_limit_and_chunk_size_combine_as_total_then_batch_size(
+    tmp_path, monkeypatch, capsys
+):
+    """--limit 10 --chunk-size 3 must mean '10 rows total, in chunks of 3' -
+    not any other reading of the two together. 12 ready rows exercise both:
+    only the first 10 are ever reserved or uploaded, arriving in reserve
+    batches of 3, 3, 3, then 1."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in range(1, 13)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=tuple(f"photo{n}.jpg" for n in range(1, 13)),
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(
+            tmp_path, registry_path, write_identifier=True, limit=10, chunk_size=3
+        )
+    )
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert recorder.uploads == [
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-{n:05d}" for n in range(1, 11)
+    ]
+    reserve_batch_sizes = [len(batch) for batch in recorder.writes[0::2]]
+    assert reserve_batch_sizes == [3, 3, 3, 1]
+
+
+def test_run_header_records_limit_and_chunk_size_when_set(tmp_path, monkeypatch, capsys):
+    """Task 11's header exists to make a run reconstructable; a run that
+    stopped at --limit, or used a non-default --chunk-size, is not
+    reconstructable without both numbers recorded alongside everything else
+    the header already captures."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in range(1, 4)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg", "photo3.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, limit=2, chunk_size=1))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    header = json.loads(log_files[0].read_text(encoding="utf-8").splitlines()[0])
+    assert header["limit"] == 2
+    assert header["chunk_size"] == 1
+
+
+def test_cmd_upload_rejects_limit_and_chunk_size_on_the_csv_path(tmp_path, capsys):
+    """--limit and --chunk-size describe the Sheet path's own batching and
+    quota-stopping behavior; silently ignoring them on --csv would let an
+    operator believe a hand-prepared CSV run was capped or rechunked when it
+    was not - the same trap --write-identifier/--dry-run already guard
+    against just above."""
+    from ia_bulk import cmd_upload
+
+    csv_path = tmp_path / "items.csv"
+    write_csv(csv_path, ["identifier", "file", "mediatype", "title"], [])
+
+    args = Namespace(
+        csv=str(csv_path),
+        project="astoriaphotos",
+        registry="projects_registry.json",
+        files_dir=None,
+        collection=None,
+        live=False,
+        write_identifier=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        limit=5,
+        chunk_size=CHUNK_SIZE,
+    )
+
+    exit_code = cmd_upload(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert err.splitlines() == [
+        "--limit and --chunk-size describe the Sheet path's batching and quota-stopping "
+        "behavior, so they apply to the Sheet path only. Drop --csv to run against the "
+        "Sheet."
+    ]
 
 
 def test_cmd_upload_prints_the_field_receipt_before_uploading(tmp_path, monkeypatch, capsys):

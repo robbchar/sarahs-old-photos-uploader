@@ -211,9 +211,40 @@ valid rows upload, and the command exits non-zero so a partial run is never
 mistaken for a clean one. The `--csv` path keeps the opposite behavior — it
 refuses to upload anything if any row fails.
 
+**A rate limit stops the run, not just one row (Sheet path only).** If an
+upload fails with what looks like Internet Archive's rate limit, the run
+stops rather than grinding through the rest of the batch as unexplained
+failures — everything already uploaded that run, in this chunk or an earlier
+one, is still confirmed in the Sheet first. This detector is best-effort: no
+`--live` run has ever happened, so no real rate-limit response has ever been
+captured, and it may not fire on one — see `docs/DECISIONS.md`, "Still open".
+`--limit` (below) is the operator-controlled fallback either way.
+
+**`--limit` and `--chunk-size` (Sheet path only).**
+
+```bash
+# upload at most 100 items this run, in the default batches of 500
+python ia_bulk.py upload --project sarasoldphotos --write-identifier --limit 100
+
+# 10 items total, in batches of 3 - not 10 batches of 3
+python ia_bulk.py upload --project sarasoldphotos --write-identifier --limit 10 --chunk-size 3
+```
+
+`--limit` counts *planned* upload targets — rows that are valid, ready
+(nothing required left blank), and not already done — never raw Sheet rows
+scanned. On a Sheet with 2,900 uncatalogued rows and 150 ready ones,
+`--limit 100` uploads 100 of the 150 ready rows, not the first 100 rows
+read. `--chunk-size` overrides the reserve/upload/confirm batch size
+(default 500, Internet Archive's per-run cap) for the rows `--limit` leaves;
+the two combine literally, as shown above. Both are recorded in the
+`run_header` record every Sheet-path log starts with (see
+`docs/ARCHITECTURE.md`) and rejected on `--csv`, the same way
+`--write-identifier`/`--dry-run` are rejected on the Sheet path.
+
 Other behavior, both paths:
 
-- Processes rows in chunks of 500 (Internet Archive's per-run batch limit)
+- Processes rows in chunks of 500 by default (Internet Archive's per-run
+  batch limit), overridable on the Sheet path via `--chunk-size`
 - Uploads each row via the `internetarchive` Python library (not the `ia`
   CLI), so per-row success/failure is captured directly
 - Writes a timestamped JSONL log to `logs/upload-<timestamp>.jsonl`, one

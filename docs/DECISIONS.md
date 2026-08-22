@@ -496,6 +496,80 @@ per-field breakdown (`format_readiness_breakdown`) is what surfaces that
 distinction to an operator deciding what to work on next, rather than folding
 it into one flat, unhelpful total.
 
+## `--limit` counts planned targets, not Sheet rows; `--chunk-size` overrides `CHUNK_SIZE`
+
+*Decided 2026-08-22.*
+
+`--limit` is applied to `plan_upload_targets()`'s own output — after it has
+already filtered to rows that are valid, ready, and not already done — never
+to raw Sheet rows. The real Sheet is ~3,000 rows, the great majority
+uncatalogued (see "A blank cell is not an error"); "stop after scanning N
+rows" and "stop after uploading N rows" are very different numbers on a Sheet
+shaped like that, and only the second is useful to an operator pacing
+against the 5,000/day cap. `--limit 100` on a Sheet with 2,900 uncatalogued
+rows and 150 ready ones uploads 100 of the 150, never the first 100 read.
+It combines with `--chunk-size` as "this many total, batched this way", not
+"this many chunks": `--limit 10 --chunk-size 3` uploads 10 items in batches
+of 3, never 10 batches of 3.
+
+Targets sliced away by `--limit` cost nothing: `plan_upload_targets` still
+mints an identifier for every pending row up front (minting is pure
+arithmetic — see its own docstring), but a target `--limit` drops is never
+reserved, so its number is never written anywhere and `next_identifiers()`
+mints it again on the next run. No permanent identifier is spent on a row
+this run chose not to touch.
+
+`--chunk-size` makes `SheetUploadRun.execute()`'s `CHUNK_SIZE` read (a
+module constant previously overridable only by hand-editing it, or by
+`monkeypatch.setattr("ia_bulk.CHUNK_SIZE", ...)` in a test) an ordinary
+per-run flag, defaulting to `CHUNK_SIZE` (500, IA's per-run cap) so every
+existing chunk-boundary test keeps working unchanged. The operator had
+already been hand-editing the constant to rehearse the reserve/upload/confirm
+protocol across a chunk boundary; this makes that a flag instead.
+
+Both flags are Sheet-path only, rejected on `--csv` the same way
+`--write-identifier`/`--dry-run` are rejected there: `run_rows()` (the `--csv`
+path) has no reserve/confirm batching for `--chunk-size` to control, and no
+ready/not-ready distinction for `--limit`'s counting promise to mean
+anything. Both are recorded in the `run_header` log record (see
+`ARCHITECTURE.md`, "Logging and resume") so a run that stopped at `--limit`,
+or used a non-default `--chunk-size`, stays reconstructable from its own log
+alone.
+
+## Rate-limit detection matches a status code, not vendor text — and is unverified
+
+*Decided 2026-08-22.*
+
+`is_rate_limit_error()` matches only `"429"`/`"503"` as they appear in
+`upload_row()`'s own `f"failed with status {response.status_code}: ..."`
+message — the one representation of an IA upload failure this codebase
+constructs itself and can vouch for. 503 is Internet Archive's documented S3
+overload signal (the installed `internetarchive` 5.10.1's own `ia upload
+--retries` help text: *"Number of times to retry request if S3 returns a 503
+SlowDown error"*); 429 is not IA-upload-specific documentation, but
+`session.py`'s default urllib3 `Retry` `status_forcelist`
+(`[429, 500, 501, 502, 503, 504]`) shows the library's own authors also treat
+it as rate-limit-adjacent.
+
+Deliberately **not** matched: `"SlowDown"`, `"Too Many Requests"`, or any
+other vendor-supplied text. Tracing `item.py`'s `upload_file()` — the method
+`upload_row()` actually reaches via `internetarchive.upload()` — shows that on
+a real failure it catches the resulting `HTTPError` and **re-raises it with a
+message rebuilt from the S3 XML body's `Message`/`Resource` elements only**
+(`get_s3_xml_text()` in `internetarchive/utils.py`); the numeric HTTP status
+and the S3 error `Code` (e.g. `SlowDown`) are explicitly discarded in that
+rewrite. So a live 429/503 surfacing through the real library may not contain
+either marker anywhere in `str(exc)`, and this detector would not catch it.
+
+No `--live` run has ever happened, so no real rate-limit response has ever
+been captured — this could not be verified against actual IA behavior, only
+against the installed library's source. A missed detection is the safe
+failure direction: the row is logged as one ordinary failure and the run
+continues, same as any other transient error, whereas a detector guessing at
+unconfirmed vendor text risks matching the wrong thing and aborting a run
+over an unrelated error. `--limit` (above) remains the operator-controlled
+fallback for whatever this detector cannot cover.
+
 ## Still open
 
 - `collection_key` (currently `"lcps"`, the first segment of every minted
@@ -534,7 +608,14 @@ it into one flat, unhelpful total.
   or not. `collection_key` (`"lcps"`) is untouched by either correction; it
   remains a third, unrelated value — see above.
 - Whether IA emits a distinguishable signal at its 5,000/day cap, as opposed to
-  generic throttling. `--limit` covers the case where it does not.
+  generic throttling, **remains open** — no `--live` run has ever happened, so
+  no real rate-limit response has ever been captured. **2026-08-22:**
+  `is_rate_limit_error()` now stops a run on a `429`/`503` upload failure (see
+  "Rate-limit detection matches a status code..." above), but that detector
+  is verified only against the installed library's source, not a live
+  response, and may not fire on however IA's real signal actually looks.
+  `--limit` (see "`--limit` counts planned targets..." above) remains the
+  operator-controlled fallback for whatever it does not cover.
 - ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:
   reserve in the Sheet before uploading, and track completion in an
   `ia_uploaded` column so an interrupted run is recoverable.

@@ -287,10 +287,29 @@ see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3).
 
 IA's limits are **500 items per upload run** and **5,000 per day**.
 
-`chunk_rows()` groups rows into 500s, but the loop just walks through them —
-there is no sleep, no checkpoint, and no daily counter. **Batch sizing is
-entirely manual.** With ~10,000 photos this matters: split the CSV into
-day-sized files yourself, or run it in sittings and rely on `--resume-from`.
+`chunk_rows()` groups rows into batches of 500 by default, but the loop just
+walks through them — there is still no sleep between batches and no running
+daily counter. **Pacing across a day's runs is entirely manual.**
+
+On the Sheet path, `upload --limit N` caps how many items a single
+invocation uploads (counting rows actually ready to go out, not rows
+scanned — see `README.md`), and `--chunk-size N` overrides the 500-item
+batch size for that run. The two combine literally: `--limit 10
+--chunk-size 3` uploads 10 items in batches of 3. Use `--limit` to pace
+today's runs against the 5,000/day cap by hand, e.g. `--limit 2500` twice in
+a day rather than one uncapped run; both values are recorded in the run's
+`run_header` log line (`ARCHITECTURE.md`, "Logging and resume") so a later
+read of the log shows exactly what each run was capped at. If Internet
+Archive's own rate limit shows up mid-run, the run now stops cleanly instead
+of continuing to grind through failures — but that detection is best-effort
+and unverified against a real response (`DECISIONS.md`, "Rate-limit
+detection matches a status code..."), so treat `--limit` as the dependable
+control and the detector as a bonus, not the other way around.
+
+Neither flag exists on the `--csv` path (`run_rows()` has no per-chunk Sheet
+write, and no ready/not-ready distinction, for either to mean anything
+there): with ~10,000 photos on that path, split the CSV into day-sized files
+yourself, or run it in sittings and rely on `--resume-from`.
 
 ## Resuming a failed run
 

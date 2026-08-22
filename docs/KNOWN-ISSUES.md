@@ -26,15 +26,25 @@ upload, not after.
 
 ## 2. Batch limits are documented but not enforced
 
-**Severity: medium for a 10,000-item batch.**
+**Severity: medium for a 10,000-item batch. Partially mitigated 2026-08-22.**
 
 `chunk_rows()` groups rows into 500s to match IA's per-run limit, but the loop
-has no pacing, no per-chunk checkpoint, and no counter against the 5,000/day
-limit. Chunking is structural only. This was flagged and accepted during the
-original build review.
+still has no pacing (no sleep between batches) and no running counter against
+the 5,000/day limit. That much is structural only, unchanged from the
+original build review. What did change: the Sheet path's `upload --limit N`
+now caps how many items a single invocation uploads at all (an operator can
+size a day's runs by hand with a number the tool enforces, rather than by
+pre-splitting a CSV), `--chunk-size` makes the 500-per-run batch size an
+overridable flag instead of a constant, and a detected rate-limit response
+now stops a run cleanly instead of grinding through the rest of the batch as
+unexplained failures — though that detector is unverified against a real
+response; see `DECISIONS.md`, "Rate-limit detection matches a status
+code...".
 
-**Mitigation today:** size the CSVs by hand; see
-[`OPERATIONS.md`](OPERATIONS.md#pacing-and-batch-limits).
+**Mitigation today:** pace `--limit` across the day's runs by hand; see
+[`OPERATIONS.md`](OPERATIONS.md#pacing-and-batch-limits). The `--csv` path
+still has neither flag (see `DECISIONS.md`, "`--limit` counts planned
+targets...") — size those CSVs by hand as before.
 
 ## 3. No retry on transient network failures
 

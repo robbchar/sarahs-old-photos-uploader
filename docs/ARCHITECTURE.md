@@ -60,10 +60,31 @@ CSV; see "Safety rail" below for how test runs are kept safe instead.
 
 ## Chunking
 All `upload`/`sync-metadata` runs process rows in batches of 500 (IA's
-per-run batch limit), via `chunk_rows()`. This is a pacing/checkpoint
-boundary, not a literal separate CSV file per chunk — each row is
-uploaded individually through the `internetarchive` Python library so
-outcomes are captured per-row.
+per-run batch limit) by default, via `chunk_rows()`. This is a
+pacing/checkpoint boundary, not a literal separate CSV file per chunk —
+each row is uploaded individually through the `internetarchive` Python
+library so outcomes are captured per-row. On the Sheet path, `upload
+--chunk-size N` overrides the batch size for that run
+(`SheetUploadRun.chunk_size`, threaded into `chunk_rows()` at the same call
+site `CHUNK_SIZE` used to be read from directly); `--csv` has no
+`--chunk-size` of its own, since `run_rows()`'s chunking has no per-chunk
+Sheet write for a batch size to actually change.
+
+`upload --limit N` (Sheet path only) caps how many *planned* upload targets
+(valid, ready, not already done — `plan_upload_targets()`'s own output) a
+single invocation processes at all, applied before chunking: `--limit 10
+--chunk-size 3` means 10 items total, in batches of 3. It counts targets
+in scope, never raw Sheet rows scanned, and it and `--chunk-size` are both
+recorded in the run's `run_header` log record (below) so a capped or
+rechunked run stays reconstructable later. See `DECISIONS.md`, "`--limit`
+counts planned targets...".
+
+If an upload fails with what `is_rate_limit_error()` recognizes as
+Internet Archive's rate limit, `SheetUploadRun.execute()` stops the whole
+run after confirming whatever it already uploaded in the current chunk (and
+any earlier chunk), rather than treating it as one more per-row failure and
+continuing. This detector is best-effort, not confirmed against a real
+rate-limit response — see `DECISIONS.md`, "Still open".
 
 ## Progress output
 `upload`/`sync-metadata` print a `[position/total] ...` line to stdout
@@ -80,6 +101,21 @@ IA's `derive` task) for anything already present with a matching MD5.
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:
 `{identifier, file, status, error, uploaded_as, live, timestamp}`.
+
+On the Sheet path, `log_run_header()` writes one more record as the log's
+**first** line, before any row result: `{record: "run_header", timestamp,
+project, live, dry_run, sheet_id, collection, files_dir, file_template,
+columns, held_back, required_for_upload, limit, chunk_size}`. `columns`
+and `held_back` come from that run's `ColumnMap` (every header the Sheet
+had, and which were excluded as `(LCPS Internal)`); `required_for_upload`,
+`limit` and `chunk_size` are the readiness/scope/batching rules in effect
+that run. All of these can change between runs even though none of them
+changes per row within one, which is why they are captured once here
+rather than left to be reconstructed later from a Sheet that has since
+moved on. `load_prior_successes()` explicitly skips this record by its
+`record` field (not merely by lacking a `status` key, which would also
+happen to work but for the wrong reason) so it is never mistaken for a
+row result.
 `identifier` is always the real CSV identifier. `uploaded_as` is the
 identifier actually sent to IA for that row (see "Safety rail" below), so
 you can see exactly what landed on the site. `live` records which mode

@@ -716,6 +716,8 @@ def log_run_header(
     column_map: ColumnMap,
     live: bool,
     dry_run: bool,
+    limit: int | None = None,
+    chunk_size: int = CHUNK_SIZE,
 ) -> None:
     """The first line written to a Sheet-path run's log. `head -1 <log>` then
     answers "what did this run send, under what field names, and what did it
@@ -734,6 +736,13 @@ def log_run_header(
     them changes per row within one run, which is why this is written once
     per log rather than being documented once somewhere else.
 
+    `limit` and `chunk_size` (Task 12) round out the same reconstructability
+    goal: a run that stopped after --limit rows, or that used a non-default
+    --chunk-size, cannot be explained later by the rest of this record alone.
+    Both default to "the run's own default" (None / CHUNK_SIZE) so the three
+    tests that call this directly without passing them still get a header
+    that says so explicitly, rather than omitting the fields.
+
     Deliberately excludes anything that isn't safe to keep around in a log
     file indefinitely: no credentials, no tokens, no filesystem paths outside
     the project. `sheet_id` is the one Google identifier here, and it already
@@ -751,6 +760,8 @@ def log_run_header(
         "columns": dict(column_map.field_names),
         "held_back": list(column_map.held_back),
         "required_for_upload": list(config.required_for_upload),
+        "limit": limit,
+        "chunk_size": chunk_size,
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -840,6 +851,48 @@ def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
     if live:
         return identifier
     return f"{TEST_IDENTIFIER_PREFIX}{stamp}-{identifier}"
+
+
+# What this matches, and why it does NOT match on "SlowDown" or "Too Many
+# Requests" text: upload_row() below raises its own RuntimeError, embedding
+# `response.status_code` verbatim, whenever internetarchive.upload() returns
+# a not-ok Response - that is the one representation of an IA failure this
+# codebase constructs itself and can vouch for. 503 is Internet Archive's
+# documented S3 overload signal (see the installed internetarchive 5.10.1's
+# own `ia upload --retries` help text: "Number of times to retry request if
+# S3 returns a 503 SlowDown error", and item.py's upload retry loop, which
+# checks for it by number). 429 is not IA-upload-specific documentation, but
+# session.py's own default urllib3 Retry status_forcelist
+# ([429, 500, 501, 502, 503, 504]) shows the library's authors also treat it
+# as a retryable/rate-limit-adjacent status from this API.
+#
+# What could NOT be verified (no --live run has ever happened, so no real
+# 429/503 response has been captured): tracing item.py's upload_file() shows
+# that on the actual path upload_row() takes (internetarchive.upload() ->
+# Item.upload() -> Item.upload_file()), a failing request raises HTTPError
+# rather than returning a not-ok Response, and the library catches that
+# HTTPError and RE-RAISES it with a message rebuilt from the S3 XML body's
+# <Message>/<Resource> text only (see get_s3_xml_text() in
+# internetarchive/utils.py) - the numeric status code and the S3 <Code>
+# (e.g. "SlowDown") are explicitly discarded in that rewrite. So a live rate
+# limit surfacing through the real library may not contain "429" or "503"
+# anywhere in str(exc), and this detector would not catch it. That is the
+# safe direction to be wrong in: a miss here just logs one more ordinary
+# failure and the run continues, where a false match would wrongly abort a
+# run mid-flight over an unrelated error. See task-12-report.md.
+RATE_LIMIT_STATUS_CODES = ("429", "503")
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(f"status {code}" in message for code in RATE_LIMIT_STATUS_CODES)
+
+
+class RateLimited(Exception):
+    """Raised (from the original exception) only once is_rate_limit_error()
+    has already matched it, so anything that catches RateLimited specifically
+    already knows why: this is the signal to stop the whole run, not to log
+    one more per-row failure and move on to the next target."""
 
 
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
@@ -1675,6 +1728,11 @@ class SheetUploadRun:
     live: bool
     write_back: bool
     log_path: Path
+    # Task 12: overridable per run via --chunk-size (upload_from_sheet reads
+    # the module-level CHUNK_SIZE itself when the flag is absent, so this
+    # still defaults to whatever CHUNK_SIZE is at call time - including a
+    # test's own monkeypatched value).
+    chunk_size: int = CHUNK_SIZE
 
     def execute(self, targets: list[UploadTarget]) -> dict[str, int]:
         """One chunk at a time: verify, reserve, upload, verify, confirm,
@@ -1686,10 +1744,21 @@ class SheetUploadRun:
         run per chunk: the last chunk's reserve write can be hours after the
         read that fixed its row numbers.
 
-        `CHUNK_SIZE` is read here rather than taken as chunk_rows' default so
-        the chunk boundary is reachable in a test - a protocol that is only
-        ever exercised with a single chunk is a protocol nobody has tested."""
-        counts = {"success": 0, "failure": 0, "unconfirmed": 0, "not_attempted": 0}
+        `self.chunk_size` is read here rather than taken as chunk_rows'
+        default so the chunk boundary is reachable in a test - a protocol
+        that is only ever exercised with a single chunk is a protocol nobody
+        has tested. It defaults to CHUNK_SIZE (see the field above) and is
+        overridable per run via --chunk-size.
+
+        A rate-limited row (is_rate_limit_error() matches its exception)
+        stops the run after finishing this chunk's confirm write, rather
+        than being logged as an ordinary failure and moving on to the next
+        target - see RateLimited's docstring. Every row this run already
+        uploaded successfully, in this chunk or an earlier one, is still
+        confirmed before returning: a rate limit must not leave a row
+        RESERVED-but-unconfirmed, which would make tomorrow's run re-upload
+        it under a second identifier."""
+        counts = {"success": 0, "failure": 0, "unconfirmed": 0, "not_attempted": 0, "rate_limited": 0}
         total = len(targets)
         position = 0
         # Targets that already have a verdict of any kind - uploaded, failed, or
@@ -1697,7 +1766,7 @@ class SheetUploadRun:
         # run-stopping problem leaves unattempted, with nothing counted twice.
         settled = 0
 
-        for chunk in chunk_rows(targets, CHUNK_SIZE):
+        for chunk in chunk_rows(targets, self.chunk_size):
             # Every chunk gets a fresh timestamp. One timestamp for the whole
             # run would stamp chunk 20 with the time chunk 1 started, which on
             # a full-collection run is hours wrong.
@@ -1718,6 +1787,7 @@ class SheetUploadRun:
                 working = outcome.ok
 
             succeeded: list[UploadTarget] = []
+            rate_limited = False
             for target in working:
                 position += 1
                 settled += 1
@@ -1730,8 +1800,18 @@ class SheetUploadRun:
                         self.files_dir,
                     )
                 except Exception as exc:
+                    # Wrapping (rather than a bare is_rate_limit_error() check
+                    # here) keeps the detection logic in one place and makes
+                    # the `except RateLimited` below the only thing that can
+                    # stop the run - str(exc) is unchanged either way, so the
+                    # logged message is identical to an ordinary failure's.
+                    if is_rate_limit_error(exc):
+                        exc = RateLimited(str(exc))
                     counts["failure"] += 1
                     self._log(target, "failure", error=str(exc))
+                    if isinstance(exc, RateLimited):
+                        rate_limited = True
+                        break
                     continue
                 counts["success"] += 1
                 self._log(target, "success")
@@ -1751,6 +1831,18 @@ class SheetUploadRun:
                         self._log(target, "unconfirmed", error="the Sheet write failed")
                     counts["not_attempted"] += total - settled
                     return counts
+
+            if rate_limited:
+                attempted = counts["success"] + counts["failure"]
+                counts["not_attempted"] += total - settled
+                counts["rate_limited"] = 1
+                print(
+                    f"stopped: Internet Archive reported a rate limit after "
+                    f"{_pluralize(attempted, 'item')}",
+                    file=sys.stderr,
+                )
+                print(f"{counts['success']} uploaded this run - resume by re-running tomorrow")
+                return counts
 
         return counts
 
@@ -1902,6 +1994,27 @@ def upload_from_csv(args, csv_path: str) -> int:
         print(
             "--write-identifier and --dry-run describe what happens to the project's Sheet, so "
             "they apply to the Sheet path only. Drop --csv to run against the Sheet.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Task 12: --limit and --chunk-size describe SheetUploadRun's own
+    # reserve/upload/confirm batching and quota-stopping behavior, which the
+    # CSV path (a small, hand-prepared file uploaded via run_rows - see this
+    # function's own docstring) does not have. Silently ignoring an explicit
+    # flag on the wrong path is its own trap (see --collection's old "lcps"
+    # default, above), so this is checked the same way --write-identifier and
+    # --dry-run are just above rather than left to do nothing. Only an
+    # explicitly-changed --chunk-size trips this: the default (unset, or
+    # equal to CHUNK_SIZE) is indistinguishable from "the flag was never
+    # passed" and must not block an ordinary --csv run.
+    limit = getattr(args, "limit", None)
+    chunk_size = getattr(args, "chunk_size", None)
+    if limit is not None or (chunk_size is not None and chunk_size != CHUNK_SIZE):
+        print(
+            "--limit and --chunk-size describe the Sheet path's batching and quota-stopping "
+            "behavior, so they apply to the Sheet path only. Drop --csv to run against the "
+            "Sheet.",
             file=sys.stderr,
         )
         return 1
@@ -2146,6 +2259,32 @@ def upload_from_sheet(args) -> int:
         print()
 
     targets = plan_upload_targets(rows, row_results, config, live, source_fingerprints, run_stamp())
+
+    # Task 12: --limit counts PLANNED targets (valid AND ready AND not
+    # already done), not Sheet rows scanned - plan_upload_targets has
+    # already done that filtering above, so slicing its output is what
+    # makes "--limit 100" mean "100 of the rows actually in scope", not
+    # "stop after the first 100 rows read". Numbers were minted for every
+    # pending row before this slice runs (plan_upload_targets mints for the
+    # whole run up front - see its own docstring), but minting is pure
+    # arithmetic with no side effect: a target dropped here is never
+    # reserved, so its number is never spent and next_identifiers() mints it
+    # again next run.
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        targets = targets[:limit]
+
+    # getattr's default is looked up fresh on every call (it is an ordinary
+    # function argument, not a class default evaluated once at import time),
+    # so falling back to the module-level CHUNK_SIZE here - rather than
+    # snapshotting it into make_upload_args()'s Namespace - is what keeps
+    # every existing `monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)` test
+    # working: those tests never set args.chunk_size at all, so this always
+    # sees whatever CHUNK_SIZE is right now.
+    chunk_size = getattr(args, "chunk_size", None)
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
     collection = config.ia_collection if live else TEST_COLLECTION
 
     # `upload` is where something permanent happens, so it shows the same
@@ -2164,7 +2303,7 @@ def upload_from_sheet(args) -> int:
 
     log_path = open_log(args.log_dir, "upload")
     try:
-        log_run_header(log_path, config, column_map, live, dry_run)
+        log_run_header(log_path, config, column_map, live, dry_run, limit=limit, chunk_size=chunk_size)
     except Exception as exc:
         # This record is a receipt for later, not part of the upload itself -
         # a run about to create permanent Internet Archive items must not be
@@ -2187,6 +2326,7 @@ def upload_from_sheet(args) -> int:
         live=live,
         write_back=write_back,
         log_path=log_path,
+        chunk_size=chunk_size,
     ).execute(targets)
 
     print(f"{counts['success']} file(s) uploaded successfully, {counts['failure']} error(s)")
@@ -2313,6 +2453,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
     upload_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped (--csv only)")
+    upload_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Upload at most this many items this run (Sheet path only). Counts rows actually "
+            "in scope to upload - valid AND ready AND not already done - not every row scanned; "
+            "on a Sheet with 2,900 uncatalogued rows and 150 ready ones, --limit 100 uploads 100 "
+            "of the 150 ready rows, not the first 100 rows read. Combines with --chunk-size as "
+            "'this many total, batched this way': --limit 10 --chunk-size 3 uploads 10 items in "
+            "chunks of 3, not 10 chunks of 3."
+        ),
+    )
+    upload_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE,
+        help=(
+            f"Items per reserve/upload/confirm batch (Sheet path only; default {CHUNK_SIZE}, "
+            "Internet Archive's own per-run item cap). Applied to whatever --limit leaves, not "
+            "instead of it - see --limit's help for the exact combination."
+        ),
+    )
 
     sync_parser = subparsers.add_parser("sync-metadata", help="Update metadata on already-uploaded items")
     sync_parser.add_argument("csv", help="Path to the CSV of identifier + changed metadata columns")
