@@ -3591,6 +3591,85 @@ def test_cmd_upload_default_mode_writes_nothing_to_the_sheet_and_only_uploads_pr
     assert client.grid == [list(row) for row in grid]
 
 
+def test_cmd_upload_writes_the_run_header_as_the_first_line_of_the_sheet_path_log(
+    tmp_path, monkeypatch, capsys
+):
+    """The bug this test exists to catch: log_run_header() was implemented
+    and covered by tests that call it directly, but nothing in cmd_upload's
+    Sheet path (upload_from_sheet) ever called it, so no real run wrote one.
+    Driving the real entry point (cmd_upload -> upload_from_sheet, the same
+    path the CLI takes) rather than calling log_run_header() directly is the
+    point - a direct-call test could not have caught this. The header must be
+    line 1, not merely present somewhere in the file, since a resumed run and
+    a human doing `head -1` both depend on that exact position."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    assert len(log_files) == 1
+    lines = log_files[0].read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    header = json.loads(lines[0])
+    assert header["record"] == "run_header"
+    assert header["project"] == "astoriaphotos"
+    assert header["live"] is False
+    assert header["dry_run"] is False
+    assert header["sheet_id"] == "TEST_SHEET_ID"
+    assert header["collection"] == "lcpsociety"
+    assert header["required_for_upload"] == ["title"]
+    assert header["columns"]["Title"] == "title"
+
+    result = json.loads(lines[1])
+    assert result["status"] == "success"
+    assert result["identifier"] == "lcps-astoriaphotos-00001"
+
+
+def test_cmd_upload_survives_a_run_header_write_failure_and_still_uploads(
+    tmp_path, monkeypatch, capsys
+):
+    """The run header is a receipt for later, not part of the upload itself -
+    a disk-full or permissions problem hit while writing it must not stop a
+    run that is about to create permanent Internet Archive items, the same
+    way a Sheet write failing mid-run is reported cleanly rather than left to
+    crash (see SheetUploadRun._write). log_run_header() is monkeypatched to
+    raise, standing in for that failure without needing an actually-unwritable
+    log_dir on every platform this runs on."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(tmp_path, monkeypatch, grid)
+    monkeypatch.setattr(
+        "ia_bulk.log_run_header",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "could not write the run-header record" in captured.err
+    assert "disk full" in captured.err
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
+
+    log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
+    lines = log_files[0].read_text(encoding="utf-8").strip().splitlines()
+    # The header failed to write, so the first (and only) line is the row
+    # result, not a run_header record - proving the failure was swallowed
+    # rather than silently retried or masked.
+    assert len(lines) == 1
+    assert json.loads(lines[0])["status"] == "success"
+
+
 def test_cmd_upload_with_write_identifier_reserves_then_uploads_then_confirms(
     tmp_path, monkeypatch, capsys
 ):
@@ -3883,7 +3962,8 @@ def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
     assert exit_code == 1
 
     log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
-    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    logged = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    entries = [entry for entry in logged if entry.get("record") != "run_header"]
     statuses = {entry["identifier"]: entry["status"] for entry in entries}
     assert statuses["lcps-astoriaphotos-00001"] == "unconfirmed"
     assert statuses["lcps-astoriaphotos-00002"] == "success"
@@ -4331,7 +4411,8 @@ def test_cmd_upload_reports_a_sheets_read_failure_during_verify_instead_of_a_tra
     assert "log written to" in captured.out
 
     log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
-    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    logged = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    entries = [entry for entry in logged if entry.get("record") != "run_header"]
     assert [entry["status"] for entry in entries] == [
         "success",
         "success",
@@ -4524,7 +4605,8 @@ def test_cmd_upload_reports_a_sheets_write_failure_instead_of_a_traceback(
     assert "log written to" in captured.out
 
     log_files = list((tmp_path / "logs").glob("upload-*.jsonl"))
-    entries = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    logged = [json.loads(line) for line in log_files[0].read_text(encoding="utf-8").splitlines()]
+    entries = [entry for entry in logged if entry.get("record") != "run_header"]
     assert [entry["status"] for entry in entries] == ["success", "unconfirmed"]
 
 

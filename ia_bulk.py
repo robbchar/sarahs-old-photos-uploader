@@ -2163,6 +2163,19 @@ def upload_from_sheet(args) -> int:
         return 1 if blocked else 0
 
     log_path = open_log(args.log_dir, "upload")
+    try:
+        log_run_header(log_path, config, column_map, live, dry_run)
+    except Exception as exc:
+        # This record is a receipt for later, not part of the upload itself -
+        # a run about to create permanent Internet Archive items must not be
+        # stopped by a failure to write it. Same reasoning as _write() below:
+        # a clean stderr message, never a traceback in place of the actual
+        # work this command exists to do.
+        print(
+            f"could not write the run-header record to {log_path}: {exc}. Continuing without "
+            "it - this only affects the log's own audit trail, not the upload that follows.",
+            file=sys.stderr,
+        )
     counts = SheetUploadRun(
         client=client,
         columns=columns,
