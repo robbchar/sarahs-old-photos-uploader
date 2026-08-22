@@ -4397,13 +4397,23 @@ def test_a_blank_candidate_is_recorded_as_blank_not_as_an_error(tmp_path):
     assert outcomes.blank == {2: ["folder", "name"]}
 
 
-def test_a_blank_candidate_never_reaches_the_resolver(tmp_path):
+def test_a_blank_filename_never_reaches_the_resolver(tmp_path):
     """The cryptic "matching ''" message must be unreachable, not merely
-    unlikely."""
+    unlikely. Folder present and filename blank is the shape that produced
+    it: pre-change the candidate reached resolve_file() and it complained
+    about matching '', so this asserts errors is EMPTY rather than asserting
+    over an empty collection, which would pass unconditionally.
+
+    The folder has to exist for this to test what it claims - without the
+    mkdir the resolver would fail on the missing folder before it ever got
+    as far as matching a name, and the test would pass for the wrong
+    reason."""
+    (tmp_path / "SOP CD 1").mkdir()
     config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
-    rows = [{"folder": "", "name": ""}]
+    rows = [{"folder": "SOP CD 1", "name": ""}]
     outcomes = resolve_sheet_files(rows, config)
-    assert all("matching ''" not in message for message in outcomes.errors.values())
+    assert outcomes.errors == {}
+    assert outcomes.blank == {2: ["name"]}
 
 
 def test_only_the_blank_cells_are_named(tmp_path):
