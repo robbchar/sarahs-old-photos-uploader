@@ -27,6 +27,8 @@ from ia_bulk import (
     build_sheet_client,
     format_field_receipt,
     format_lifecycle_summary,
+    format_readiness_breakdown,
+    _format_result_lines,
     main,
 )
 from project_config import ProjectConfig
@@ -4709,3 +4711,71 @@ def test_missing_fields_combines_both_of_its_sources_on_one_row(tmp_path):
     rows = [_sheet_row(title="", theme="Townscape", folder="", name="")]
     _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
     assert results[0].missing_fields == ["title", "folder_on_lacie_drive", "file_name"]
+
+
+# --- Task 8: `validate` reporting - not-ready marker + per-field breakdown ---
+#
+# Global-constraint note: the brief's own draft asserted five of these via
+# `"some text" in breakdown` (substring-of-the-whole-blob). Per this plan's
+# exact-assertion rule (a prior review found weakening exact assertions to
+# substrings dropped a mutation's catch rate from 19 to 16), every one of
+# those five is rewritten below as exact LINE membership -
+# `"...exact line..." in breakdown.splitlines()` - derived from the
+# implementation's actual leading whitespace, never a substring check.
+
+
+def test_not_ready_rows_are_marked_in_the_itemised_list():
+    results = [
+        RowValidation(2, "", errors=["no file found …"], missing_fields=["title"]),
+    ]
+    lines = _format_result_lines(results)
+    assert lines[0] == "[FAIL] row 2  (not yet catalogued)"
+
+
+def test_ready_rows_are_not_marked():
+    results = [RowValidation(2, "", errors=["no file found …"])]
+    lines = _format_result_lines(results)
+    assert lines[0] == "[FAIL] row 2"
+
+
+def test_breakdown_counts_a_row_missing_two_fields_in_both():
+    results = [
+        RowValidation(2, "", missing_fields=["title", "theme"]),
+        RowValidation(3, "", missing_fields=["title"]),
+    ]
+    breakdown = format_readiness_breakdown(results)
+    lines = breakdown.splitlines()
+    # Was `assert "2 rows not yet catalogued" in breakdown` (substring of
+    # the whole blob) - rewritten to exact-line membership.
+    assert "2 rows not yet catalogued" in lines
+    # Was `assert "2 missing title" in breakdown` - the real line carries
+    # 4 leading spaces, which a substring check would not have pinned.
+    assert "    2 missing title" in lines
+    # Was `assert "1 missing theme" in breakdown` - same reasoning.
+    assert "    1 missing theme" in lines
+
+
+def test_breakdown_says_the_counts_overlap():
+    results = [RowValidation(2, "", missing_fields=["title", "theme"])]
+    # Was `assert "more than one count" in format_readiness_breakdown(results)`
+    # (substring) - rewritten to the exact overlap-parenthetical line,
+    # including its leading spaces and the row-count it interpolates.
+    lines = format_readiness_breakdown(results).splitlines()
+    assert (
+        "    (a row missing more than one field appears in more than one "
+        "count above, so these do not sum to 1)"
+    ) in lines
+
+
+def test_breakdown_field_list_follows_the_data_not_a_hardcoded_pair():
+    results = [RowValidation(2, "", missing_fields=["photographer_studio"])]
+    # Was `assert "1 missing photographer_studio" in
+    # format_readiness_breakdown(results)` (substring) - rewritten to exact
+    # line membership, proving the field name is read from missing_fields
+    # itself rather than a hardcoded title/theme pair.
+    lines = format_readiness_breakdown(results).splitlines()
+    assert "    1 missing photographer_studio" in lines
+
+
+def test_breakdown_is_empty_when_every_row_is_ready():
+    assert format_readiness_breakdown([RowValidation(2, "")]) == ""

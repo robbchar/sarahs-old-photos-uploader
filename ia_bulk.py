@@ -643,10 +643,56 @@ def _format_result_lines(results: list[RowValidation]) -> list[str]:
         # row number for - "[PASS] row 2 (row 2)" said nothing "[PASS] row 2"
         # didn't already say.
         label = f" {result.identifier}" if result.identifier else ""
-        lines.append(f"[{status}] row {result.row_number}{label}")
+        # A not-ready row (missing_fields non-empty) gets a marker appended
+        # after the label, distinct from the [PASS]/[FAIL] status: readiness
+        # and validity are different questions (see Readiness's docstring),
+        # so a row can be "[FAIL] ... (not yet catalogued)" - broken AND
+        # uncatalogued - without the marker implying the errors below it are
+        # what "not yet catalogued" means.
+        marker = "  (not yet catalogued)" if result.missing_fields else ""
+        lines.append(f"[{status}] row {result.row_number}{label}{marker}")
         for error in result.errors:
             lines.append(f"    - {error}")
     return lines
+
+
+def format_readiness_breakdown(row_results: list[RowValidation]) -> str:
+    """Counts not-ready rows by which field is missing.
+
+    This is the measurement that sizes a planned follow-up tool: a script
+    that fills filenames in from disk. If most not-ready rows are missing
+    only a filename, that script closes most of the gap; if most are
+    missing a title, it barely helps. A single flat "N not yet catalogued"
+    total cannot answer that question - this can.
+
+    The field names come from whatever is actually in each result's
+    missing_fields, not a hardcoded list - so this stays correct when a
+    project's required_for_upload changes, without this function needing to
+    change alongside it.
+
+    The counts OVERLAP - a row missing two fields appears in both of their
+    counts - so the closing parenthetical noting that is load-bearing, not
+    decoration: adjacent numbers are read as a partition (as if they summed
+    to the total above them) unless something says otherwise, and here they
+    don't sum to it."""
+    not_ready = [result for result in row_results if result.missing_fields]
+    if not not_ready:
+        return ""
+
+    counts: dict[str, int] = {}
+    for result in not_ready:
+        for name in result.missing_fields:
+            counts[name] = counts.get(name, 0) + 1
+
+    lines = [f"{_pluralize(len(not_ready), 'row')} not yet catalogued"]
+    for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"    {count} missing {name}")
+    if any(len(result.missing_fields) > 1 for result in not_ready):
+        lines.append(
+            "    (a row missing more than one field appears in more than one count "
+            f"above, so these do not sum to {len(not_ready)})"
+        )
+    return "\n".join(lines)
 
 
 def format_report(results: list[RowValidation]) -> str:
@@ -1135,6 +1181,10 @@ def cmd_validate(args) -> int:
     print(format_field_receipt(column_map))
     print()
     print(format_lifecycle_summary(rows, row_results))
+    breakdown = format_readiness_breakdown(row_results)
+    if breakdown:
+        print()
+        print(breakdown)
     print()
     print("suggestions (advisory - nothing is changed automatically):")
     suggestions = suggest_standard_fields(column_map.uploadable_fields())
