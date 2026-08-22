@@ -73,12 +73,13 @@ before real uploads can pass.
 outside the intended directory. Accepted during review: the CSV is authored by
 the same person running the tool.
 
-## 6. `check_file_exists`'s `is_file()` catch has no test in the suite
+## 6. `check_file_exists`'s `is_file()` catch has no test for the case it exists for
 
 *Found 2026-08-22, during the row-readiness effort — pre-existing, not
-introduced by it.*
+introduced by it. Reasons corrected 2026-08-22 after the claims below were
+checked by running them; the conclusion is unchanged.*
 
-**Severity: latent — protected only by a comment.**
+**Severity: latent — tested generically, untested for its actual purpose.**
 
 `validate_rows`' redundant `is_file()` check (`ia_bulk.py`, inside the
 `if check_file_exists:` block) is documented, in this project's own build
@@ -91,21 +92,41 @@ different mechanism" from the required-columns check nearby and that removing
 it "is a different (and wrong) change" from anything that constant's own
 shrink calls for.
 
-Nothing in the suite exercises that scenario, and nothing references
-`check_file_exists` or asserts on a `"file not found:"` message produced from
-a real, on-disk mismatch — confirmed by grepping `test_ia_bulk.py` during this
-work. The check is therefore protected by a comment alone, which is exactly
-the gap its own warning exists to close: a future refactor that "simplifies"
-away the redundant-looking `is_file()` call would pass the entire suite green.
+The block is **not** untested in general. `test_validate_rows_flags_missing_file`
+drives it through the CSV path with a genuine on-disk mismatch and asserts the
+`"file not found"` message. Deleting the `if check_file_exists:` block outright
+was tried during the 2026-08-22 review: three tests fail
+(`test_validate_rows_flags_missing_file`,
+`test_cmd_validate_returns_one_when_a_row_fails`, and
+`test_cmd_upload_fails_validation_before_touching_network` — the last of which
+then uploads a file that does not exist). A refactor that removed the call
+would not go green.
 
-This is not hypothetical. Earlier in this same row-readiness effort, a
-planning document confidently instructed an implementer working directly
-beside this check to "run the existing test that covers the internal-space
-case" — stated as settled fact. No such test exists; the implementer caught
-the false premise and said so rather than fabricating coverage. A doc
-asserting a right conclusion ("don't touch this check") for a wrong reason
-("here is the test proving it's safe") is not safe to leave standing, because
-the next reader has no way to tell the reason was never checked.
+What *is* uncovered is narrower, and it is the scenario that makes the check
+load-bearing rather than merely redundant: the **Sheet path**, where an
+internal space in a multi-segment folder cell makes the earlier file
+resolution and this later disk re-check disagree. The existing test is a
+generic missing-file case on the CSV path, which the resolver alone would
+already have caught on the Sheet path. So the check's *ordinary* behavior is
+tested; its *reason for existing* is not.
+
+An earlier version of this entry claimed nothing referenced `check_file_exists`
+or asserted that message at all, and that deleting the `is_file()` call "would
+pass the entire suite green". Both were wrong, and the irony is worth stating
+plainly, because the paragraph directly below warns about exactly this: this
+entry reached a right conclusion — the check deserves a test aimed at the case
+it was written for — by a route nobody had run. It has now been run, and the
+conclusion survives on better grounds.
+
+The warning below is unchanged and still stands. Earlier in the same
+row-readiness effort, a planning document confidently instructed an
+implementer working directly beside this check to "run the existing test that
+covers the internal-space case" — stated as settled fact. No test covers that
+case; the implementer caught the false premise and said so rather than
+fabricating coverage. A doc asserting a right conclusion ("don't touch this
+check") for a wrong reason ("here is the test proving it's safe") is not safe
+to leave standing, because the next reader has no way to tell the reason was
+never checked.
 
 Reproducing the underlying scenario is likely platform-specific: the
 originally observed disagreement was Windows-specific (`Path.is_dir()`

@@ -94,8 +94,9 @@ a per-field breakdown instead of listing thousands of identical rows:
 
 2,847 rows not yet catalogued
     2,100 missing title
-      940 missing theme
     1,900 missing file_name
+    1,900 missing folder_on_lacie_drive
+      940 missing theme
     (a row missing more than one field appears in more than one count
      above, so these do not sum to 2,847)
 ```
@@ -108,6 +109,12 @@ of not-ready rows carry no error at all and are never itemized individually,
 only counted in the breakdown above — a flat "N not yet catalogued" total
 can't tell you whether the backlog is mostly missing filenames (automatable)
 or mostly missing titles (it isn't); the per-field counts can.
+
+Both halves of `file_template` appear in that breakdown. This project's is
+`{folder_on_lacie_drive}/{file_name}`, so a row nobody has touched leaves two
+blank cells and is counted once under each — which is why those two counts
+track each other. The lines are ordered by count, highest first, ties broken
+alphabetically.
 
 `upload` deliberately does **not** repeat this breakdown on every run — see
 [`docs/DECISIONS.md`](DECISIONS.md), "A blank cell is not an error". It
@@ -122,7 +129,7 @@ validation) and gives the uncatalogued backlog one contained line instead:
 command still exits non-zero so a partial run is never mistaken for a clean one
 
 2,847 rows not yet catalogued (41 of them also have unresolvable filenames -
-run `validate` to see those)
+run `validate` to see them)
 ```
 
 Only a row that was actually in this run's scope — ready, but broken —
@@ -235,9 +242,20 @@ files in the wrong place under a permanent identifier.
       Sheet, and exited 0** — not a validate of the test Sheet, and not
       yesterday's. See §2; this is the cheapest check on this list and the one
       most likely to find something.
+- [ ] That same run's **"N rows ready to upload (no identifier yet)"** line was
+      read, and N is the number you expect. **Exiting 0 no longer means "every
+      row is ready"** — a Sheet of 2,900 uncatalogued rows exits 0 by design,
+      because a not-ready row is waiting on data entry, not carrying an error.
+      That count, not the exit code, is what tells you this run has the scope
+      you think it has. It is the same set `upload` will plan, so an N that
+      surprises you is worth resolving *before* anything permanent happens.
 - [ ] The `ia` CLI is authenticated as `admin@lcpsociety.org` (`ia whoami`).
-- [ ] The CSV was re-exported from the Sheet today, not reused.
-- [ ] A test run of this exact CSV succeeded and was eyeballed in a browser.
+- [ ] The Sheet is current and saved — the rows you intend to upload were
+      filled in, and no edit is still sitting unsaved or as a pending
+      suggestion. A `--live` run reads the Sheet directly; there is no CSV
+      export step to redo, and nothing local to go stale.
+- [ ] A test run (**no** `--live`) over these same rows succeeded, and at
+      least one resulting `zztest-…` item was eyeballed in a browser.
 - [ ] The batch is under IA's daily limit — **see "Pacing" below, the tool does
       not enforce this.**
 
