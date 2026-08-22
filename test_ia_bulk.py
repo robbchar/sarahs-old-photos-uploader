@@ -4716,6 +4716,29 @@ def test_missing_fields_combines_both_of_its_sources_on_one_row(tmp_path):
     assert results[0].missing_fields == ["title", "folder_on_lacie_drive", "file_name"]
 
 
+def test_a_field_named_by_both_sources_is_listed_once_not_twice(tmp_path):
+    """missing_fields' two sources can name the SAME column. Listing a
+    file_template column in required_for_upload - here ("title",
+    "file_name") - is a natural edit, and check_required_for_upload accepts
+    it because file_name IS a real column in the Sheet. validate_sheet_rows
+    then seeds the name and validate_sheet_grid extends the same name on
+    again from the blank template cells.
+
+    Left duplicated, ONE not-ready row reported "2 missing file_name" - a
+    per-field count larger than the number of rows it counts - and dragged
+    in the overlap parenthetical, which told the operator the counts don't
+    sum when for a single missing field they trivially do. Both halves are
+    pinned: the deduplicated list, and the rendered breakdown as an exact
+    ordered line list so a re-introduced duplicate fails from either side."""
+    rows = [_sheet_row(title="A Title", name="")]
+    _, results = _validate(rows, required_for_upload=("title", "file_name"), tmp_path=tmp_path)
+    assert results[0].missing_fields == ["file_name"]
+    assert format_readiness_breakdown(results).splitlines() == [
+        "1 row not yet catalogued",
+        "    1 missing file_name",
+    ]
+
+
 # --- Task 8: `validate` reporting - not-ready marker + per-field breakdown ---
 #
 # Global-constraint note: the brief's own draft asserted five of these via
@@ -5016,3 +5039,146 @@ def test_cmd_upload_exit_code_ignores_a_not_ready_broken_row_during_a_real_run(
 
     assert exit_code == 0
     assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
+
+
+# --- Final review: not-ready rows must never enter a run's scope ---
+#
+# Task 6 shrank SHEET_REQUIRED_COLUMNS to ("mediatype",), which moved a
+# blank-title / blank-file row from INVALID to VALID + NOT_READY. Task 9
+# taught upload_from_sheet to itemize and exit-code on readiness, but the
+# actual scope filter lives in plan_upload_targets, which filtered on
+# is_valid alone - so ~2,900 uncatalogued rows were still planned and
+# uploaded under permanent, unrenameable identifiers.
+#
+# Every pre-existing upload test kept its not-ready rows ALSO invalid (an
+# unresolvable filename, or an empty files_dir), so none of them could see
+# it. The tests below deliberately use the shape that was missing: a row
+# that is NOT_READY and genuinely VALID, with a real file on disk.
+
+
+def test_plan_upload_targets_skips_a_not_ready_row_that_is_genuinely_valid(tmp_path):
+    """THE regression guard. Blank title, filename resolving to a real file
+    on disk - so is_valid is True and nothing upstream objects - must still
+    produce no target. Before this fix it produced one, and a real
+    photograph would have uploaded under a permanent identifier carrying no
+    title and no theme.
+
+    is_valid is asserted explicitly rather than assumed: if a later change
+    made this row invalid again, the empty-targets assertion would still
+    pass, but for the old reason rather than the one this test exists to
+    pin."""
+    from ia_bulk import plan_upload_targets
+
+    rows = [_sheet_row(title="", theme="Townscape")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].is_valid is True
+    assert results[0].readiness is Readiness.NOT_READY
+
+    targets = plan_upload_targets(
+        rows, results, _sheet_config(), live=False, fingerprints={}, stamp=FIXED_STAMP
+    )
+    assert targets == []
+
+
+def test_plan_upload_targets_skips_a_wholly_uncatalogued_row(tmp_path):
+    """The ~2,900-row case, and the more dangerous of the two: nobody has
+    touched this row at all, so resolve_sheet_files leaves row['file'] as
+    '' - and Path(files_dir) / '' is files_dir ITSELF, which
+    internetarchive uploads recursively. row['file'] is asserted to be
+    blank so the test states plainly why an escaping target here is not
+    merely a wrong item but the entire data tree in one."""
+    from ia_bulk import plan_upload_targets
+
+    rows = [_sheet_row(title="", theme="", folder="", name="")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].is_valid is True
+    assert rows[0]["file"] == ""
+
+    targets = plan_upload_targets(
+        rows, results, _sheet_config(), live=False, fingerprints={}, stamp=FIXED_STAMP
+    )
+    assert targets == []
+
+
+def test_cmd_upload_uploads_nothing_for_a_not_ready_row_whose_file_exists(
+    tmp_path, monkeypatch, capsys
+):
+    """End-to-end counterpart, through cmd_upload with write-back on. The
+    grid's one row has a blank Title (required_for_upload defaults to
+    ["title"]) and names photo1.jpg, which setup_sheet_upload really does
+    create - so this is the valid-but-not-ready shape, not a broken row.
+
+    Asserted as 'the recorded event log holds exactly the one grid read and
+    nothing else' rather than 'no upload of the wrong identifier': the
+    latter still passes if something uploads under an identifier the test
+    did not think to name. recorder.events spans writes as well as uploads,
+    so a reserve write for an out-of-scope row fails this too."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["", "photo1.jpg", "", "", "", ""],
+    ]
+    recorder, _, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg",)
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    output = capsys.readouterr().out
+
+    assert recorder.uploads == []
+    assert recorder.events == [("read", None)]
+    assert exit_code == 0
+    # `upload` reports the row as backlog, never as something it skipped
+    # because of an error - and says so on its own line.
+    assert "1 row not yet catalogued" in output.splitlines()
+
+
+def test_upload_row_refuses_a_blank_file_value(tmp_path, monkeypatch):
+    """Defence in depth, and the reason it is a raise rather than trust in
+    plan_upload_targets: this is the most damaging single call in the
+    system. internetarchive.upload is monkeypatched to blow up rather than
+    merely recorded, so the test proves the refusal happens BEFORE the
+    library is reached, not that the library was called with something
+    harmless."""
+    from ia_bulk import upload_row
+
+    def exploding_upload(*args, **kwargs):
+        raise AssertionError("internetarchive.upload must never be reached for a blank file")
+
+    monkeypatch.setattr(internetarchive, "upload", exploding_upload)
+
+    with pytest.raises(ValueError) as excinfo:
+        upload_row(
+            {"file": "", "title": "A photo", "mediatype": "image"},
+            target_identifier="zztest-lcps-astoriaphotos-00001",
+            collection="test_collection",
+            files_dir=tmp_path,
+        )
+
+    assert str(excinfo.value) == (
+        "upload of 'zztest-lcps-astoriaphotos-00001' refused: the row has no 'file' value, "
+        "and uploading a blank filename would send the entire files_dir recursively into "
+        "one permanent item"
+    )
+
+
+def test_upload_row_refuses_a_whitespace_only_file_value(tmp_path, monkeypatch):
+    """A cell holding a space is not blank to `if not row["file"]`, but it
+    IS blank after .strip() - and it resolves to files_dir just the same.
+    The guard has to read the stripped value, so this pins that it does."""
+    from ia_bulk import upload_row
+
+    monkeypatch.setattr(
+        internetarchive,
+        "upload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not be reached")),
+    )
+
+    with pytest.raises(ValueError):
+        upload_row(
+            {"file": "   ", "title": "A photo"},
+            target_identifier="zztest-lcps-astoriaphotos-00001",
+            collection="test_collection",
+            files_dir=tmp_path,
+        )

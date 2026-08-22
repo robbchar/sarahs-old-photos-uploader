@@ -791,7 +791,23 @@ def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
 
 
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
-    file_path = Path(files_dir) / row["file"].strip()
+    file_name = (row.get("file") or "").strip()
+    if not file_name:
+        # Defence in depth against the single most damaging outcome in this
+        # system. `Path(files_dir) / ""` is files_dir ITSELF, and
+        # internetarchive's Item.upload() iterates a directory argument, so a
+        # blank name would send the whole data tree recursively into one
+        # permanent, unrenameable item. plan_upload_targets already refuses to
+        # plan such a row (it is NOT_READY); this raise makes the path
+        # unreachable by construction rather than by an upstream caller's
+        # discipline. Raising is safe for a run in flight: SheetUploadRun
+        # catches it per row, logs a failure and moves on.
+        raise ValueError(
+            f"upload of '{target_identifier}' refused: the row has no 'file' value, and "
+            "uploading a blank filename would send the entire files_dir recursively into "
+            "one permanent item"
+        )
+    file_path = Path(files_dir) / file_name
     metadata = {
         key: (value or "").strip()
         for key, value in row.items()
@@ -1029,7 +1045,18 @@ def validate_sheet_grid(
         # missing_fields alongside any blank required_for_upload columns
         # validate_sheet_rows already put there, required_for_upload names
         # first - see missing_fields' own ordering note on RowValidation.
-        row_results[row_number - 2].missing_fields.extend(blank_cells)
+        #
+        # De-duplicated (dict.fromkeys preserves that order) because the two
+        # sources can legitimately name the same column: an operator may list
+        # a file_template column in required_for_upload - e.g.
+        # ["title", "file_name"] - and check_required_for_upload accepts it,
+        # because it IS a real column in the Sheet. Left duplicated, one
+        # not-ready row reported "2 missing file_name" and dragged in the
+        # overlap parenthetical that says the counts do not sum.
+        row_result = row_results[row_number - 2]
+        row_result.missing_fields = list(
+            dict.fromkeys(row_result.missing_fields + blank_cells)
+        )
 
     header_results: list[RowValidation] = []
     for entry in structure_results:
@@ -1517,7 +1544,16 @@ def plan_upload_targets(
 
     pending: list[tuple[int, dict[str, str], RowState]] = []
     for offset, (row, result) in enumerate(zip(rows, row_results)):
-        if not result.is_valid:
+        # Scope is valid AND ready - readiness is load-bearing here, not a
+        # nicety. SHEET_REQUIRED_COLUMNS no longer requires `title` or `file`,
+        # so a row nobody has catalogued yet is now perfectly VALID; it is
+        # merely NOT_READY. Filtering on is_valid alone uploaded it under a
+        # permanent, unrenameable identifier with no title - and, because its
+        # `file` is blank, with files_dir itself as the file argument (see the
+        # guard at the top of upload_row). This is also what makes `upload`'s
+        # scope agree with what `validate`'s lifecycle summary calls "ready to
+        # upload"; the two commands must not define that phrase differently.
+        if not result.is_valid or result.readiness is Readiness.NOT_READY:
             continue
         state = classify_row(row)
         if state is RowState.DONE:
