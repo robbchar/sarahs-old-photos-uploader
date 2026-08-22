@@ -8,7 +8,7 @@ from project_config import REQUIRED_KEYS, ConfigError, load_project_config
 REGISTRY = {
     "collection_key": "lcps",
     "projects": {
-        "sarahsoldphotos": {
+        "sarasoldphotos": {
             "description": "Sarah's donated collection",
             "mediatype": "image",
             "ia_collection": "lcpsociety",
@@ -39,7 +39,7 @@ def _registry(**overrides):
 
 
 def test_load_project_config_reads_the_block():
-    config = load_project_config(REGISTRY, "sarahsoldphotos")
+    config = load_project_config(REGISTRY, "sarasoldphotos")
 
     assert config.collection_key == "lcps"
     assert config.mediatype == "image"
@@ -49,7 +49,7 @@ def test_load_project_config_reads_the_block():
 def test_live_and_test_runs_select_different_sheets():
     """The safety rail: there is no flag that can point a live run at the test
     Sheet, or an identifier-writing test run at the real one."""
-    config = load_project_config(REGISTRY, "sarahsoldphotos")
+    config = load_project_config(REGISTRY, "sarasoldphotos")
 
     assert config.sheet_id_for(live=True) == "REAL_SHEET"
     assert config.sheet_id_for(live=False) == "TEST_SHEET"
@@ -74,7 +74,7 @@ def test_identical_sheet_ids_are_rejected():
         "collection_key": "lcps",
         "projects": {
             "p": {
-                **REGISTRY["projects"]["sarahsoldphotos"],
+                **REGISTRY["projects"]["sarasoldphotos"],
                 "sheet_id": "SAME",
                 "test_sheet_id": "SAME",
             }
@@ -88,7 +88,7 @@ def test_identical_sheet_ids_are_rejected():
 def test_missing_collection_key_is_rejected():
     """collection_key is a top-level registry field, not in a project block.
     Missing it should raise ConfigError, not KeyError."""
-    registry = {"projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]}}
+    registry = {"projects": {"p": REGISTRY["projects"]["sarasoldphotos"]}}
 
     with pytest.raises(ConfigError, match="collection_key"):
         load_project_config(registry, "p")
@@ -99,7 +99,7 @@ def test_non_string_collection_key_is_rejected():
     as ConfigError, not silently accepted."""
     registry = {
         "collection_key": 123,
-        "projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]},
+        "projects": {"p": REGISTRY["projects"]["sarasoldphotos"]},
     }
 
     with pytest.raises(ConfigError, match="collection_key.*string"):
@@ -110,7 +110,7 @@ def test_empty_string_collection_key_is_rejected():
     """collection_key must be a non-empty string."""
     registry = {
         "collection_key": "   ",
-        "projects": {"p": REGISTRY["projects"]["sarahsoldphotos"]},
+        "projects": {"p": REGISTRY["projects"]["sarasoldphotos"]},
     }
 
     with pytest.raises(ConfigError, match="collection_key"):
@@ -124,7 +124,7 @@ def test_non_string_project_value_is_rejected():
         "collection_key": "lcps",
         "projects": {
             "p": {
-                **REGISTRY["projects"]["sarahsoldphotos"],
+                **REGISTRY["projects"]["sarasoldphotos"],
                 "mediatype": 42,
             }
         },
@@ -147,7 +147,7 @@ def test_shipped_registry_json_loads_against_the_current_required_keys():
     with open(registry_path) as f:
         registry = json.load(f)
 
-    config = load_project_config(registry, "sarahsoldphotos")
+    config = load_project_config(registry, "sarasoldphotos")
 
     for key in REQUIRED_KEYS:
         assert getattr(config, key), f"shipped registry has an empty '{key}'"
