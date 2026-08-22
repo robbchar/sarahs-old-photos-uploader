@@ -3,6 +3,7 @@ import json
 import csv
 import re
 from argparse import Namespace
+from pathlib import Path
 
 import internetarchive
 import pytest
@@ -14,6 +15,7 @@ from ia_bulk import (
     load_registry,
     check_identifier,
     check_required_for_upload,
+    resolve_sheet_files,
     validate_rows,
     RowValidation,
     Readiness,
@@ -4372,3 +4374,90 @@ def test_every_missing_name_is_reported_not_just_the_first():
     config = _sheet_config(required_for_upload=("titel", "thmee"))
     errors = check_required_for_upload(config, column_map)
     assert len(errors) == 2
+
+
+def _unresolved_message(directory: Path, name: str) -> str:
+    """resolve_file()'s own wording, rebuilt here so the tests below can
+    assert the message character-for-character instead of settling for a
+    substring. The message embeds an absolute path that varies with
+    tmp_path, which is the only reason it has to be interpolated rather
+    than written out literally - `.resolve()` because that is what
+    resolve_file() itself formats into the message."""
+    return (
+        f"no file found in '{directory.resolve()}' matching '{name}' (looked for an "
+        "exact filename match, then a case-insensitive match ignoring extension)"
+    )
+
+
+def test_a_blank_candidate_is_recorded_as_blank_not_as_an_error(tmp_path):
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [{"folder": "", "name": ""}]
+    outcomes = resolve_sheet_files(rows, config)
+    assert outcomes.errors == {}
+    assert outcomes.blank == {2: ["folder", "name"]}
+
+
+def test_a_blank_candidate_never_reaches_the_resolver(tmp_path):
+    """The cryptic "matching ''" message must be unreachable, not merely
+    unlikely."""
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [{"folder": "", "name": ""}]
+    outcomes = resolve_sheet_files(rows, config)
+    assert all("matching ''" not in message for message in outcomes.errors.values())
+
+
+def test_only_the_blank_cells_are_named(tmp_path):
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [{"folder": "SOP CD 1", "name": ""}]
+    outcomes = resolve_sheet_files(rows, config)
+    assert outcomes.blank == {2: ["name"]}
+
+
+def test_a_present_candidate_that_does_not_resolve_is_an_error_not_blank(tmp_path):
+    """THE reclassification guard. A broken row silently downgraded to
+    not-ready is a row nobody ever fixes."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [{"folder": "SOP CD 1", "name": "Finnis Meat Market.jpg"}]
+    outcomes = resolve_sheet_files(rows, config)
+    assert outcomes.blank == {}
+    assert 2 in outcomes.errors
+    assert outcomes.errors[2] == _unresolved_message(folder, "Finnis Meat Market.jpg")
+
+
+def test_a_broken_filename_stays_an_error_even_beside_a_genuinely_blank_row(tmp_path):
+    """Both errors here are real rows from a rehearsal against the actual
+    drive: 'Finnis' for 'Finnish' (a typo in the Sheet) and "Roy's" for
+    'Roy_s' (the apostrophe sanitized away when the files were copied).
+    Each names a file the operator believes exists, so each is a defect to
+    fix - and neither may be filed as "nobody has got to this row yet"
+    just because the blank row 2 in the same run legitimately is.
+
+    Run together on purpose: the reclassification failure is a routing
+    bug, and routing is only observable when both destinations are in
+    play at once. Exact dict equality on BOTH buckets, so a row leaking
+    from one to the other fails the assertion from either side."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    (folder / "Roy_s Shell.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "", "name": ""},
+        {"folder": "SOP CD 1", "name": "Finnis Meat Market.jpg"},
+        {"folder": "SOP CD 1", "name": "Roy's Shell.jpg"},
+    ]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.blank == {2: ["folder", "name"]}
+    assert outcomes.errors == {
+        3: _unresolved_message(folder, "Finnis Meat Market.jpg"),
+        4: _unresolved_message(folder, "Roy's Shell.jpg"),
+    }
+    # The unverified candidate must not survive as row['file'] for ANY
+    # failing row, blank or broken - left in place it would resolve as a
+    # literal path for the later disk check and mask the failure.
+    assert [row["file"] for row in rows] == ["", "", ""]

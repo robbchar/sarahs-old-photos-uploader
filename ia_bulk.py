@@ -32,6 +32,7 @@ from column_map import (
     check_grid_shape,
     grid_to_rows,
     resolve_file,
+    template_fields,
 )
 from ia_fields import suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers
@@ -775,37 +776,69 @@ def build_sheet_client(config: ProjectConfig, live: bool) -> SheetClient:
     return SheetClient(service, config.sheet_id_for(live), config.sheet_tab)
 
 
-def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> dict[int, str]:
+@dataclass(frozen=True)
+class FileOutcomes:
+    """Two distinct failures that used to be one. `errors` are rows that
+    asserted a file and were wrong; `blank` are rows that asserted nothing.
+    Kept apart HERE because resolve_sheet_files blanks row['file'] on
+    failure, so nothing downstream can tell them apart afterwards."""
+
+    errors: dict[int, str]
+    blank: dict[int, list[str]]
+
+
+def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileOutcomes:
     """Resolves each row's file against disk BEFORE validation runs, so a row
     either carries a real, disk-verified 'file' value (and the resolved name,
     which may differ from what the Sheet cell says - see resolve_file() - also
-    becomes 'ia_identifier_bib') or is recorded here with the resolver's own
-    message. Returns row_number -> message for the rows that failed.
+    becomes 'ia_identifier_bib') or is recorded here as one of two DIFFERENT
+    outcomes: a row that named a file and was wrong (`errors`, carrying the
+    resolver's own message), or a row that named nothing at all (`blank`,
+    carrying which of file_template's cells are empty).
+
+    Splitting the two here is the whole point. Below, on failure, the Sheet
+    cell's raw, UNVERIFIED candidate must not survive as row['file'] - left in
+    place it would coincidentally resolve as a literal path for the later disk
+    check (or for an upload), silently masking the fact that resolution never
+    actually confirmed this file exists. The cost of that blanking is that
+    afterwards a row nobody filled in and a row with a typo'd filename are
+    indistinguishable, both being row['file'] == "". This function is the last
+    place the candidate still exists, so it is the only place the distinction
+    can be drawn - and drawing it matters in one direction especially: a
+    broken row misfiled as blank is downgraded from "fix me" to "nobody has
+    got to it yet", which is how it stops ever being fixed.
 
     Shared by `validate` and `upload` deliberately: the value `upload` records
     in `ia_identifier_bib` has to be the same resolved name `validate` showed
-    the operator, and two copies of this loop would eventually disagree.
-
-    On failure the Sheet cell's raw, UNVERIFIED candidate must not survive as
-    row['file'] - left in place it would coincidentally resolve as a literal
-    path for the later disk check (or for an upload), silently masking the
-    fact that resolution never actually confirmed this file exists."""
+    the operator, and two copies of this loop would eventually disagree."""
     listing_cache: dict[Path, list[str]] = {}
-    file_resolution_errors: dict[int, str] = {}
+    errors: dict[int, str] = {}
+    blank: dict[int, list[str]] = {}
+    fields = template_fields(config.file_template)
 
     for offset, row in enumerate(rows):
         row_number = offset + 2  # header is row 1
+
+        blank_cells = [name for name in fields if not (row.get(name) or "").strip()]
+        if blank_cells:
+            # Nobody asserted a file here, so there is nothing to be wrong.
+            # Returning before resolve_file() is what makes the old
+            # "matching ''" message unreachable rather than merely rare.
+            blank[row_number] = blank_cells
+            row["file"] = ""
+            continue
+
         candidate = candidate_path(config.file_template, row)
         try:
             resolved = resolve_file(config.files_dir, candidate, listing_cache)
         except FileResolutionError as exc:
-            file_resolution_errors[row_number] = str(exc)
+            errors[row_number] = str(exc)
             row["file"] = ""
             continue
         row["file"] = resolved
         row[IA_IDENTIFIER_BIB_COLUMN] = resolved
 
-    return file_resolution_errors
+    return FileOutcomes(errors=errors, blank=blank)
 
 
 def validate_sheet_grid(
@@ -982,9 +1015,9 @@ def cmd_validate(args) -> int:
     # See docs/DECISIONS.md, "A file is found by resolution, not by
     # constructing a path". `upload` runs the identical two steps, so the
     # value it records in ia_identifier_bib is the one shown here.
-    file_resolution_errors = resolve_sheet_files(rows, config)
+    file_outcomes = resolve_sheet_files(rows, config)
     header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_resolution_errors
+        rows, registry, config, structure_results, file_outcomes.errors
     )
 
     results = header_results + row_results
@@ -1807,9 +1840,9 @@ def upload_from_sheet(args) -> int:
     # what every later mid-run-edit check compares against.
     source_fingerprints = sheet_row_fingerprints(rows, config.file_template)
 
-    file_resolution_errors = resolve_sheet_files(rows, config)
+    file_outcomes = resolve_sheet_files(rows, config)
     header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_resolution_errors
+        rows, registry, config, structure_results, file_outcomes.errors
     )
 
     if header_results:
