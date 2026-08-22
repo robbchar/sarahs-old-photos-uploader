@@ -12,15 +12,23 @@ and several things below have never been exercised against production.
 ## The pipeline
 
 ```
-Google Sheet  →  raw CSV export  →  hand-prepared CSV  →  validate  →  upload  →  sync-metadata
-                                    (see CSV-PREPARATION.md)         (test)     (corrections)
-                                                                        ↓
-                                                                   upload --live
+Google Sheet (read live)  →  validate  →  upload  →  sync-metadata
+                                             (test)     (corrections)
+                                                ↓
+                                          upload --live
+
+offline / dry-run fallback:
+Google Sheet  →  raw CSV export  →  hand-prepared CSV  →  validate/upload --csv
+                                    (see CSV-PREPARATION.md)
 ```
 
-The Sheet is the source of truth. A local CSV is a snapshot and goes stale the
-moment someone edits the Sheet — re-export deliberately before every run
-rather than reusing yesterday's file.
+The Sheet is the source of truth, and `validate`/`upload` read it directly
+over the Google Sheets API — see [`docs/DECISIONS.md`](DECISIONS.md), "The
+Sheet is read live; the CSV becomes the offline path". A hand-prepared CSV
+export (`--csv`) is a deliberate fallback for offline and dry-run work, not
+the normal route: it is a snapshot that goes stale the moment someone edits
+the Sheet, so treat one as disposable and re-export before trusting it rather
+than reusing yesterday's file.
 
 ## 1. Prepare the CSV
 
@@ -52,11 +60,77 @@ Exits `0` if every row passes, `1` otherwise. On the Sheet path `--live`
 only chooses *which* Sheet is read; it never makes this command write or
 upload anything.
 
-Checks per row: required columns present (`mediatype`, `title`, `file` on the
-Sheet path; `identifier` too on the CSV path), identifiers match
-`COLLECTIONKEY-PROJECTID-NUMBER` and are registered in
-`projects_registry.json`, identifiers are unique, and the row's file resolves
-to a real file on disk.
+Checks per row, Sheet path: `mediatype` is structurally required (it's
+injected from the registry, so a blank one means the registry is wrong, not
+the Sheet); each row's file is resolved against `files_dir` using
+`file_template`; and, when present, `ia_identifier` matches
+`COLLECTIONKEY-PROJECTID-NUMBER`, is registered in `projects_registry.json`,
+and is unique. CSV path, unchanged: `identifier`, `file`, `mediatype`, and
+`title` are all required and non-empty.
+
+A human-filled field that is simply blank — no title yet, no filename yet —
+is *not* an error on the Sheet path. It marks the row **not ready**, a
+different question from whether the row is valid; see
+[`docs/DECISIONS.md`](DECISIONS.md), "A blank cell is not an error". Which
+fields count is the project's `required_for_upload` list in
+`projects_registry.json` — normalized column names, e.g. `["title",
+"theme"]` — plus the file-resolution outcome. The registry key is required
+with no default, and every name in it is checked against the Sheet's actual
+headers at startup, so a typo (`"titel"` for `"title"`) fails loudly instead
+of quietly marking every row not-ready forever.
+
+`validate`'s report marks a not-ready row inline, and rolls the rest up into
+a per-field breakdown instead of listing thousands of identical rows:
+
+```
+[FAIL] row 7
+    - no file found in '...' matching 'CD 1 01 53 34 2 Finnis Meat Market.jpg' (...)
+[FAIL] row 41  (not yet catalogued)
+    - no file found in '...' matching 'CD 1 02 11 38 4 Sunfower Dairy.jpg' (...)
+
+2,898/2,900 rows passed
+
+...
+
+2,847 rows not yet catalogued
+    2,100 missing title
+      940 missing theme
+    1,900 missing file_name
+    (a row missing more than one field appears in more than one count
+     above, so these do not sum to 2,847)
+```
+
+Row 7 is genuinely broken (a filename that doesn't resolve) and is itemized
+regardless of readiness. Row 41 carries the `(not yet catalogued)` marker
+*and* an error — readiness and validity are different questions about the
+same row, not alternatives, so both can be true at once. The great majority
+of not-ready rows carry no error at all and are never itemized individually,
+only counted in the breakdown above — a flat "N not yet catalogued" total
+can't tell you whether the backlog is mostly missing filenames (automatable)
+or mostly missing titles (it isn't); the per-field counts can.
+
+`upload` deliberately does **not** repeat this breakdown on every run — see
+[`docs/DECISIONS.md`](DECISIONS.md), "A blank cell is not an error". It
+itemizes only the rows it would otherwise have uploaded (ready, but failing
+validation) and gives the uncatalogued backlog one contained line instead:
+
+```
+[FAIL] row 7
+    - no file found in '...' matching 'CD 1 01 53 34 2 Finnis Meat Market.jpg' (...)
+
+1 row failed validation and will be skipped; the rest are uploaded, and this
+command still exits non-zero so a partial run is never mistaken for a clean one
+
+2,847 rows not yet catalogued (41 of them also have unresolvable filenames -
+run `validate` to see those)
+```
+
+Only a row that was actually in this run's scope — ready, but broken —
+affects `upload`'s exit code. A not-ready row was never going to be uploaded
+regardless, so it does not flip the exit code; if it did, `upload` would
+return non-zero on every run until all ~2,900 uncatalogued rows are filled
+in, which trains an operator to stop trusting the exit code at all. See §3
+below for `upload`'s modes.
 
 It also prints a **field receipt** — every metadata field name the run would
 create, plus the columns held back as `(LCPS Internal)`. Read it. This receipt
@@ -136,11 +210,25 @@ python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files
 Nothing on this list is validated automatically. A wrong value here puts real
 files in the wrong place under a permanent identifier.
 
-- [ ] `projects_registry.json` → `collection_key` matches LCPS's real IA
-      collection identifier. Currently `"lcps"`, **never confirmed against IA.**
-- [ ] `--collection` matches that same real collection. Defaults to `"lcps"`,
-      and **nothing validates it** — a wrong value pushes real files to the
-      wrong collection and reports success.
+- [ ] `projects_registry.json` → `collection_key` (currently `"lcps"`) is the
+      first segment of every identifier this tool mints
+      (`lcps-sarahsoldphotos-00001`). `check_identifier` already refuses any
+      row whose identifier prefix doesn't match this value — but the value
+      itself has **never been confirmed** against how LCPS actually names its
+      collection. This is a different thing from the IA collection uploads
+      land in; see the next item.
+- [ ] `projects_registry.json` → `ia_collection` (currently
+      `"lcpsdigitalcollection"`) is the actual Internet Archive collection
+      `upload --live` uploads into on the Sheet path — taken from the
+      registry automatically, never from a `--collection` flag there.
+      **Do not confuse this with `collection_key` above; they are unrelated
+      values.** `--collection` no longer has a `"lcps"` default: passing it
+      on the Sheet path is now a hard error (the registry's `ia_collection` is
+      the only source), and on the `--csv --live` path it is required with no
+      default, refusing to run rather than guessing. What nothing in this
+      tool does is confirm `ia_collection` **exists on archive.org** — that
+      confirmation has to happen by hand, once, before the first `--live`
+      run.
 - [ ] `validate --project <id> --live` was run **today, against the real
       Sheet, and exited 0** — not a validate of the test Sheet, and not
       yesterday's. See §2; this is the cheapest check on this list and the one

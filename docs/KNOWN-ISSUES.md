@@ -73,6 +73,49 @@ before real uploads can pass.
 outside the intended directory. Accepted during review: the CSV is authored by
 the same person running the tool.
 
+## 6. `check_file_exists`'s `is_file()` catch has no test in the suite
+
+*Found 2026-08-22, during the row-readiness effort — pre-existing, not
+introduced by it.*
+
+**Severity: latent — protected only by a comment.**
+
+`validate_rows`' redundant `is_file()` check (`ia_bulk.py`, inside the
+`if check_file_exists:` block) is documented, in this project's own build
+history, as load-bearing: it is what catches an internal space in a
+multi-segment folder cell that `resolve()` normalizes away, when the Sheet
+path's earlier file resolution and this later disk re-check disagree. It
+looks like a purely decorative, redundant safety net and is not — the comment
+above `SHEET_REQUIRED_COLUMNS` already warns that this is "a completely
+different mechanism" from the required-columns check nearby and that removing
+it "is a different (and wrong) change" from anything that constant's own
+shrink calls for.
+
+Nothing in the suite exercises that scenario, and nothing references
+`check_file_exists` or asserts on a `"file not found:"` message produced from
+a real, on-disk mismatch — confirmed by grepping `test_ia_bulk.py` during this
+work. The check is therefore protected by a comment alone, which is exactly
+the gap its own warning exists to close: a future refactor that "simplifies"
+away the redundant-looking `is_file()` call would pass the entire suite green.
+
+This is not hypothetical. Earlier in this same row-readiness effort, a
+planning document confidently instructed an implementer working directly
+beside this check to "run the existing test that covers the internal-space
+case" — stated as settled fact. No such test exists; the implementer caught
+the false premise and said so rather than fabricating coverage. A doc
+asserting a right conclusion ("don't touch this check") for a wrong reason
+("here is the test proving it's safe") is not safe to leave standing, because
+the next reader has no way to tell the reason was never checked.
+
+Reproducing the underlying scenario is likely platform-specific: the
+originally observed disagreement was Windows-specific (`Path.is_dir()`
+normalizing away a trailing space that `Path.iterdir()` on the same path does
+not), so a fixture built on a different OS may not reproduce it at all — which
+is itself part of why no test exists yet.
+
+**Mitigation today:** none — this is a test-coverage gap, not a behavior
+change. Recorded here so it is not lost the next time this file is reviewed.
+
 ## Fixed
 
 ### `validate` passed CSVs whose metadata was silently misaligned

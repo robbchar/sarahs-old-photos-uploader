@@ -30,6 +30,38 @@ Identifiers are permanent once uploaded — never reused, never renamed.
 Original filenames/donor folder structure are NOT part of the identifier;
 they go in the `identifier-bib` metadata field instead.
 
+## Project registry
+
+Everything technical about a project — the target IA collection, where its
+files live, how a row's file path is built, and which fields a human must
+fill in before a row can upload — lives in `projects_registry.json`, never on
+the command line. See [`docs/DECISIONS.md`](docs/DECISIONS.md), "Technical
+configuration lives in the registry, not the command line".
+
+```json
+{
+  "collection_key": "lcps",
+  "projects": {
+    "photosexample": {
+      "mediatype": "image",
+      "ia_collection": "lcpsdigitalcollection",
+      "sheet_id": "...",
+      "test_sheet_id": "...",
+      "sheet_tab": "TestSheet",
+      "files_dir": "./data",
+      "file_template": "{folder_on_lacie_drive}/{file_name}",
+      "required_for_upload": ["title", "theme"]
+    }
+  }
+}
+```
+
+`required_for_upload` names the normalized columns (not raw Sheet header
+text) a human must fill in before a row is ready to upload — a blank one
+marks the row not-ready rather than invalid, and a typo in this list is a
+hard startup error rather than a silent no-op. See
+[`docs/DECISIONS.md`](docs/DECISIONS.md), "A blank cell is not an error".
+
 ## Setup
 ```bash
 pip install -r requirements.txt

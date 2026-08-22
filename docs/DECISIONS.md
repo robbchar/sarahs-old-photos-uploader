@@ -428,6 +428,74 @@ This is not only tidiness. The surviving test item
 misspelled, permanently. A header typo ships once per batch; a generated field
 name cannot.
 
+## A blank cell is not an error
+
+*Decided 2026-08-22.* The real Sheet has roughly 3,000 rows: about 2,900 carry
+no metadata at all, around 100 are partly filled, and roughly 25 are complete.
+Running `validate --live` against it buried the ~150–300 rows with a genuine,
+fixable problem under nearly 2,900 identical "missing required column" errors
+from rows nobody had touched yet — a nine-row rehearsal the day before showed
+the same failure in miniature: three rows failed, in two genuinely different
+ways, all reported identically.
+
+**Blank means not-ready; present-but-wrong means invalid, regardless of which
+field.** The governing principle: the tool only complains about assertions
+someone actually made. Silence about a field is not an error; a wrong value in
+it is. `RowValidation` carries this as `readiness`, a property derived from a
+new `missing_fields` list rather than a second stored field — one source of
+truth, so the two can never drift apart. Readiness is orthogonal to `is_valid`,
+not a replacement for it: a row can be not-ready *and* carrying errors at once
+(an uncatalogued row whose filename also happens to be a typo).
+
+**`validate` is loud and owns the data; `upload` is quiet and owns the run.**
+`validate` itemizes every row carrying a broken assertion, ready or not, and
+adds a per-field breakdown of the uncatalogued backlog. `upload` itemizes only
+the rows it would otherwise have uploaded — ready rows that fail validation —
+and gives the rest one line pointing back at `validate`, because a not-ready
+row was never in this run's scope to begin with. The same reasoning settles
+`upload`'s exit code: only a row that was actually in scope and failed flips
+it. If an uncatalogued row did too, `upload` would return non-zero on every
+run until all ~2,900 rows are filled in, which trains an operator to stop
+trusting the exit code at all — `validate` is where that signal belongs.
+
+**Test and live apply identical readiness rules.** No lowered bar for the test
+Sheet, no opt-in flag to loosen it. Low-quality test *data* belongs in the test
+Sheet, which the operator already controls; a lowered *rule* would mean a
+green rehearsal no longer predicts a green live run. This generalizes "Test
+identifiers carry a per-run stamp" above: a rehearsal that behaves differently
+from the real thing is not a rehearsal.
+
+**Readiness is a field on the validation result, not a new `RowState`
+member.** `RowState` (`UNASSIGNED`/`RESERVED`/`DONE`) answers "has this row
+been minted and uploaded"; readiness answers "has a person filled it in". A
+not-ready row *is* `RowState.UNASSIGNED` — the two are different questions
+about the same row, not alternative states of it. A fourth `RowState` member
+would have broken the invariant `plan_upload_targets` relies on, that every
+row is exactly one of the three.
+
+**Where the distinction is made, and why it must stay there.**
+`resolve_sheet_files` deliberately blanks `row["file"]` when resolution fails,
+so an unverified candidate can never survive to be mistaken for a real path
+later. The cost is that afterward a blank row and a broken row are
+indistinguishable — both are `row["file"] == ""`. Any readiness check reading
+`row["file"]` at that point would misclassify a broken row (a typo'd filename)
+as not-ready, and that misclassification runs in the one direction that
+matters: a broken row demoted to "nobody has got to it yet" is a row nobody
+ever fixes. So classification happens earlier, at candidate construction
+inside `resolve_sheet_files` itself — the last point the raw candidate still
+exists: a blank or whitespace-only candidate is recorded not-ready before the
+resolver is ever called; a non-blank candidate that fails to resolve is a real
+error, exactly as before.
+
+**The partially-filled row.** A row with a blank folder cell but a filled-in
+filename cell (or the reverse) routes to not-ready, naming only the specific
+blank cell — not lumped in with a row nobody has touched at all. The operator
+did assert a filename; the folder cell is simply a question not yet answered,
+and a blank cell is a not-yet-answered question, not a wrong answer. The
+per-field breakdown (`format_readiness_breakdown`) is what surfaces that
+distinction to an operator deciding what to work on next, rather than folding
+it into one flat, unhelpful total.
+
 ## Still open
 
 - `collection_key` and the real IA collection have never been confirmed against
