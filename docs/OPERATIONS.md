@@ -228,7 +228,9 @@ files in the wrong place under a permanent identifier.
       default, refusing to run rather than guessing. What nothing in this
       tool does is confirm `ia_collection` **exists on archive.org** — that
       confirmation has to happen by hand, once, before the first `--live`
-      run.
+      run. **Done 2026-08-22**: `archive.org/details/lcpsdigitalcollection`
+      was checked by hand and the collection exists. Re-check only if the
+      registry value changes.
 - [ ] `validate --project <id> --live` was run **today, against the real
       Sheet, and exited 0** — not a validate of the test Sheet, and not
       yesterday's. See §2; this is the cheapest check on this list and the one

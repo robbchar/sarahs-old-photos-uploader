@@ -498,8 +498,17 @@ it into one flat, unhelpful total.
 
 ## Still open
 
-- `collection_key` and the real IA collection have never been confirmed against
-  LCPS. No `--live` run has ever been made. This is now the main live blocker.
+- `collection_key` (currently `"lcps"`, the first segment of every minted
+  identifier) has never been confirmed against how LCPS actually names its
+  collection. No `--live` run has ever been made.
+  **Not to be confused with `ia_collection`** — see below; they are unrelated
+  values and only one of them is now settled.
+- ~~The real IA collection has never been confirmed~~ **Settled 2026-08-22**:
+  `ia_collection` is `lcpsdigitalcollection`, confirmed by hand against
+  `archive.org/details/lcpsdigitalcollection`. Nothing in this tool checks
+  that a collection exists, so this was and remains a manual, one-time
+  verification; it is recorded here because the next person to read the
+  pre-live checklist should not have to redo it.
 - Whether IA emits a distinguishable signal at its 5,000/day cap, as opposed to
   generic throttling. `--limit` covers the case where it does not.
 - ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:
