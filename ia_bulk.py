@@ -2017,14 +2017,44 @@ def upload_from_sheet(args) -> int:
         )
         return 1
 
-    skipped = [result for result in row_results if not result.is_valid]
-    if skipped:
-        print("\n".join(_format_result_lines(skipped)))
+    # `upload` owns the run, not the data: it itemizes only rows it would
+    # otherwise have uploaded (`blocked` - ready, but invalid) and gives one
+    # contained line for the rest (`not_ready` - never yet catalogued, so
+    # never in this run's scope to begin with). `validate` owns the
+    # per-field breakdown of the backlog - repeating it here would make
+    # `upload` loud about the ~2,900 uncatalogued rows on every single run,
+    # which is the exact noise this split exists to stop.
+    blocked = [
+        result
+        for result in row_results
+        if not result.is_valid and result.readiness is Readiness.READY
+    ]
+    not_ready = [result for result in row_results if result.readiness is Readiness.NOT_READY]
+    not_ready_broken = [result for result in not_ready if not result.is_valid]
+
+    if blocked:
+        print("\n".join(_format_result_lines(blocked)))
         print(
-            f"{_pluralize(len(skipped), 'row')} failed validation and will be skipped; the rest "
+            f"{_pluralize(len(blocked), 'row')} failed validation and will be skipped; the rest "
             "are uploaded, and this command still exits non-zero so a partial run is never "
             "mistaken for a clean one"
         )
+    if not_ready:
+        # The sub-count is deliberately CONTAINED inside the not-ready
+        # sentence - in parentheses, mid-sentence - rather than printed as
+        # a second number beside it: two adjacent numbers read as a
+        # partition (as if they summed to something) unless something says
+        # otherwise, and a not-ready-and-broken row is a SUBSET of the
+        # not-ready total, not a disjoint group next to it.
+        line = f"{_pluralize(len(not_ready), 'row')} not yet catalogued"
+        if not_ready_broken:
+            verb = "has" if len(not_ready_broken) == 1 else "have"
+            line += (
+                f" ({len(not_ready_broken)} of them also {verb} an unresolvable "
+                "filename - run `validate` to see them)"
+            )
+        print(line)
+    if blocked or not_ready:
         print()
 
     targets = plan_upload_targets(rows, row_results, config, live, source_fingerprints, run_stamp())
@@ -2038,11 +2068,11 @@ def upload_from_sheet(args) -> int:
 
     if dry_run:
         print_dry_run(targets, columns, write_back, upload_timestamp())
-        return 1 if skipped else 0
+        return 1 if blocked else 0
 
     if not targets:
         print("nothing to upload - every valid row is already marked uploaded")
-        return 1 if skipped else 0
+        return 1 if blocked else 0
 
     log_path = open_log(args.log_dir, "upload")
     counts = SheetUploadRun(
@@ -2069,12 +2099,12 @@ def upload_from_sheet(args) -> int:
             f"{_pluralize(counts['not_attempted'], 'row')} not attempted - the run stopped early; "
             "see the reason on stderr above"
         )
-    if skipped:
-        print(f"{_pluralize(len(skipped), 'row')} skipped (failed validation)")
+    if blocked:
+        print(f"{_pluralize(len(blocked), 'row')} skipped (failed validation)")
     print(f"log written to {log_path}")
     return (
         1
-        if (counts["failure"] or counts["unconfirmed"] or counts["not_attempted"] or skipped)
+        if (counts["failure"] or counts["unconfirmed"] or counts["not_attempted"] or blocked)
         else 0
     )
 

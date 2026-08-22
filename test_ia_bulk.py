@@ -1,7 +1,10 @@
+import contextlib
 import dataclasses
+import io
 import json
 import csv
 import re
+import tempfile
 from argparse import Namespace
 from pathlib import Path
 
@@ -4837,3 +4840,179 @@ def test_breakdown_uses_the_singular_header_for_one_not_ready_row():
         [RowValidation(2, "", missing_fields=["title"])]
     ).splitlines()
     assert lines == ["1 row not yet catalogued", "    1 missing title"]
+
+
+# --- Task 9: `upload` reporting and exit code ---
+#
+# `validate` owns the data (the per-field breakdown of the ~2,900-row
+# backlog); `upload` owns the run. These tests pin the split: `upload`
+# itemizes only rows it would otherwise have uploaded (`blocked` - ready,
+# but invalid), gives one contained line for the rest (`not_ready`), and -
+# the point of this task - never lets a not-ready row affect the exit code.
+# A not-ready row was never in this run's scope to begin with, so counting
+# it against the exit code would return 1 on every run for months until all
+# ~3,000 rows are catalogued, training the operator to ignore the exit code
+# entirely.
+#
+# Global-constraint note: the brief's own draft asserted two of these
+# against captured multi-line stdout with `"..." in output` (substring-of-
+# the-whole-blob) - one of them a *truncated* line, which would pass even if
+# the untranscribed rest of the line were wrong. Both are rewritten below to
+# exact line membership via `.splitlines()`.
+
+
+def _run_upload_and_capture(
+    rows: list[dict[str, str]],
+    required_for_upload: tuple[str, ...] = ("title", "theme"),
+) -> tuple[str, int]:
+    """Runs `upload` end-to-end against an in-memory grid built from
+    _sheet_row rows, for the report-shape/exit-code tests below. Every row
+    these tests exercise is either genuinely broken (an unresolvable
+    filename) or not-ready (a blank title/theme) or both, so
+    plan_upload_targets() never returns a real target and no network call -
+    not even upload_row - is ever reached. build_sheet_client is
+    monkeypatched anyway, as the single seam every other Sheet-path test
+    replaces, so a bug that DID produce a target still could not reach past
+    it onto a real credential lookup.
+
+    stdout is captured via redirect_stdout rather than the capsys fixture:
+    these tests take no fixtures at all (matching the brief's own
+    signatures), so the helper has to do its own capturing."""
+    from ia_bulk import cmd_upload
+
+    headers = [
+        "mediatype",
+        "title",
+        "theme",
+        "folder_on_lacie_drive",
+        "file_name",
+        "ia_identifier",
+        "ia_uploaded",
+        "ia_url",
+        "ia_identifier_bib",
+    ]
+    grid = [headers] + [[row.get(header, "") for header in headers] for row in rows]
+
+    with tempfile.TemporaryDirectory() as files_dir:
+        registry = make_sheet_registry(
+            files_dir=files_dir,
+            file_template="{folder_on_lacie_drive}/{file_name}",
+            required_for_upload=list(required_for_upload),
+        )
+        registry_path = Path(files_dir) / "registry.json"
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        args = make_upload_args(Path(files_dir), registry_path)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = cmd_upload(args)
+
+    return buffer.getvalue(), exit_code
+
+
+def _run_upload(rows: list[dict[str, str]]) -> str:
+    output, _ = _run_upload_and_capture(rows)
+    return output
+
+
+def _run_upload_exit_code(rows: list[dict[str, str]]) -> int:
+    _, exit_code = _run_upload_and_capture(rows)
+    return exit_code
+
+
+def test_upload_itemises_only_ready_rows_that_are_broken():
+    """`upload` itemizes only rows it would otherwise have uploaded - a
+    not-ready row was never in scope, so it must never get a [FAIL] line of
+    its own, only a mention in the one contained not-ready summary below."""
+    output = _run_upload(rows=[
+        _sheet_row(title="A", theme="B", name="Finnis.jpg"),    # ready + broken
+        _sheet_row(title="", theme="", name="AlsoBroken.jpg"),  # not ready + broken
+    ])
+    lines = output.splitlines()
+    # Global constraint: exact LINE membership, not `"..." in output`. Both
+    # the bare and not-yet-catalogued-marker forms are checked for row 3 -
+    # checking only the bare form would pass by accident against the OLD
+    # behavior too, since that form appends the marker onto the SAME line
+    # ("[FAIL] row 3  (not yet catalogued)"), never as its own line.
+    assert "[FAIL] row 2" in lines
+    assert "[FAIL] row 3" not in lines
+    assert "[FAIL] row 3  (not yet catalogued)" not in lines
+
+
+def test_upload_contains_the_broken_subcount_inside_the_not_ready_total():
+    """The sub-count must read as CONTAINED within the not-ready total - in
+    parentheses, inside the sentence - never as a second, disjoint number
+    beside it, which is how two adjacent numbers are read otherwise."""
+    output = _run_upload(rows=[_sheet_row(title="", theme="", name="Broken.jpg")])
+    # Global constraint: exact LINE membership of the FULL line, not a
+    # truncated substring - a truncated check would still pass even if the
+    # untranscribed rest of the line were wrong.
+    assert (
+        "1 row not yet catalogued (1 of them also has an unresolvable "
+        "filename - run `validate` to see them)"
+    ) in output.splitlines()
+
+
+def test_upload_pluralizes_the_subcount_when_more_than_one_broken_row_is_not_ready():
+    """The brief's own test only ever renders the singular 'has' (one
+    broken not-ready row). This pins the 'have' branch at count 2, so both
+    forms of the has/have switch are actually exercised, not just written."""
+    output = _run_upload(rows=[
+        _sheet_row(title="", theme="", name="Broken1.jpg"),
+        _sheet_row(title="", theme="", name="Broken2.jpg"),
+    ])
+    assert (
+        "2 rows not yet catalogued (2 of them also have an unresolvable "
+        "filename - run `validate` to see them)"
+    ) in output.splitlines()
+
+
+def test_upload_shows_no_per_field_breakdown():
+    """validate owns the data, upload owns the run - decision 2. Repeating
+    the per-field breakdown here would make `upload` loud about the backlog
+    again, which is the entire thing this change exists to stop."""
+    output = _run_upload(rows=[_sheet_row(title="", theme="")])
+    assert "missing title" not in output
+
+
+def test_upload_exits_zero_when_only_not_ready_rows_are_broken():
+    """The point of this task: a row nobody has catalogued yet was never in
+    this run's scope, so it must not turn the exit code non-zero."""
+    assert _run_upload_exit_code(rows=[_sheet_row(title="", theme="", name="Broken.jpg")]) == 0
+
+
+def test_upload_exits_one_when_a_ready_row_is_broken():
+    """The other half of the same rule: a row that WAS in scope (ready) and
+    still failed validation must still exit non-zero."""
+    assert _run_upload_exit_code(rows=[_sheet_row(title="A", theme="B", name="Finnis.jpg")]) == 1
+
+
+def test_cmd_upload_exit_code_ignores_a_not_ready_broken_row_during_a_real_run(
+    tmp_path, monkeypatch
+):
+    """The two `_run_upload_exit_code` tests above never reach real
+    execution - both their only rows are invalid, so plan_upload_targets()
+    never hands back a target and the run returns through the early
+    'nothing to upload' branch. This is the third place a not-ready row
+    could leak into the exit code: the summary printed AFTER a real upload
+    run used to OR the raw skipped-row count (not-ready rows included) into
+    its return value too. Here a genuinely ready row uploads successfully
+    alongside a not-ready row whose filename is also broken; the exit code
+    must still be 0."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["", "does-not-exist.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg",)
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+
+    assert exit_code == 0
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
