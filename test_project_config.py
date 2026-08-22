@@ -9,7 +9,7 @@ REGISTRY = {
     "collection_key": "lcps",
     "projects": {
         "sarasoldphotos": {
-            "description": "Sarah's donated collection",
+            "description": "Sara's donated collection",
             "mediatype": "image",
             "ia_collection": "lcpsociety",
             "sheet_id": "REAL_SHEET",
