@@ -857,6 +857,21 @@ def validate_sheet_grid(
     return header_results, row_results
 
 
+def check_required_for_upload(config: ProjectConfig, column_map: ColumnMap) -> list[str]:
+    """A required_for_upload name that matches no column makes EVERY row
+    not-ready, so nothing ever uploads and the report reads "3,000 rows not
+    yet catalogued" - which looks plausible. Silent, permanent, and
+    self-consistent, which is why this is a hard error rather than a
+    warning."""
+    known = sorted(set(column_map.field_names.values()))
+    return [
+        f"required_for_upload names {name!r}, which is not a column in this Sheet. "
+        f"Known columns: {', '.join(known)}"
+        for name in config.required_for_upload
+        if name not in known
+    ]
+
+
 def cmd_validate(args) -> int:
     # `is not None`, not truthiness: --csv "" must be an explicit (if
     # useless) request to read a CSV named "", and fail as such, rather than
@@ -950,6 +965,16 @@ def cmd_validate(args) -> int:
     except TemplateError as exc:
         print(
             f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
+            file=sys.stderr,
+        )
+        return 1
+
+    config_errors = check_required_for_upload(config, column_map)
+    if config_errors:
+        print("\n".join(config_errors), file=sys.stderr)
+        print(
+            f"fix required_for_upload in {args.registry} - as written, every row would "
+            "be reported as not yet catalogued and nothing would ever upload",
             file=sys.stderr,
         )
         return 1
@@ -1757,6 +1782,16 @@ def upload_from_sheet(args) -> int:
     except TemplateError as exc:
         print(
             f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
+            file=sys.stderr,
+        )
+        return 1
+
+    config_errors = check_required_for_upload(config, column_map)
+    if config_errors:
+        print("\n".join(config_errors), file=sys.stderr)
+        print(
+            f"fix required_for_upload in {args.registry} - as written, every row would "
+            "be reported as not yet catalogued and nothing would ever upload",
             file=sys.stderr,
         )
         return 1

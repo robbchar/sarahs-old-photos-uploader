@@ -12,6 +12,7 @@ from ia_bulk import (
     read_csv,
     load_registry,
     check_identifier,
+    check_required_for_upload,
     validate_rows,
     RowValidation,
     Readiness,
@@ -113,6 +114,29 @@ def make_sheet_registry(files_dir=".", **project_overrides):
     }
     project.update(project_overrides)
     return {"collection_key": "lcps", "projects": {"astoriaphotos": project}}
+
+
+def _sheet_config(**overrides) -> ProjectConfig:
+    """A ProjectConfig with the same defaults as make_sheet_registry(), for
+    tests that need the dataclass itself (e.g. to call a function that takes
+    ProjectConfig directly) rather than a registry dict routed through
+    load_project_config(). Every field is overridable, not only
+    required_for_upload - files_dir and file_template are exercised by other
+    tasks in this same plan that reuse this helper."""
+    defaults = dict(
+        project_id="astoriaphotos",
+        collection_key="lcps",
+        mediatype="image",
+        ia_collection="lcpsociety",
+        sheet_id="REAL_SHEET_ID",
+        test_sheet_id="TEST_SHEET_ID",
+        sheet_tab="Sheet1",
+        files_dir=".",
+        file_template="{file}",
+        required_for_upload=("title",),
+    )
+    defaults.update(overrides)
+    return ProjectConfig(**defaults)
 
 
 class FakeSheetClient:
@@ -4317,3 +4341,26 @@ def test_readiness_is_independent_of_validity():
     )
     assert result.readiness is Readiness.NOT_READY
     assert result.is_valid is False
+
+
+def test_required_for_upload_naming_a_missing_column_is_an_error():
+    column_map = build_column_map(["Title", "Theme", "File Name"])
+    config = _sheet_config(required_for_upload=("titel",))
+    errors = check_required_for_upload(config, column_map)
+    assert errors == [
+        "required_for_upload names 'titel', which is not a column in this Sheet. "
+        "Known columns: file_name, theme, title"
+    ]
+
+
+def test_required_for_upload_matching_every_column_passes():
+    column_map = build_column_map(["Title", "Theme"])
+    config = _sheet_config(required_for_upload=("title", "theme"))
+    assert check_required_for_upload(config, column_map) == []
+
+
+def test_every_missing_name_is_reported_not_just_the_first():
+    column_map = build_column_map(["Title"])
+    config = _sheet_config(required_for_upload=("titel", "thmee"))
+    errors = check_required_for_upload(config, column_map)
+    assert len(errors) == 2
