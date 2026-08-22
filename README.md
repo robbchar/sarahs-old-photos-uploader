@@ -82,10 +82,10 @@ unchanged from before this integration and still needs `--files-dir`.
 
 ```bash
 # read the project's Sheet
-python ia_bulk.py validate --project sarahsoldphotos
+python ia_bulk.py validate --project sarasoldphotos
 
 # validate an offline CSV instead
-python ia_bulk.py validate --project sarahsoldphotos --csv items.csv --files-dir ./photos
+python ia_bulk.py validate --project sarasoldphotos --csv items.csv --files-dir ./photos
 ```
 
 Note: the full Sheet-workflow write-up (registry fields, Google Cloud
@@ -134,16 +134,16 @@ Reads the project's Sheet by default; `--csv` switches to the offline path.
 
 ```bash
 # rehearse against the test Sheet: uploads as zztest-…, writes nothing back
-python ia_bulk.py upload --project sarahsoldphotos
+python ia_bulk.py upload --project sarasoldphotos
 
 # same, but record the minted identifiers in the TEST Sheet
-python ia_bulk.py upload --project sarahsoldphotos --write-identifier
+python ia_bulk.py upload --project sarasoldphotos --write-identifier
 
 # see what it would do without doing any of it
-python ia_bulk.py upload --project sarahsoldphotos --dry-run
+python ia_bulk.py upload --project sarasoldphotos --dry-run
 
 # upload from an offline CSV instead
-python ia_bulk.py upload --csv items.csv --project sarahsoldphotos --files-dir ./photos
+python ia_bulk.py upload --csv items.csv --project sarasoldphotos --files-dir ./photos
 ```
 
 | Mode | Reads | Uploads as | Writes back |
@@ -231,7 +231,7 @@ Other behavior, both paths:
 `--project` is required here too, for the same reason as `upload`.
 
 ```bash
-python ia_bulk.py sync-metadata updates.csv --project sarahsoldphotos
+python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos
 ```
 
 Same chunking/logging/safety-rail behavior as `upload`, but only requires
@@ -257,7 +257,7 @@ Pass `--live` to target the real collection with the real identifier as-is,
 with no stamp — do this deliberately, never as a default.
 
 ```bash
-python ia_bulk.py upload --project sarahsoldphotos --live
+python ia_bulk.py upload --project sarasoldphotos --live
 ```
 
 **Before any `--live` run**, confirm both of these by hand — neither is

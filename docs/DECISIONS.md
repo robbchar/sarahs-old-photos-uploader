@@ -249,7 +249,7 @@ The Sheet already had an `Identifier` column, holding the donor's original
 reference (`CD 1 01 53 58 1 Central SS`). That normalizes to `identifier` —
 which was the tool's reserved column for the minted IA identifier. The first
 `upload` would have overwritten every one of those original references with a
-freshly minted `lcps-sarahsoldphotos-NNNNN`.
+freshly minted `lcps-sarasoldphotos-NNNNN`.
 
 The tool's column is therefore renamed `ia_identifier`, joining `ia_uploaded`
 and `ia_url`. Every column the tool writes now carries the `ia_` prefix, which
@@ -504,11 +504,35 @@ it into one flat, unhelpful total.
   **Not to be confused with `ia_collection`** — see below; they are unrelated
   values and only one of them is now settled.
 - ~~The real IA collection has never been confirmed~~ **Settled 2026-08-22**:
-  `ia_collection` is `lcpsdigitalcollection`, confirmed by hand against
-  `archive.org/details/lcpsdigitalcollection`. Nothing in this tool checks
-  that a collection exists, so this was and remains a manual, one-time
-  verification; it is recorded here because the next person to read the
-  pre-live checklist should not have to redo it.
+  `ia_collection` is `sarasoldphotos`, the subcollection — confirmed to exist
+  (`archive.org/metadata/sarasoldphotos`, title "Sara's Old Photos") and
+  already parented to `lcpsdigitalcollection`, the LCPS parent collection.
+  Items are tagged into the subcollection alone; membership in the parent
+  (and in `clatsopcountyhistoricalsociety` and `americana`, both listed on
+  `sarasoldphotos`'s own `collection` field) is transitive, so listing more
+  than one collection per item is unnecessary. A same-day earlier pass had
+  recorded this value as `lcpsdigitalcollection` itself — that collection is
+  real and does exist, but it is the *parent*, not the subcollection the
+  operator decided items should carry; this replaces that value before any
+  `--live` run. Nothing in this tool checks that a collection exists, so this
+  remains a manual, one-time verification.
+- **Also settled 2026-08-22**: the registry's project id was corrected from
+  `sarahsoldphotos` to `sarasoldphotos` — the donor is Sara, and the `h` was
+  only ever the operator's habitual spelling, never a confirmed value.
+  `archive.org/metadata/sarahsoldphotos` returned `{}` (no such item);
+  `archive.org/metadata/sarasoldphotos` returned the real collection recorded
+  above. Because **no `--live` run has ever happened**, no permanent
+  identifier was ever minted under the misspelling, which is the only reason
+  this correction was still cheap — it reaches the registry key, every
+  minted-identifier example in the docs and tests, `README.md`, and
+  `docs/OPERATIONS.md`. It does **not** reach the `zztest-`-prefixed sandbox
+  identifiers already recorded elsewhere in these docs as historical fact
+  (see "Test identifiers carry a per-run stamp" and "`identifier-bib` and
+  `mediatype` are generated, not columns" above) — those items were actually
+  minted, under the old spelling, in `test_collection`, so rewriting the docs
+  to claim otherwise would misstate what is really out there, auto-expiring
+  or not. `collection_key` (`"lcps"`) is untouched by either correction; it
+  remains a third, unrelated value — see above.
 - Whether IA emits a distinguishable signal at its 5,000/day cap, as opposed to
   generic throttling. `--limit` covers the case where it does not.
 - ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:

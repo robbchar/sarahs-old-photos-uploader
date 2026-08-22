@@ -47,13 +47,13 @@ the whole pipeline.
 
 ```bash
 # against the project's test Sheet
-python ia_bulk.py validate --project sarahsoldphotos
+python ia_bulk.py validate --project sarasoldphotos
 
 # against the real Sheet (still uploads nothing and writes nothing)
-python ia_bulk.py validate --project sarahsoldphotos --live
+python ia_bulk.py validate --project sarasoldphotos --live
 
 # against an offline CSV instead of a Sheet
-python ia_bulk.py validate --project sarahsoldphotos --csv data/upload.csv --files-dir data
+python ia_bulk.py validate --project sarasoldphotos --csv data/upload.csv --files-dir data
 ```
 
 Exits `0` if every row passes, `1` otherwise. On the Sheet path `--live`
@@ -172,13 +172,13 @@ to recur across a 10,000-row collection.
 
 ```bash
 # against the project's test Sheet (the normal path)
-python ia_bulk.py upload --project sarahsoldphotos
+python ia_bulk.py upload --project sarasoldphotos
 
 # ...and again, recording the minted identifiers in the test Sheet
-python ia_bulk.py upload --project sarahsoldphotos --write-identifier
+python ia_bulk.py upload --project sarasoldphotos --write-identifier
 
 # against an offline CSV
-python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data
+python ia_bulk.py upload --csv data/upload.csv --project sarasoldphotos --files-dir data
 ```
 
 On the Sheet path, run it once without `--write-identifier` first: that mode
@@ -206,10 +206,10 @@ meant, with the values you meant.
 ## 4. Live run
 
 ```bash
-python ia_bulk.py upload --project sarahsoldphotos --live
+python ia_bulk.py upload --project sarasoldphotos --live
 
 # ...or from an offline CSV, where --live must name the collection itself
-python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data --live --collection lcpsdigitalcollection
+python ia_bulk.py upload --csv data/upload.csv --project sarasoldphotos --files-dir data --live --collection sarasoldphotos
 ```
 
 ### Pre-live checklist
@@ -219,25 +219,35 @@ files in the wrong place under a permanent identifier.
 
 - [ ] `projects_registry.json` → `collection_key` (currently `"lcps"`) is the
       first segment of every identifier this tool mints
-      (`lcps-sarahsoldphotos-00001`). `check_identifier` already refuses any
+      (`lcps-sarasoldphotos-00001`). `check_identifier` already refuses any
       row whose identifier prefix doesn't match this value — but the value
       itself has **never been confirmed** against how LCPS actually names its
       collection. This is a different thing from the IA collection uploads
       land in; see the next item.
 - [ ] `projects_registry.json` → `ia_collection` (currently
-      `"lcpsdigitalcollection"`) is the actual Internet Archive collection
+      `"sarasoldphotos"`) is the actual Internet Archive collection
       `upload --live` uploads into on the Sheet path — taken from the
       registry automatically, never from a `--collection` flag there.
       **Do not confuse this with `collection_key` above; they are unrelated
-      values.** `--collection` no longer has a `"lcps"` default: passing it
+      values, and it is a coincidence of spelling — not a code relationship —
+      that `ia_collection` and the project id now share the same string.**
+      `--collection` no longer has a `"lcps"` default: passing it
       on the Sheet path is now a hard error (the registry's `ia_collection` is
       the only source), and on the `--csv --live` path it is required with no
       default, refusing to run rather than guessing. What nothing in this
       tool does is confirm `ia_collection` **exists on archive.org** — that
       confirmation has to happen by hand, once, before the first `--live`
-      run. **Done 2026-08-22**: `archive.org/details/lcpsdigitalcollection`
-      was checked by hand and the collection exists. Re-check only if the
-      registry value changes.
+      run. **Done 2026-08-22**: `archive.org/details/sarasoldphotos` was
+      checked by hand — it exists (title "Sara's Old Photos") and is already
+      a child of the LCPS parent collection, `lcpsdigitalcollection`. Items
+      are tagged into this subcollection alone; membership in the parent (and
+      in `clatsopcountyhistoricalsociety` and `americana`) follows
+      transitively, so listing multiple collections on each item is
+      unnecessary. An earlier pass this same day recorded `ia_collection` as
+      `lcpsdigitalcollection` itself — that collection is real and does
+      exist, but it is the *parent*, not the subcollection the operator
+      decided items should carry; this corrects it before any `--live` run.
+      Re-check only if the registry value changes again.
 - [ ] `validate --project <id> --live` was run **today, against the real
       Sheet, and exited 0** — not a validate of the test Sheet, and not
       yesterday's. See §2; this is the cheapest check on this list and the one
@@ -303,7 +313,7 @@ resumes by itself and `--resume-from` is refused there. On the `--csv` path,
 to pick up after failures:
 
 ```bash
-python ia_bulk.py upload --csv data/upload.csv --project sarahsoldphotos --files-dir data --resume-from logs/upload-20260712T125326.jsonl
+python ia_bulk.py upload --csv data/upload.csv --project sarasoldphotos --files-dir data --resume-from logs/upload-20260712T125326.jsonl
 ```
 
 Rows marked `success` or `unchanged` **in the same mode** are skipped. Test-mode
