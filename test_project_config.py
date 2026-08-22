@@ -163,19 +163,50 @@ def test_missing_required_for_upload_is_an_error():
     del registry["projects"]["p"]["required_for_upload"]
     with pytest.raises(ConfigError) as exc:
         load_project_config(registry, "p")
-    assert "required_for_upload" in str(exc.value)
+    assert str(exc.value) == (
+        "project 'p' is missing required registry key: required_for_upload. "
+        "It lists the normalized column names a human must fill in before a "
+        "row can be uploaded, e.g. [\"title\", \"theme\"]. There is "
+        "deliberately no default - a project inheriting another project's "
+        "readiness rules by silence is worse than stating them."
+    )
 
 
 def test_empty_required_for_upload_is_an_error():
     with pytest.raises(ConfigError) as exc:
         load_project_config(_registry(required_for_upload=[]), "p")
-    assert "at least one" in str(exc.value)
+    assert str(exc.value) == "project 'p': required_for_upload must name at least one column"
 
 
 def test_required_for_upload_must_be_a_list_not_a_string():
     with pytest.raises(ConfigError) as exc:
         load_project_config(_registry(required_for_upload="title"), "p")
-    assert "must be a list" in str(exc.value)
+    assert str(exc.value) == "project 'p': required_for_upload must be a list, got 'str'"
+
+
+def test_required_for_upload_entry_must_be_a_string():
+    """Covers the per-entry isinstance branch (project_config.py's
+    `not isinstance(name, str) or not name.strip()` check), which the
+    original five tests never exercised: every entry passed to
+    load_project_config was already a valid string."""
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(_registry(required_for_upload=["title", 123]), "p")
+    assert str(exc.value) == (
+        "project 'p': every required_for_upload entry must be a non-empty "
+        "string, got 123"
+    )
+
+
+def test_required_for_upload_entry_must_not_be_blank():
+    """The other half of the same branch: a whitespace-only entry is still
+    truthy, so it takes the .strip() check specifically, not just a
+    non-string check, to reject it."""
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(_registry(required_for_upload=["title", "   "]), "p")
+    assert str(exc.value) == (
+        "project 'p': every required_for_upload entry must be a non-empty "
+        "string, got '   '"
+    )
 
 
 def test_raw_header_text_is_rejected_with_the_normalization_rule_explained():
@@ -183,6 +214,11 @@ def test_raw_header_text_is_rejected_with_the_normalization_rule_explained():
     read as 'your Sheet is wrong' when the Sheet was fine."""
     with pytest.raises(ConfigError) as exc:
         load_project_config(_registry(required_for_upload=["Architectura Style"]), "p")
-    message = str(exc.value)
-    assert "Architectura Style" in message
-    assert "architectura_style" in message
+    assert str(exc.value) == (
+        "project 'p': required_for_upload entry 'Architectura Style' is raw "
+        "header text, not a normalized column name - use 'architectura_style'. "
+        "This is the same rule file_template follows: the Sheet's headers are "
+        "normalized (lowercased, punctuation dropped, spaces to underscores) "
+        "before anything matches against them, so the registry must name the "
+        "normalized form. Your Sheet is fine; the registry entry is not."
+    )
