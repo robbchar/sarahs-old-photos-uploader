@@ -52,16 +52,34 @@ REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
 # (RowState.UNASSIGNED), not an error. See docs/DECISIONS.md, "Tool-owned
 # Sheet columns are all `ia_`-prefixed".
 #
-# "file" IS required here - this is Phase 2's deliberate reversal of Task
-# 8's Phase 1 exemption (which ran with no photos on disk by design). By
-# the time validate_rows sees a Sheet row, cmd_validate has already turned
+# "file" is left out entirely, not merely reclassified. By the time
+# validate_rows sees a Sheet row, cmd_validate has already turned
 # `file_template` plus the row's own columns into a candidate path and
-# resolved it against `files_dir` (see resolve_file() in column_map.py) -
-# so every row either carries a real, disk-verified `file` value or has
-# already failed with the resolver's own error message. See
+# resolved it against `files_dir` (see resolve_file() in column_map.py),
+# recording the outcome in a FileOutcomes: resolved (a real, disk-verified
+# `file` value), blank (nobody named a file yet - a readiness fact), or
+# broken (a name was given and didn't resolve - an error, via
+# outcomes.errors). A required-columns check for `file` here would just
+# be a second, cruder way of asking the same question FileOutcomes already
+# answered precisely, producing a duplicate "missing required column
+# 'file'" line behind the resolver's own, more actionable message. See
 # docs/DECISIONS.md, "A file is found by resolution, not by constructing a
 # path".
-SHEET_REQUIRED_COLUMNS = ("mediatype", "title", "file")
+#
+# "title" is also gone, but reclassified rather than dropped: it moved to
+# the registry's required_for_upload (see ProjectConfig), because it is
+# ordinary human-filled metadata - a blank title means "nobody has
+# catalogued this row yet" (readiness), not "this row is broken"
+# (validity). `required_columns` here is now reserved for what is
+# structurally guaranteed to exist independent of any human filling
+# anything in.
+#
+# NOT to be confused with validate_rows' check_file_exists / is_file()
+# check below, a completely different mechanism that stays untouched: it
+# is a disk-level safety net on the resolved `file` value, not a
+# required-columns check, and removing it is a different (and wrong)
+# change from the one this constant's shrink makes.
+SHEET_REQUIRED_COLUMNS = ("mediatype",)
 # Columns this script reads by exact lowercase name. A case variant of one of
 # these (a "Date" column from the raw Sheet export, say) is silently treated as
 # unrelated pass-through metadata, so check_header rejects it.
@@ -262,6 +280,11 @@ class RowValidation:
     row_number: int
     identifier: str
     errors: list[str] = field(default_factory=list)
+    # Two sources, in a fixed order: the blank required_for_upload columns
+    # validate_rows finds first, then the blank file_template cells
+    # validate_sheet_grid extends on afterward (see FileOutcomes.blank).
+    # Order matters to callers that group or count by name (Tasks 7-8), not
+    # just to this list's own contents.
     missing_fields: list[str] = field(default_factory=list)
 
     @property
@@ -283,6 +306,7 @@ def validate_rows(
     required_columns: tuple[str, ...] = REQUIRED_UPLOAD_COLUMNS,
     check_file_exists: bool = True,
     identifier_column: str = "identifier",
+    required_for_upload: tuple[str, ...] = (),
 ) -> list[RowValidation]:
     """skip_identifiers lets a --resume-from run skip re-validating rows a
     prior run already validated and uploaded successfully - the identifier
@@ -310,7 +334,15 @@ def validate_rows(
     NUMBER regex against a donor reference fails every row for the wrong
     reason - which is exactly what happened against the real Sheet before
     this fix. See docs/DECISIONS.md, "Tool-owned Sheet columns are all
-    `ia_`-prefixed"."""
+    `ia_`-prefixed".
+
+    required_for_upload defaults to () (the CSV path, unchanged: a CSV's
+    'title' etc. are already covered by required_columns, and a CSV has no
+    ProjectConfig to source a second list from). The Sheet path passes
+    config.required_for_upload - a blank one of these is a READINESS fact
+    (nobody has catalogued this row yet), not a validation error, which is
+    the whole reason it is recorded on missing_fields rather than folded
+    into `errors` alongside required_columns."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
@@ -343,7 +375,18 @@ def validate_rows(
                 if not file_path.is_file():
                     errors.append(f"file not found: {file_path}")
 
-        results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
+        missing_fields = [
+            column for column in required_for_upload if not (row.get(column) or "").strip()
+        ]
+
+        results.append(
+            RowValidation(
+                row_number=row_number,
+                identifier=identifier,
+                errors=errors,
+                missing_fields=missing_fields,
+            )
+        )
 
     return results
 
@@ -374,9 +417,10 @@ def validate_sheet_rows(
     files_dir: str | Path,
     registry: dict,
     skip_identifiers: frozenset[str] = frozenset(),
+    required_for_upload: tuple[str, ...] = (),
 ) -> list[RowValidation]:
     """The Sheet path's answer, named. It differs from the CSV path's in
-    exactly two ways, both of which used to travel as loose parameters at
+    exactly three ways, all of which used to travel as loose parameters at
     every call site:
 
     - the tool's minted identifier lives in `ia_identifier`, never
@@ -384,7 +428,10 @@ def validate_sheet_rows(
       reference and would fail the COLLECTIONKEY-PROJECTID-NUMBER regex on
       every row);
     - `ia_identifier` is not required, because blank is the normal starting
-      state of a new row - RowState.UNASSIGNED, not an error."""
+      state of a new row - RowState.UNASSIGNED, not an error;
+    - a blank required_for_upload column (title, say) is a readiness fact
+      recorded on missing_fields, not a validation error - see
+      SHEET_REQUIRED_COLUMNS' comment for why that split exists."""
     return validate_rows(
         rows,
         files_dir,
@@ -393,6 +440,7 @@ def validate_sheet_rows(
         required_columns=SHEET_REQUIRED_COLUMNS,
         check_file_exists=True,
         identifier_column=IA_IDENTIFIER_COLUMN,
+        required_for_upload=required_for_upload,
     )
 
 
@@ -852,7 +900,7 @@ def validate_sheet_grid(
     registry: dict,
     config: ProjectConfig,
     structure_results: list[RowValidation],
-    file_resolution_errors: dict[int, str],
+    outcomes: FileOutcomes,
 ) -> tuple[list[RowValidation], list[RowValidation]]:
     """Returns (header_results, row_results). row_results holds exactly one
     entry per row in `rows`, in the same order - which is what
@@ -871,16 +919,28 @@ def validate_sheet_grid(
     its own row-1 entry (as does _GRID_SHAPE_ROW_NUMBER_RE's row-1 fallback) -
     the bounds check is load-bearing, not defensive: a bare row_number - 2
     would quietly fold row 1 into the LAST data row via negative indexing."""
-    row_results = validate_sheet_rows(rows, config.files_dir, registry)
+    row_results = validate_sheet_rows(
+        rows, config.files_dir, registry, required_for_upload=config.required_for_upload
+    )
 
-    for row_number, message in file_resolution_errors.items():
-        # The resolver's own message first: it names the folder and the name
-        # that was looked for, which is the actionable part. The generic
-        # "missing required column 'file'" that follows from required_columns
-        # (row['file'] was never set - see resolve_sheet_files) merely
-        # restates that the row has no file.
+    for row_number, message in outcomes.errors.items():
+        # The resolver's own message: it names the folder and the name that
+        # was looked for, which is the actionable part. There is no longer a
+        # generic "missing required column 'file'" line behind it - `file`
+        # left required_columns entirely once FileOutcomes became the sole
+        # source of truth for whether a row's file resolved (see
+        # SHEET_REQUIRED_COLUMNS' comment), so this is the whole story for a
+        # broken-filename row now, not merely the first line of it.
         row_result = row_results[row_number - 2]
         row_result.errors = [message] + row_result.errors
+
+    for row_number, blank_cells in outcomes.blank.items():
+        # Blank template cells are a readiness fact, not an error: nobody
+        # asserted a file, so there is nothing to be wrong. Extended onto
+        # missing_fields alongside any blank required_for_upload columns
+        # validate_sheet_rows already put there, required_for_upload names
+        # first - see missing_fields' own ordering note on RowValidation.
+        row_results[row_number - 2].missing_fields.extend(blank_cells)
 
     header_results: list[RowValidation] = []
     for entry in structure_results:
@@ -1023,7 +1083,7 @@ def cmd_validate(args) -> int:
     # value it records in ia_identifier_bib is the one shown here.
     file_outcomes = resolve_sheet_files(rows, config)
     header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_outcomes.errors
+        rows, registry, config, structure_results, file_outcomes
     )
 
     results = header_results + row_results
@@ -1848,7 +1908,7 @@ def upload_from_sheet(args) -> int:
 
     file_outcomes = resolve_sheet_files(rows, config)
     header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_outcomes.errors
+        rows, registry, config, structure_results, file_outcomes
     )
 
     if header_results:

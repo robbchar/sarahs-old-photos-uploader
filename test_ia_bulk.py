@@ -17,6 +17,7 @@ from ia_bulk import (
     check_required_for_upload,
     resolve_sheet_files,
     validate_rows,
+    validate_sheet_grid,
     RowValidation,
     Readiness,
     effective_identifier,
@@ -1925,19 +1926,25 @@ def test_cmd_validate_prints_correct_lifecycle_counts_for_a_mix_of_states_end_to
     look identical to correct behavior."""
     from ia_bulk import cmd_validate
 
-    for name in ("ready.jpg", "done.jpg", "done2.jpg", "reserved.jpg", "reserved2.jpg"):
+    for name in ("ready.jpg", "done.jpg", "reserved.jpg"):
         (tmp_path / name).write_bytes(b"x")
 
     # Uses "ia_identifier", not "identifier": after Task 9 the latter is
     # ordinary donor metadata and no longer drives classify_row() at all.
+    #
+    # The "fails validation" row in each pair names a FILE that resolves to
+    # nothing (missing*.jpg is deliberately never created above), not a
+    # blank title - since the SHEET_REQUIRED_COLUMNS shrink, a blank title
+    # is a readiness fact rather than a validation error, so it can no
+    # longer stand in for "this row is invalid" here.
     grid = [
         ["Title", "file", "ia_identifier", "ia_uploaded"],
         ["Ready", "ready.jpg", "", ""],
-        ["", "ready.jpg", "", ""],  # blank title -> fails validation, still unassigned
+        ["Ready but broken", "missing.jpg", "", ""],  # unresolvable file -> fails, still unassigned
         ["Done", "done.jpg", "lcps-astoriaphotos-00001", "2026-01-01T00:00:00"],
-        ["", "done2.jpg", "lcps-astoriaphotos-00002", "2026-01-01T00:00:00"],  # blank title -> fails
+        ["Done but broken", "missing2.jpg", "lcps-astoriaphotos-00002", "2026-01-01T00:00:00"],  # unresolvable file -> fails
         ["Reserved", "reserved.jpg", "lcps-astoriaphotos-00003", ""],
-        ["", "reserved2.jpg", "lcps-astoriaphotos-00004", ""],  # blank title -> fails
+        ["Reserved but broken", "missing3.jpg", "lcps-astoriaphotos-00004", ""],  # unresolvable file -> fails
     ]
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: FakeSheetClient(grid))
 
@@ -3463,16 +3470,22 @@ def test_cmd_upload_skips_an_invalid_row_uploads_the_valid_ones_and_exits_non_ze
     """The Sheet path's deliberate opposite of the CSV path: one typo in row
     9,000 must not block the other 9,999, but a partial run must never be
     mistaken for a clean one. See docs/DECISIONS.md, "On the Sheet path,
-    `upload` uploads the valid rows and reports the rest"."""
+    `upload` uploads the valid rows and reports the rest".
+
+    Row 2's file is broken (present but resolves to nothing) rather than
+    its title being blank - a blank required_for_upload column is now a
+    readiness fact, not a validation error (see the SHEET_REQUIRED_COLUMNS
+    shrink), so a blank title no longer produces the genuinely INVALID row
+    this test needs."""
     from ia_bulk import cmd_upload
 
     grid = [
         SHEET_HEADER,
-        ["", "photo1.jpg", "", "", "", ""],
+        ["First photo", "does-not-exist.jpg", "", "", "", ""],
         ["Second photo", "photo2.jpg", "", "", "", ""],
     ]
     recorder, client, registry_path, _ = setup_sheet_upload(
-        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+        tmp_path, monkeypatch, grid, files=("photo2.jpg",)
     )
 
     exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
@@ -3489,7 +3502,7 @@ def test_cmd_upload_skips_an_invalid_row_uploads_the_valid_ones_and_exits_non_ze
         ],
     ]
     assert "[FAIL] row 2" in out
-    assert "missing required column 'title'" in out
+    assert _unresolved_message(tmp_path, "does-not-exist.jpg") in out
 
 
 def test_cmd_upload_dry_run_writes_nothing_uploads_nothing_and_prints_what_it_would_mint(
@@ -4238,17 +4251,24 @@ def test_cmd_upload_treats_a_number_in_an_invalid_row_as_spent(tmp_path, monkeyp
     """A number that appears anywhere in the Sheet is spent, whatever the state
     of the row holding it. Minting from valid rows only would re-issue a number
     an invalid row already holds - which is the permanent collision the whole
-    reserve-first design exists to prevent."""
+    reserve-first design exists to prevent.
+
+    The row's file is broken (present but resolves to nothing), not its
+    title blank - a blank required_for_upload column is now a readiness
+    fact rather than a validation error (see the SHEET_REQUIRED_COLUMNS
+    shrink), so this test needs a different way to make the row genuinely
+    INVALID while it still holds ...-00050."""
     from ia_bulk import cmd_upload
 
     grid = [
         SHEET_HEADER,
-        # No title, so it fails validation - but it still holds ...-00050.
-        ["", "photo1.jpg", "lcps-astoriaphotos-00050", "", "", ""],
+        # File does not resolve, so it fails validation - but it still holds
+        # ...-00050.
+        ["First photo", "does-not-exist.jpg", "lcps-astoriaphotos-00050", "", "", ""],
         ["Second photo", "photo2.jpg", "", "", "", ""],
     ]
     recorder, client, registry_path, _ = setup_sheet_upload(
-        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+        tmp_path, monkeypatch, grid, files=("photo2.jpg",)
     )
 
     exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
@@ -4476,3 +4496,87 @@ def test_a_broken_filename_stays_an_error_even_beside_a_genuinely_blank_row(tmp_
     # failing row, blank or broken - left in place it would resolve as a
     # literal path for the later disk check and mask the failure.
     assert [row["file"] for row in rows] == ["", "", ""]
+
+
+def _sheet_row(**cells: str) -> dict[str, str]:
+    """One Sheet row for the readiness tests below. `folder`/`name` are
+    short aliases for the two file_template columns _validate's on-disk
+    layout below uses (folder_on_lacie_drive/file_name - the real names
+    from projects_registry.json), so a test reads as "which cell is
+    missing or wrong" rather than repeating the long column names
+    throughout. mediatype is always present: SHEET_REQUIRED_COLUMNS still
+    checks it structurally, and these tests are about
+    required_for_upload/missing_fields, not that check."""
+    folder = cells.pop("folder", "SOP CD1")
+    name = cells.pop("name", "Finnish Meat Market.jpg")
+    row = {
+        "mediatype": "image",
+        "title": "A Title",
+        "theme": "Townscape",
+        "folder_on_lacie_drive": folder,
+        "file_name": name,
+    }
+    row.update(cells)
+    return row
+
+
+def _validate(
+    rows: list[dict[str, str]], required_for_upload: tuple[str, ...], tmp_path: Path
+) -> tuple[list[RowValidation], list[RowValidation]]:
+    """Wires resolve_sheet_files into validate_sheet_grid exactly as
+    cmd_validate's own two call sites do - so these tests exercise the
+    same path FileOutcomes actually travels, not a hand-assembled
+    substitute for it.
+
+    Takes the calling test's own tmp_path rather than managing a hidden
+    directory of its own: a test asserting the resolver's exact message
+    (via _unresolved_message(), per this plan's exact-assertion rule)
+    needs a directory it can name back, which a directory this helper
+    created and never exposed would not allow.
+
+    Sets up one real file, 'SOP CD1/Finnish Meat Market.jpg', matching
+    _sheet_row's defaults, so an unmodified row resolves cleanly and a
+    test only has to override the one cell it wants broken or blank."""
+    (tmp_path / "SOP CD1").mkdir()
+    (tmp_path / "SOP CD1" / "Finnish Meat Market.jpg").write_bytes(b"x")
+
+    config = _sheet_config(
+        files_dir=str(tmp_path),
+        file_template="{folder_on_lacie_drive}/{file_name}",
+        required_for_upload=required_for_upload,
+    )
+    outcomes = resolve_sheet_files(rows, config)
+    return validate_sheet_grid(rows, make_registry(), config, [], outcomes)
+
+
+def test_a_blank_required_field_is_not_an_error(tmp_path):
+    rows = [_sheet_row(title="", theme="Townscape")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].errors == []
+    assert results[0].missing_fields == ["title"]
+    assert results[0].readiness is Readiness.NOT_READY
+
+
+def test_a_broken_filename_produces_exactly_one_error(tmp_path):
+    """The duplicate 'missing required column file' line must be gone. Count
+    the errors - asserting 'contains the resolver message' passes just as
+    well with the redundant line still there. Exact message equality (not
+    a substring) per this plan's rule: a prior review found weakening
+    exact assertions to substrings dropped a mutation's catch rate."""
+    rows = [_sheet_row(title="Finnish Meat Market", theme="Townscape", name="Finnis.jpg")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert len(results[0].errors) == 1
+    assert results[0].errors[0] == _unresolved_message(tmp_path / "SOP CD1", "Finnis.jpg")
+
+
+def test_a_broken_filename_in_an_uncatalogued_row_is_both(tmp_path):
+    rows = [_sheet_row(title="", theme="", name="Finnis.jpg")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].readiness is Readiness.NOT_READY
+    assert results[0].is_valid is False
+
+
+def test_missing_fields_names_the_blank_template_cells_too(tmp_path):
+    rows = [_sheet_row(title="A Title", theme="Townscape", folder="", name="")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].missing_fields == ["folder_on_lacie_drive", "file_name"]
