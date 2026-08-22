@@ -710,6 +710,52 @@ def open_log(log_dir: str | Path, command_name: str) -> Path:
     return log_dir / f"{command_name}-{timestamp}.jsonl"
 
 
+def log_run_header(
+    log_path: str | Path,
+    config: ProjectConfig,
+    column_map: ColumnMap,
+    live: bool,
+    dry_run: bool,
+) -> None:
+    """The first line written to a Sheet-path run's log. `head -1 <log>` then
+    answers "what did this run send, under what field names, and what did it
+    require before a row could go out" - the exact question that gets asked
+    months later, once an identifier is already permanent and the Sheet has
+    moved on and no longer shows what it looked like at upload time.
+
+    `columns` and `held_back` come straight from the ColumnMap: `columns`
+    maps EVERY header the Sheet had that run (not only the uploaded ones) to
+    its normalized field name, and `held_back` names which of those were
+    excluded as `(LCPS Internal)` - a receipt has to show what was left out,
+    not only what went through. `required_for_upload` is the project's
+    readiness rule at the time of the run: which normalized columns had to be
+    non-blank for a row to be in scope at all. All three can change between
+    runs (the Sheet gaining a column, a registry edit) even though none of
+    them changes per row within one run, which is why this is written once
+    per log rather than being documented once somewhere else.
+
+    Deliberately excludes anything that isn't safe to keep around in a log
+    file indefinitely: no credentials, no tokens, no filesystem paths outside
+    the project. `sheet_id` is the one Google identifier here, and it already
+    appears in this command's ordinary console output."""
+    entry = {
+        "record": "run_header",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "project": config.project_id,
+        "live": live,
+        "dry_run": dry_run,
+        "sheet_id": config.sheet_id_for(live),
+        "collection": config.ia_collection,
+        "files_dir": config.files_dir,
+        "file_template": config.file_template,
+        "columns": dict(column_map.field_names),
+        "held_back": list(column_map.held_back),
+        "required_for_upload": list(config.required_for_upload),
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def log_result(
     log_path: str | Path,
     identifier: str,
@@ -738,7 +784,11 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
     zztest-prefixed item landed in test_collection, never the real one, so
     it must not be allowed to skip a real --live upload (and vice versa).
     Logs from before the "live" field existed have no mode recorded and are
-    treated conservatively as not matching either mode."""
+    treated conservatively as not matching either mode. A run_header record
+    (see log_run_header) is skipped explicitly rather than relying on it
+    merely lacking a "status" key - the header schema is free to grow a
+    "status"-named field of its own later without silently turning this into
+    a bug."""
     successes: set[str] = set()
     with open(log_path, encoding="utf-8") as f:
         for line in f:
@@ -746,6 +796,8 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
             if not line:
                 continue
             entry = json.loads(line)
+            if entry.get("record") == "run_header":
+                continue
             if entry.get("status") in ("success", "unchanged") and entry.get("live") == live:
                 successes.add(entry["identifier"])
     return successes

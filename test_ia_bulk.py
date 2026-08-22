@@ -2250,6 +2250,110 @@ def test_load_prior_successes_ignores_pre_migration_entries_with_no_live_field(t
     assert load_prior_successes(log_path, live=True) == set()
 
 
+def test_run_header_is_the_first_line_of_the_log(tmp_path):
+    """log_run_header() is called once, before any log_result() call, and
+    must be the log's first line so `head -1 <log>` always answers "what did
+    this run send, under what field names, and what did it require" -
+    verbatim from the Task 11 brief, adapted to the current ProjectConfig
+    shape (_sheet_config(), since the brief's REGISTRY_FIXTURE/
+    load_project_config(..., "sarahsoldphotos") no longer exist) and
+    extended with required_for_upload, which did not exist when the brief
+    was written but is now part of what determined this run's scope."""
+    from ia_bulk import log_run_header
+
+    log_path = tmp_path / "upload.jsonl"
+    column_map = build_column_map(["Title", "Notes (LCPS Internal)"])
+    config = _sheet_config(required_for_upload=("title",))
+
+    log_run_header(log_path, config, column_map, live=False, dry_run=False)
+    log_result(log_path, "lcps-astoriaphotos-00001", "a.jpg", "success", False)
+
+    first, second = log_path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(first)
+    assert header["record"] == "run_header"
+    assert header["project"] == "astoriaphotos"
+    assert header["live"] is False
+    assert header["dry_run"] is False
+    assert header["sheet_id"] == "TEST_SHEET_ID"
+    assert header["collection"] == "lcpsociety"
+    assert header["files_dir"] == "."
+    assert header["file_template"] == "{file}"
+    assert header["columns"] == {
+        "Title": "title",
+        "Notes (LCPS Internal)": "notes_lcps_internal",
+    }
+    assert header["held_back"] == ["Notes (LCPS Internal)"]
+    assert header["required_for_upload"] == ["title"]
+    assert json.loads(second)["status"] == "success"
+
+
+def test_run_header_records_live_mode_and_the_real_sheet_id(tmp_path):
+    """A separate case from the test-mode one above rather than a second
+    assertion bolted onto it: sheet_id_for() branches on `live`, and a run
+    header that silently logged the test Sheet ID during a --live run (or
+    vice versa) would be the exact kind of defect this record exists to make
+    visible months later."""
+    from ia_bulk import log_run_header
+
+    log_path = tmp_path / "upload.jsonl"
+    column_map = build_column_map(["Title"])
+    config = _sheet_config(required_for_upload=("title",))
+
+    log_run_header(log_path, config, column_map, live=True, dry_run=False)
+
+    header = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert header["live"] is True
+    assert header["sheet_id"] == "REAL_SHEET_ID"
+
+
+def test_resume_skips_the_run_header_record(tmp_path):
+    """The run header carries no "status" field, so it must never be
+    counted as a prior success/failure by load_prior_successes() - proven
+    here by resuming past a header-then-result log and getting back exactly
+    the one real identifier, not an error and not an empty set."""
+    from ia_bulk import log_run_header, load_prior_successes
+
+    log_path = tmp_path / "upload.jsonl"
+    column_map = build_column_map(["Title"])
+    config = _sheet_config(required_for_upload=("title",))
+
+    log_run_header(log_path, config, column_map, live=True, dry_run=False)
+    log_result(log_path, "lcps-astoriaphotos-00001", "a.jpg", "success", True)
+
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00001"}
+
+
+def test_load_prior_successes_skips_a_run_header_by_record_type_not_by_missing_status(tmp_path):
+    """The two tests above never actually force the `record == "run_header"`
+    check in load_prior_successes() to do any work, because a real header
+    also happens to lack a "status" key - the pre-existing `entry.get(
+    "status") in (...)` guard already throws it out for free. This test
+    writes a line that is tagged as a run_header but otherwise shaped
+    exactly like a matching success entry (same "status", "live", and
+    "identifier" as the real success line below), so it can only be excluded
+    by the explicit record-type check. Without that check this line would be
+    wrongly counted, and the assertion below would see two identifiers
+    instead of one."""
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload.jsonl"
+    log_path.write_text(
+        json.dumps(
+            {
+                "record": "run_header",
+                "identifier": "lcps-astoriaphotos-99999",
+                "status": "success",
+                "live": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    log_result(log_path, "lcps-astoriaphotos-00001", "a.jpg", "success", True)
+
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00001"}
+
+
 def test_effective_identifier_prepends_zztest_and_the_given_stamp_when_not_live():
     """See docs/DECISIONS.md, "Test identifiers carry a per-run stamp" - a
     bare zztest- prefix made a test run's identifiers a pure function of the
