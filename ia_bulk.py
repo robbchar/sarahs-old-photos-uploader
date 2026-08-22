@@ -530,9 +530,30 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
     now-missing title) is not "already uploaded" or "will retry" just
     because it has the shape of one - RESERVED in particular makes a
     forward-looking promise ("will retry under existing identifier") that a
-    row failing identifier validation cannot keep. Every row falls into
-    exactly one of UNASSIGNED/DONE/RESERVED and then exactly one of
-    valid/invalid, so the six counts below always sum to len(rows)."""
+    row failing identifier validation cannot keep.
+
+    Validity itself splits three ways, not two: a row is either READY
+    (catalogued and passes validation), invalid (catalogued but fails
+    validation), or NOT_READY (missing one or more required_for_upload/
+    file_template fields - see RowValidation.readiness). Crossed with
+    classify_row()'s three states that makes nine buckets, not six. A row
+    that is BOTH not-ready and carrying validation errors (e.g. an
+    uncatalogued row whose filename is also a typo) is counted ONCE, under
+    not-ready: not-ready takes precedence over invalid, because "nobody has
+    filled this in yet" is the more useful thing to tell an operator than a
+    validation error that will most likely resolve itself the moment the
+    row is catalogued. Every row falls into exactly one of UNASSIGNED/DONE/
+    RESERVED and then exactly one of ready/invalid/not_ready, so the nine
+    counts below always sum to len(rows).
+
+    Only non-zero buckets render, except the three per-state headline lines
+    ("ready to upload"/"already uploaded"/"reserved but unconfirmed"), which
+    always print - even as "0" - so the three lifecycle states themselves
+    are never silently absent from the report. When both a state's
+    not_ready and invalid counts are non-zero, not_ready prints first: it is
+    normally the far larger of the two (an unfilled-in row rather than a
+    broken one) and is not an error, so it reads before the more alarming
+    invalid line rather than after it."""
     if len(rows) != len(row_results):
         raise ValueError(
             f"format_lifecycle_summary: got {len(rows)} row(s) but {len(row_results)} "
@@ -541,47 +562,69 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
             "also carries sheet_structure_validation()'s row-1/shape entries)."
         )
 
-    ready = failed_unassigned = 0
-    done = failed_done = 0
-    reserved = failed_reserved = 0
+    counts: dict[tuple[RowState, str], int] = {
+        (state, bucket): 0
+        for state in (RowState.UNASSIGNED, RowState.DONE, RowState.RESERVED)
+        for bucket in ("ready", "invalid", "not_ready")
+    }
 
     for row, result in zip(rows, row_results):
         state = classify_row(row)
-        valid = result.is_valid
-        if state is RowState.UNASSIGNED:
-            if valid:
-                ready += 1
-            else:
-                failed_unassigned += 1
-        elif state is RowState.DONE:
-            if valid:
-                done += 1
-            else:
-                failed_done += 1
-        elif state is RowState.RESERVED:
-            if valid:
-                reserved += 1
-            else:
-                failed_reserved += 1
+        if result.readiness is Readiness.NOT_READY:
+            bucket = "not_ready"  # precedence: counted once, here - never also "invalid"
+        elif result.is_valid:
+            bucket = "ready"
+        else:
+            bucket = "invalid"
+        counts[(state, bucket)] += 1
 
-    lines = [f"{_pluralize(ready, 'row')} ready to upload (no identifier yet)"]
-    if failed_unassigned:
+    lines = [
+        f"{_pluralize(counts[(RowState.UNASSIGNED, 'ready')], 'row')} ready to upload "
+        "(no identifier yet)"
+    ]
+    if counts[(RowState.UNASSIGNED, "not_ready")]:
         lines.append(
-            f"{_pluralize(failed_unassigned, 'row')} not yet assigned an identifier but failed "
-            "validation - see the errors above; will not be uploaded until fixed"
+            f"{_pluralize(counts[(RowState.UNASSIGNED, 'not_ready')], 'row')} not yet "
+            "assigned an identifier and not yet catalogued (missing required fields) - "
+            "waiting on data entry, not blocked by an error"
         )
-    lines.append(f"{done} already uploaded")
-    if failed_done:
+    if counts[(RowState.UNASSIGNED, "invalid")]:
         lines.append(
-            f"{_pluralize(failed_done, 'row')} already uploaded but now fail validation - see "
-            "the errors above; this needs a human to look, not an automatic retry"
+            f"{_pluralize(counts[(RowState.UNASSIGNED, 'invalid')], 'row')} not yet "
+            "assigned an identifier but failed validation - see the errors above; will "
+            "not be uploaded until fixed"
         )
-    lines.append(f"{reserved} reserved but unconfirmed - will retry under existing identifier")
-    if failed_reserved:
+
+    lines.append(f"{counts[(RowState.DONE, 'ready')]} already uploaded")
+    if counts[(RowState.DONE, "not_ready")]:
         lines.append(
-            f"{_pluralize(failed_reserved, 'row')} reserved but invalid - see the errors above; "
-            "will NOT retry automatically until fixed"
+            f"{_pluralize(counts[(RowState.DONE, 'not_ready')], 'row')} already uploaded "
+            "but missing required fields - a required column was cleared after upload; "
+            "needs a human to look, not an automatic retry"
         )
+    if counts[(RowState.DONE, "invalid")]:
+        lines.append(
+            f"{_pluralize(counts[(RowState.DONE, 'invalid')], 'row')} already uploaded but "
+            "now fail validation - see the errors above; this needs a human to look, not "
+            "an automatic retry"
+        )
+
+    lines.append(
+        f"{counts[(RowState.RESERVED, 'ready')]} reserved but unconfirmed - will retry "
+        "under existing identifier"
+    )
+    if counts[(RowState.RESERVED, "not_ready")]:
+        lines.append(
+            f"{_pluralize(counts[(RowState.RESERVED, 'not_ready')], 'row')} reserved but "
+            "not yet catalogued (missing required fields) - waiting on data entry before "
+            "it can retry"
+        )
+    if counts[(RowState.RESERVED, "invalid")]:
+        lines.append(
+            f"{_pluralize(counts[(RowState.RESERVED, 'invalid')], 'row')} reserved but "
+            "invalid - see the errors above; will NOT retry automatically until fixed"
+        )
+
     return "\n".join(lines)
 
 

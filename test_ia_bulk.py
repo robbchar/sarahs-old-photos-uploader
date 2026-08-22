@@ -997,6 +997,118 @@ def test_lifecycle_summary_raises_on_mismatched_lengths_instead_of_silently_trun
         )
 
 
+def _one_row_in(state: str, kind: str) -> tuple[list[dict[str, str]], list[RowValidation]]:
+    """One row/result pair shaped to land in exactly the (state, kind)
+    lifecycle-summary bucket named by its arguments - the 3 (classify_row
+    state) x 3 (readiness/validity bucket) cross Task 7's rendering fans
+    out into, plus a fourth `kind` used only to pin the precedence rule
+    between not-ready and invalid.
+
+    `state` is classify_row()'s own vocabulary ("unassigned"/"reserved"/
+    "done" - see identifiers.RowState/classify_row). `kind` is the bucket
+    format_lifecycle_summary now counts: "ready_valid" (catalogued and
+    passes validation - the headline count), "ready_invalid" (catalogued
+    but fails validation), "not_ready" (missing a required field, no
+    validation errors), or "not_ready_and_invalid" (both at once - must
+    still land in not_ready alone, per the precedence rule)."""
+    row_shapes = {
+        "unassigned": {"ia_identifier": "", "ia_uploaded": ""},
+        "reserved": {"ia_identifier": "lcps-astoriaphotos-00001", "ia_uploaded": ""},
+        "done": {
+            "ia_identifier": "lcps-astoriaphotos-00001",
+            "ia_uploaded": "2026-08-08T10:00:00",
+        },
+    }
+    row = dict(row_shapes[state])
+    identifier = row["ia_identifier"]
+
+    if kind == "ready_valid":
+        result = RowValidation(row_number=2, identifier=identifier)
+    elif kind == "ready_invalid":
+        result = RowValidation(row_number=2, identifier=identifier, errors=["some validation error"])
+    elif kind == "not_ready":
+        result = RowValidation(row_number=2, identifier=identifier, missing_fields=["title"])
+    elif kind == "not_ready_and_invalid":
+        result = RowValidation(
+            row_number=2,
+            identifier=identifier,
+            errors=["some validation error"],
+            missing_fields=["title"],
+        )
+    else:
+        raise ValueError(f"_one_row_in: unknown kind {kind!r}")
+
+    return [row], [result]
+
+
+def _mixed_grid() -> tuple[list[dict[str, str]], list[RowValidation]]:
+    """Nine rows, one per (state, bucket) combination format_lifecycle_summary
+    now counts - proves all nine sum to len(rows) in a single call, not just
+    in isolation per bucket the way test_every_bucket_is_reachable does."""
+    rows: list[dict[str, str]] = []
+    results: list[RowValidation] = []
+    row_number = 2
+    for state in ("unassigned", "done", "reserved"):
+        for kind in ("ready_valid", "ready_invalid", "not_ready"):
+            one_rows, one_results = _one_row_in(state, kind)
+            one_results[0].row_number = row_number
+            rows.extend(one_rows)
+            results.extend(one_results)
+            row_number += 1
+    return rows, results
+
+
+@pytest.mark.parametrize("state", ["unassigned", "reserved", "done"])
+@pytest.mark.parametrize("kind", ["ready_valid", "ready_invalid", "not_ready"])
+def test_every_bucket_is_reachable(state, kind):
+    rows, results = _one_row_in(state, kind)
+    summary = format_lifecycle_summary(rows, results)
+    assert summary  # each combination renders without raising
+
+
+def test_counts_sum_to_total_across_mixed_rows():
+    rows, results = _mixed_grid()  # 9 rows, one per bucket
+    summary = format_lifecycle_summary(rows, results)
+    counted = sum(int(n) for n in re.findall(r"^(\d+) ", summary, re.MULTILINE))
+    assert counted == len(rows)
+
+
+def test_not_ready_takes_precedence_over_invalid():
+    """A row that is both must be counted ONCE, in not-ready - never
+    doubled, and never miscounted as merely invalid."""
+    rows, results = _one_row_in("unassigned", "not_ready_and_invalid")
+    summary = format_lifecycle_summary(rows, results)
+    counted = sum(int(n) for n in re.findall(r"^(\d+) ", summary, re.MULTILINE))
+    assert counted == 1
+    # Not just "the numbers add up to one" - assert directly that the row
+    # landed in the not-ready line and never in an "invalid"/"failed
+    # validation" line, which a mutation that instead counted it as
+    # invalid-only could still satisfy the sum-to-one check above.
+    lines = summary.splitlines()
+    assert (
+        "1 row not yet assigned an identifier and not yet catalogued (missing "
+        "required fields) - waiting on data entry, not blocked by an error"
+    ) in lines
+    assert not any("failed validation" in line for line in lines)
+
+
+def test_lifecycle_summary_prints_exact_text_for_a_not_ready_done_row():
+    """Global-constraint exact-line pin: asserts the full rendered TEXT of
+    a new (Task 7) line via splitlines() membership, not a substring of the
+    whole blob, so a mutation that changes wording or indentation while
+    keeping the arithmetic correct still fails. Uses the DONE state's
+    not-ready line specifically since that is the least intuitive of the
+    nine buckets (a row already uploaded that is somehow still missing a
+    required field - see format_lifecycle_summary's docstring)."""
+    rows, results = _one_row_in("done", "not_ready")
+    summary = format_lifecycle_summary(rows, results)
+    assert (
+        "1 row already uploaded but missing required fields - a required "
+        "column was cleared after upload; needs a human to look, not an "
+        "automatic retry"
+    ) in summary.splitlines()
+
+
 class _RecordingSheetsValues:
     """Records the exact spreadsheetId/range passed to values().get(), so a
     test can tell a client reading the correct Sheet apart from one reading
@@ -4580,3 +4692,20 @@ def test_missing_fields_names_the_blank_template_cells_too(tmp_path):
     rows = [_sheet_row(title="A Title", theme="Townscape", folder="", name="")]
     _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
     assert results[0].missing_fields == ["folder_on_lacie_drive", "file_name"]
+
+
+def test_missing_fields_combines_both_of_its_sources_on_one_row(tmp_path):
+    """Task 6 review gap, closed here: missing_fields is populated from two
+    places - validate_rows() seeds it from blank required_for_upload
+    columns, then validate_sheet_grid() extends it with blank
+    file_template cells (see the ordering note on
+    RowValidation.missing_fields and the comment above the .extend() call
+    in validate_sheet_grid). Every existing test exercises only ONE of the
+    two sources at a time; this pins the combined list, in the documented
+    order (required_for_upload names first, then blank template cells),
+    for a row missing a required column AND a template cell at once - a
+    cross-task contract Task 8 depends on that nothing previously
+    guarded."""
+    rows = [_sheet_row(title="", theme="Townscape", folder="", name="")]
+    _, results = _validate(rows, required_for_upload=("title", "theme"), tmp_path=tmp_path)
+    assert results[0].missing_fields == ["title", "folder_on_lacie_drive", "file_name"]
