@@ -188,9 +188,6 @@ class FileResolutionError(Exception):
     is found by resolution, not by constructing a path"."""
 
 
-_TEMPLATE_FIELD_RE = re.compile(r"\{([^{}]*)\}")
-
-
 def check_file_template(template: str, column_map: ColumnMap) -> None:
     """Fails fast if `file_template` (from the project registry) references
     a column the Sheet's actual header row doesn't have - a mistyped
@@ -198,9 +195,13 @@ def check_file_template(template: str, column_map: ColumnMap) -> None:
     written. Deliberately checked against every normalized field name the
     Sheet has, not just uploadable ones: a template is allowed to reference
     a reserved or held-back column (the folder/filename columns commonly
-    are)."""
+    are).
+
+    Uses template_fields() to extract field names, the same mechanism as
+    candidate_path()'s substitution, so validation and substitution cannot
+    disagree."""
     known_fields = set(column_map.field_names.values())
-    referenced = _TEMPLATE_FIELD_RE.findall(template)
+    referenced = template_fields(template)
     missing = [name for name in referenced if name not in known_fields]
     if missing:
         column_list = ", ".join(f"'{name}'" for name in missing)

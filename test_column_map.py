@@ -16,6 +16,7 @@ from column_map import (
     is_held_back,
     normalize_header,
     resolve_file,
+    template_fields,
 )
 
 
@@ -224,6 +225,17 @@ def test_check_file_template_explains_the_normalized_form_and_lists_what_exists(
     assert "file_name" in message
     # ...and the rest of what is available, so the fix needs no guesswork
     assert "title" in message
+
+
+def test_check_file_template_accepts_format_specs_on_known_columns():
+    """Templates can carry format specs (e.g. {file_name:>10}) to align output.
+    check_file_template must parse these correctly using Formatter semantics
+    (the same mechanism as candidate_path's substitution), not a naive regex
+    that would report "file_name:>10" as the column name and fail spuriously."""
+    column_map = build_column_map(["File Name"])
+
+    # This should not raise; file_name IS a known column, even though it has a format spec
+    check_file_template("{file_name:>10}", column_map)
 
 
 def test_candidate_path_joins_the_two_columns():
@@ -466,8 +478,6 @@ def test_resolve_file_still_searches_files_dirs_root_for_a_single_segment_templa
 
 
 def test_template_fields_returns_substituted_names_in_order():
-    from column_map import template_fields
-
     assert template_fields("{folder_on_lacie_drive}/{file_name}") == (
         "folder_on_lacie_drive",
         "file_name",
@@ -475,12 +485,8 @@ def test_template_fields_returns_substituted_names_in_order():
 
 
 def test_template_fields_ignores_literal_text():
-    from column_map import template_fields
-
     assert template_fields("photos/{file_name}.jpg") == ("file_name",)
 
 
 def test_template_fields_of_a_template_with_no_fields_is_empty():
-    from column_map import template_fields
-
     assert template_fields("static/path.jpg") == ()
