@@ -109,6 +109,7 @@ def make_sheet_registry(files_dir=".", **project_overrides):
         "sheet_tab": "Sheet1",
         "files_dir": files_dir,
         "file_template": "{file}",
+        "required_for_upload": ["title"],
     }
     project.update(project_overrides)
     return {"collection_key": "lcps", "projects": {"astoriaphotos": project}}
@@ -1010,6 +1011,7 @@ def test_build_sheet_client_reads_the_real_sheet_id_when_live(monkeypatch):
         sheet_tab="Donor Photos",
         files_dir=".",
         file_template="{file}",
+        required_for_upload=("title",),
     )
 
     client = build_sheet_client(config, live=True)
@@ -1032,6 +1034,7 @@ def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
         sheet_tab="Donor Photos",
         files_dir=".",
         file_template="{file}",
+        required_for_upload=("title",),
     )
 
     client = build_sheet_client(config, live=False)
@@ -1067,6 +1070,7 @@ def test_build_sheet_client_passes_credentials_through_to_discovery_build(monkey
         sheet_tab="Sheet1",
         files_dir=".",
         file_template="{file}",
+        required_for_upload=("title",),
     )
 
     build_sheet_client(config, live=True)

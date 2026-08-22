@@ -17,9 +17,25 @@ REGISTRY = {
             "sheet_tab": "Sheet1",
             "files_dir": "D:/lcps/photos",
             "file_template": "{cd}/{file_on_array}",
+            "required_for_upload": ["title"],
         }
     },
 }
+
+
+def _registry(**overrides):
+    block = {
+        "mediatype": "image",
+        "ia_collection": "lcpsdigitalcollection",
+        "sheet_id": "real",
+        "test_sheet_id": "test",
+        "sheet_tab": "Sheet1",
+        "files_dir": "./data",
+        "file_template": "{folder}/{name}",
+        "required_for_upload": ["title", "theme"],
+    }
+    block.update(overrides)
+    return {"collection_key": "lcps", "projects": {"p": block}}
 
 
 def test_load_project_config_reads_the_block():
@@ -135,3 +151,38 @@ def test_shipped_registry_json_loads_against_the_current_required_keys():
 
     for key in REQUIRED_KEYS:
         assert getattr(config, key), f"shipped registry has an empty '{key}'"
+
+
+def test_required_for_upload_is_loaded_as_a_tuple():
+    config = load_project_config(_registry(), "p")
+    assert config.required_for_upload == ("title", "theme")
+
+
+def test_missing_required_for_upload_is_an_error():
+    registry = _registry()
+    del registry["projects"]["p"]["required_for_upload"]
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(registry, "p")
+    assert "required_for_upload" in str(exc.value)
+
+
+def test_empty_required_for_upload_is_an_error():
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(_registry(required_for_upload=[]), "p")
+    assert "at least one" in str(exc.value)
+
+
+def test_required_for_upload_must_be_a_list_not_a_string():
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(_registry(required_for_upload="title"), "p")
+    assert "must be a list" in str(exc.value)
+
+
+def test_raw_header_text_is_rejected_with_the_normalization_rule_explained():
+    """The file_template lesson: an un-normalized name produced an error that
+    read as 'your Sheet is wrong' when the Sheet was fine."""
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(_registry(required_for_upload=["Architectura Style"]), "p")
+    message = str(exc.value)
+    assert "Architectura Style" in message
+    assert "architectura_style" in message

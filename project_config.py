@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from column_map import normalize_header
+
 REQUIRED_KEYS = (
     "mediatype",
     "ia_collection",
@@ -35,6 +37,7 @@ class ProjectConfig:
     sheet_tab: str
     files_dir: str
     file_template: str
+    required_for_upload: tuple[str, ...]
 
     def sheet_id_for(self, live: bool) -> str:
         return self.sheet_id if live else self.test_sheet_id
@@ -74,6 +77,41 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
             f"project '{project_id}' is missing required registry keys: {', '.join(missing)}"
         )
 
+    required_for_upload = block.get("required_for_upload")
+    if required_for_upload is None:
+        raise ConfigError(
+            f"project '{project_id}' is missing required registry key: "
+            "required_for_upload. It lists the normalized column names a human "
+            "must fill in before a row can be uploaded, e.g. [\"title\", \"theme\"]. "
+            "There is deliberately no default - a project inheriting another "
+            "project's readiness rules by silence is worse than stating them."
+        )
+    if not isinstance(required_for_upload, list):
+        raise ConfigError(
+            f"project '{project_id}': required_for_upload must be a list, got "
+            f"{type(required_for_upload).__name__!r}"
+        )
+    if not required_for_upload:
+        raise ConfigError(
+            f"project '{project_id}': required_for_upload must name at least one column"
+        )
+    for name in required_for_upload:
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(
+                f"project '{project_id}': every required_for_upload entry must be a "
+                f"non-empty string, got {name!r}"
+            )
+        normalized = normalize_header(name)
+        if normalized != name:
+            raise ConfigError(
+                f"project '{project_id}': required_for_upload entry {name!r} is raw "
+                f"header text, not a normalized column name - use {normalized!r}. "
+                "This is the same rule file_template follows: the Sheet's headers are "
+                "normalized (lowercased, punctuation dropped, spaces to underscores) "
+                "before anything matches against them, so the registry must name the "
+                "normalized form. Your Sheet is fine; the registry entry is not."
+            )
+
     if block["sheet_id"].strip() == block["test_sheet_id"].strip():
         raise ConfigError(
             f"project '{project_id}': sheet_id and test_sheet_id must differ, "
@@ -90,4 +128,5 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
         sheet_tab=block["sheet_tab"].strip(),
         files_dir=block["files_dir"].strip(),
         file_template=block["file_template"].strip(),
+        required_for_upload=tuple(required_for_upload),
     )

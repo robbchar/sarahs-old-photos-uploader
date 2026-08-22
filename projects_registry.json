@@ -9,7 +9,8 @@
       "test_sheet_id": "1Kgm7pRJSN7WIYt5pMpI0krw4V6Bs9UrAfeeO7jFcXPI",
       "sheet_tab": "TestSheet",
       "files_dir": "./data",
-      "file_template": "{folder_on_lacie_drive}/{file_name}"
+      "file_template": "{folder_on_lacie_drive}/{file_name}",
+      "required_for_upload": ["title", "theme"]
     }
   }
 }
