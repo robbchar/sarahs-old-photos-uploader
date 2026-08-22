@@ -4416,11 +4416,16 @@ def test_a_blank_filename_never_reaches_the_resolver(tmp_path):
     assert outcomes.blank == {2: ["name"]}
 
 
-def test_only_the_blank_cells_are_named(tmp_path):
+def test_a_blank_folder_beside_a_filled_filename_is_still_not_ready(tmp_path):
+    """A half-catalogued row: the operator named a file but not its folder.
+    It routes to `blank` naming only the folder cell, so the report can say
+    which cell is missing rather than lumping it in with untouched rows -
+    and NOT to `errors`, because a blank cell is not a wrong answer."""
     config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
-    rows = [{"folder": "SOP CD 1", "name": ""}]
+    rows = [{"folder": "", "name": "Finnis Meat Market.jpg"}]
     outcomes = resolve_sheet_files(rows, config)
-    assert outcomes.blank == {2: ["name"]}
+    assert outcomes.blank == {2: ["folder"]}
+    assert outcomes.errors == {}
 
 
 def test_a_present_candidate_that_does_not_resolve_is_an_error_not_blank(tmp_path):

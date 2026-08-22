@@ -821,9 +821,15 @@ def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> Fi
 
         blank_cells = [name for name in fields if not (row.get(name) or "").strip()]
         if blank_cells:
-            # Nobody asserted a file here, so there is nothing to be wrong.
-            # Returning before resolve_file() is what makes the old
-            # "matching ''" message unreachable rather than merely rare.
+            # At least one cell the template needs is empty, so no candidate
+            # path can be built and there is nothing to resolve - which is
+            # what makes the old "matching ''" message unreachable rather
+            # than merely rare. Never an error even when the OTHER cells are
+            # filled: a blank cell is a not-yet-answered question, not a
+            # wrong answer. len(blank_cells) < len(fields) is what tells a
+            # partially-filled row from an untouched one, so the report can
+            # name the specific missing cell instead of lumping the two
+            # together.
             blank[row_number] = blank_cells
             row["file"] = ""
             continue
