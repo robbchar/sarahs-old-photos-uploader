@@ -775,11 +775,17 @@ what is done" the same instruction, which they are not.
 
 ## Still open
 
-- `collection_key` (currently `"lcps"`, the first segment of every minted
-  identifier) has never been confirmed against how LCPS actually names its
-  collection. No `--live` run has ever been made.
+- ~~`collection_key` has never been confirmed~~ **Settled 2026-08-23**:
+  `collection_key` is `"lcps"` — the first segment of every minted identifier
+  and of every item's permanent public URL
+  (`archive.org/details/lcps-sarasoldphotos-00001`). Confirmed as the most
+  specific pointer to the organization; `lcpsociety` (the IA account's domain)
+  and `lcpsdigitalcollection` (the parent collection) were both considered and
+  rejected as slightly off. This value never reaches Internet Archive — it is
+  purely the identifier namespace, used by `format_identifier()`,
+  `next_identifiers()` and `check_identifier()`.
   **Not to be confused with `ia_collection`** — see below; they are unrelated
-  values and only one of them is now settled.
+  values, and both are now settled.
 - ~~The real IA collection has never been confirmed~~ **Settled 2026-08-22**:
   `ia_collection` is `sarasoldphotos`, the subcollection — confirmed to exist
   (`archive.org/metadata/sarasoldphotos`, title "Sara's Old Photos") and
