@@ -56,11 +56,29 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
         )
 
     projects = registry.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ConfigError(
+            f"registry 'projects' must be an object mapping project ids to their "
+            f"configuration, got {type(projects).__name__!r}"
+        )
     if project_id not in projects:
         known = ", ".join(sorted(projects)) or "(none registered)"
         raise ConfigError(f"unknown project '{project_id}'; registry knows: {known}")
 
     block = projects[project_id]
+    # Checked before the first block.get() below. Without this, a hand-edited
+    # registry whose project value is a string or a list - a botched merge, a
+    # half-finished edit - raises AttributeError: 'str' object has no attribute
+    # 'get' as a bare traceback, while every other shape problem in this
+    # function produces a ConfigError naming the fix. Both cmd_validate and
+    # upload_from_sheet call this before any Sheet I/O, so that traceback is
+    # the operator's first contact with the tool.
+    if not isinstance(block, dict):
+        raise ConfigError(
+            f"project '{project_id}' must be an object holding its configuration keys "
+            f"({', '.join(REQUIRED_KEYS)}, required_for_upload), got "
+            f"{type(block).__name__!r}"
+        )
 
     # Validate all values are strings before processing
     for key in REQUIRED_KEYS:

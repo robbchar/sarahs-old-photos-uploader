@@ -222,3 +222,29 @@ def test_raw_header_text_is_rejected_with_the_normalization_rule_explained():
         "before anything matches against them, so the registry must name the "
         "normalized form. Your Sheet is fine; the registry entry is not."
     )
+
+
+@pytest.mark.parametrize("block", ["see other file", ["mediatype"], 42, None])
+def test_a_project_block_that_is_not_an_object_is_a_config_error_not_a_traceback(block):
+    """A hand-edited registry whose project value is a string or a list - a
+    botched merge, a half-finished edit - used to reach block.get() and raise
+    AttributeError as a bare traceback, while every neighbouring shape
+    problem produces a ConfigError naming the fix. Both cmd_validate and
+    upload_from_sheet call this before any Sheet I/O, so that traceback was
+    the operator's first contact with the tool."""
+    registry = {"collection_key": "lcps", "projects": {"p": block}}
+
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(registry, "p")
+
+    assert "project 'p' must be an object" in str(exc.value)
+    assert type(block).__name__ in str(exc.value)
+
+
+def test_a_projects_value_that_is_not_an_object_is_a_config_error():
+    registry = {"collection_key": "lcps", "projects": ["p"]}
+
+    with pytest.raises(ConfigError) as exc:
+        load_project_config(registry, "p")
+
+    assert "'projects' must be an object" in str(exc.value)
