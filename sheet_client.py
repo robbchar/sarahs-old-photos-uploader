@@ -15,6 +15,24 @@ def column_letter(index: int) -> str:
     return letters
 
 
+def quote_tab(tab: str) -> str:
+    """A1 notation requires a sheet name to be single-quoted unless it is
+    made only of letters, digits and underscores, with any embedded single
+    quote doubled: `Sara's Photos` is written `'Sara''s Photos'`.
+
+    Quoting unconditionally rather than only when it is strictly needed:
+    `'Sheet1'!A1` is equally valid for a name that would not have required
+    it, so there is no case to get wrong, and no predicate to keep in sync
+    with Google's rules about which characters force quoting.
+
+    Without this, a tab named with a space - which is what a Google Sheet tab
+    is usually called - made every read and every write fail, and the error
+    surfaced as a generic HttpError that cmd_validate reports as "check that
+    'sheet_tab' names the tab exactly (case-sensitive)", sending the operator
+    to re-verify the one thing that was already right."""
+    return "'" + tab.replace("'", "''") + "'"
+
+
 @dataclass(frozen=True)
 class CellUpdate:
     a1: str
@@ -31,7 +49,7 @@ class SheetClient:
         response = (
             self._service.spreadsheets()
             .values()
-            .get(spreadsheetId=self._spreadsheet_id, range=self._tab)
+            .get(spreadsheetId=self._spreadsheet_id, range=quote_tab(self._tab))
             .execute()
         )
         return response.get("values", [])
@@ -45,7 +63,7 @@ class SheetClient:
         body = {
             "valueInputOption": "RAW",
             "data": [
-                {"range": f"{self._tab}!{update.a1}", "values": [[update.value]]}
+                {"range": f"{quote_tab(self._tab)}!{update.a1}", "values": [[update.value]]}
                 for update in updates
             ],
         }
