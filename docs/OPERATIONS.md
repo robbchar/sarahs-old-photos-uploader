@@ -81,6 +81,44 @@ wrong metadata if this step is skipped. Follow
 [`CSV-PREPARATION.md`](CSV-PREPARATION.md) — it is the highest-risk step on
 that path.
 
+## 0. Reconcile file names (when rows don't resolve)
+
+Not one of the four phases above — a prerequisite for the first of them,
+needed only when it applies. Run it whenever `validate` (§1) reports rows
+whose filename cell doesn't resolve against the drive, before trusting the
+rest of that report.
+
+```bash
+# see what it would propose, without prompting or writing anything
+python ia_bulk.py reconcile-files --project sarasoldphotos --dry-run
+
+# work through the mismatches interactively
+python ia_bulk.py reconcile-files --project sarasoldphotos
+```
+
+It reads the Sheet live, finds every row whose filename cell doesn't
+resolve, and proposes a correction for the ones it can — one row at a
+time, nothing written until you press `[y]` or type one at `[e]`. See
+[`README.md`](../README.md#reconcile-files-correct-a-filename-cell-that-doesnt-match-the-drive)
+for the prompt keys and exactly what it does and does not touch.
+
+**Why before validate.** "Why this is a hard rule" below walks through the
+real case this project already hit: of three rows that failed file
+resolution in a nine-row rehearsal, two were real, unnoticed
+mismatches — not because anything was missing, but because a volunteer's
+transcription, correct by eye, didn't survive being copied off source
+media. `validate`'s error list and not-ready breakdown are only a useful
+signal if a row reported broken is actually broken rather than merely
+mistyped, so working through that class of mismatch first is what makes
+the rest of `validate`'s report worth trusting. See
+[`docs/decisions/RECONCILIATION.md`](decisions/RECONCILIATION.md) for why
+reconciliation only ever proposes a correction rather than applying one,
+and why its exit code stays `0` while rows remain unresolved.
+
+Safe to run repeatedly — a Sheet with nothing left to reconcile prints
+`nothing to reconcile - every row's filename resolves against the drive`
+and does nothing else.
+
 ## 1. Validate (no uploads, no writes)
 
 > **Run this before every `upload`, every time.** It is not optional and it is
