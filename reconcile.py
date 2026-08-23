@@ -5,6 +5,8 @@ supplies the candidates and acts on the result."""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from pathlib import Path
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _DIGITS = re.compile(r"\d+")
@@ -55,3 +57,61 @@ def levenshtein(a: str, b: str) -> int:
             )
         previous = current
     return previous[-1]
+
+
+MAX_EDIT_DISTANCE = 2
+
+
+class AmbiguousMatch(Exception):
+    """More than one candidate matched. Never resolved automatically - see
+    resolve_file()'s identical rule and docs/decisions/FILES-AND-METADATA.md,
+    "A file is found by resolution, not by constructing a path"."""
+
+    def __init__(self, matches: list[str]) -> None:
+        super().__init__(f"{len(matches)} candidates matched: {', '.join(sorted(matches))}")
+        self.matches = matches
+
+
+@dataclass(frozen=True)
+class Proposal:
+    filename: str
+    reason: str
+
+
+def _stem(name: str) -> str:
+    return normalize_name(Path(name).stem)
+
+
+def propose_match(wanted: str, candidates: list[str]) -> Proposal | None:
+    """The single candidate that should be proposed for `wanted`, or None.
+
+    Two passes, most certain first. Pass A is an exact match after
+    normalization - the same photograph, written differently. Pass B is a
+    guess bounded by edit distance, and only runs when Pass A found nothing,
+    so a certainty is never made to compete with a guess for ambiguity.
+
+    Raises AmbiguousMatch if a pass produces more than one candidate."""
+    target = _stem(wanted)
+
+    exact = sorted({c for c in candidates if _stem(c) == target})
+    if len(exact) == 1:
+        return Proposal(filename=exact[0], reason="punctuation and spacing")
+    if exact:
+        raise AmbiguousMatch(exact)
+
+    # Numbers must match exactly - see digit_runs(). Letters may differ.
+    target_digits = digit_runs(target)
+    near = sorted(
+        {
+            c
+            for c in candidates
+            if digit_runs(_stem(c)) == target_digits
+            and levenshtein(_stem(c), target) <= MAX_EDIT_DISTANCE
+        }
+    )
+    if len(near) == 1:
+        distance = levenshtein(_stem(near[0]), target)
+        return Proposal(filename=near[0], reason=f"edit distance {distance}")
+    if near:
+        raise AmbiguousMatch(near)
+    return None
