@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -59,6 +59,21 @@ def load_credentials(
     if credentials and credentials.expired and credentials.refresh_token:
         try:
             credentials.refresh(Request())
+        except TransportError as exc:
+            # Google could not be REACHED - a dropped connection, DNS failure,
+            # captive portal, proxy refusing CONNECT. Distinct from a dead
+            # refresh token below and must not be treated as one: the cached
+            # credentials are probably fine, so falling through to the consent
+            # flow would discard a working token and open a browser that
+            # cannot reach Google either. google.auth.transport.requests.Request
+            # wraps every requests-level failure in TransportError, so this one
+            # class covers the whole transport layer.
+            raise AuthUnavailable(
+                f"could not reach Google to refresh the cached token ({exc}). This is a "
+                "network problem, not an authorization one - the cached token at "
+                f"{token_path} is left alone. Check the connection and re-run; there is "
+                "nothing to re-authorize."
+            ) from exc
         except RefreshError:
             # The refresh token itself is dead -- revoked, or killed by an
             # org password change. Treat this exactly like having no cached

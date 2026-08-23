@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.oauth2.credentials import Credentials
 
 import google_auth
@@ -253,3 +253,58 @@ def test_default_paths_are_absolute_and_anchored_to_the_project_root(monkeypatch
     assert DEFAULT_CLIENT_SECRETS_PATH.is_absolute()
     assert DEFAULT_TOKEN_PATH == project_root / ".ignored" / "google-token.json"
     assert DEFAULT_CLIENT_SECRETS_PATH == project_root / ".ignored" / "google-client-secret.json"
+
+
+def test_unreachable_google_during_refresh_does_not_discard_the_cached_token(
+    tmp_path, monkeypatch
+):
+    """A TransportError means Google could not be REACHED, which is a
+    different thing from a dead refresh token and must not be handled as
+    one. Before this, only RefreshError was caught, so a dropped connection
+    mid-refresh escaped load_credentials as a raw google.auth traceback on a
+    tool whose whole design is a clean stderr message instead."""
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, expired=True)
+    secrets_path = tmp_path / "secrets.json"
+    _write_client_secrets(secrets_path)
+    original = token_path.read_text(encoding="utf-8")
+
+    def _unreachable(self, request):
+        raise TransportError("Failed to establish a new connection")
+
+    monkeypatch.setattr(Credentials, "refresh", _unreachable)
+    monkeypatch.setattr(
+        "google_auth.InstalledAppFlow.from_client_secrets_file", _refuse_browser_launch
+    )
+
+    with pytest.raises(AuthUnavailable) as exc:
+        load_credentials(token_path, secrets_path, interactive=True)
+
+    # A network problem, named as one - not "re-authorize", which would send
+    # the operator to fix something that is not broken.
+    assert "network problem" in str(exc.value)
+    assert "nothing to re-authorize" in str(exc.value)
+    # The cached token was fine; discarding it would turn a transient outage
+    # into a re-consent.
+    assert token_path.read_text(encoding="utf-8") == original
+
+
+def test_unreachable_google_during_refresh_fails_the_same_way_when_not_interactive(
+    tmp_path, monkeypatch
+):
+    """The unattended path must not report a network outage as "run this
+    from a terminal to authorize", which is the message the non-interactive
+    branch below it produces."""
+    token_path = tmp_path / "token.json"
+    _write_token(token_path, expired=True)
+
+    def _unreachable(self, request):
+        raise TransportError("Failed to establish a new connection")
+
+    monkeypatch.setattr(Credentials, "refresh", _unreachable)
+
+    with pytest.raises(AuthUnavailable) as exc:
+        load_credentials(token_path, tmp_path / "secrets.json", interactive=False)
+
+    assert "network problem" in str(exc.value)
+    assert "not attached to a terminal" not in str(exc.value)
