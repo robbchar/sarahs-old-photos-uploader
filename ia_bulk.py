@@ -1366,6 +1366,11 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
 class Decision:
     action: str          # "accept" | "reject" | "stop"
     filename: str        # the RESOLVED name, empty unless accepting
+    # How the operator answered, not what they answered. [y] accepts the
+    # proposal; [e] is a name they typed - which resolve_file() may well
+    # resolve to the proposed file anyway. Comparing the two strings cannot
+    # tell those apart, and the decision log has to.
+    typed: bool = False
 
 
 def prompt_for_decision(
@@ -1422,7 +1427,7 @@ def prompt_for_decision(
             if claim_key(resolved) in claimed:
                 print(f"           '{name}' is already used by another row")
                 continue
-            return Decision(action="accept", filename=name)
+            return Decision(action="accept", filename=name, typed=True)
         print("           expected y, n, e, l or q")
 
 
@@ -3463,12 +3468,23 @@ class PendingCorrection:
 
 
 def log_decision(log_path, row_number: int, folder: str, wanted: str, status: str,
-                 chosen: str = "", reason: str = "") -> None:
+                 chosen: str = "", reason: str = "", proposed: str = "",
+                 matches: list[str] | None = None) -> None:
     """One line per row considered. Prompt-per-proposal leaves no record of
-    what was decided; this is that record."""
+    what was decided; this is that record.
+
+    `proposed` and `chosen` are separate on purpose. `chosen` is what was
+    written, so it is empty on every path but an acceptance - and a rejected
+    proposal with no record of WHAT was rejected cannot be reviewed later,
+    which is half of what this log is for. `matches` does the same job for
+    the ambiguous path, where the console names every candidate and the
+    durable record used to name none. Every key is present on every line,
+    empty where it does not apply, so a reader never has to know which
+    statuses carry which fields."""
     entry = {
         "row": row_number, "folder": folder, "wanted": wanted,
-        "status": status, "chosen": chosen, "reason": reason,
+        "status": status, "chosen": chosen, "proposed": proposed,
+        "matches": list(matches or []), "reason": reason,
         "timestamp": utc_timestamp(),
     }
     with open(log_path, "a", encoding="utf-8") as f:
@@ -3627,7 +3643,8 @@ def cmd_reconcile_files(args) -> int:
             print(f"row {row_number}  '{wanted}'  matches {len(exc.matches)} files - "
                   f"leaving it alone: {', '.join(exc.matches)}")
             if log_path:
-                log_decision(log_path, row_number, folder, wanted, "ambiguous")
+                log_decision(log_path, row_number, folder, wanted, "ambiguous",
+                             matches=exc.matches)
             continue
 
         if dry_run:
@@ -3648,7 +3665,8 @@ def cmd_reconcile_files(args) -> int:
         if decision.action == "reject":
             if log_path:
                 log_decision(log_path, row_number, folder, wanted,
-                             "rejected" if proposal else "no_candidate", reason=reason)
+                             "rejected" if proposal else "no_candidate", reason=reason,
+                             proposed=proposal.filename if proposal else "")
             continue
 
         accepted += 1
@@ -3663,9 +3681,14 @@ def cmd_reconcile_files(args) -> int:
             )
         )
         if log_path:
-            status = "accepted" if proposal and decision.filename == proposal.filename else "typed"
+            # From how the operator answered, not from whether the two
+            # strings happen to agree: a name typed at [e] that matches the
+            # proposal is still a name a human typed, and a log that calls
+            # it `accepted` claims the tool proposed something it did not.
+            status = "typed" if decision.typed else "accepted"
             log_decision(log_path, row_number, folder, wanted, status,
-                         chosen=decision.filename, reason=reason)
+                         chosen=decision.filename, reason=reason,
+                         proposed=proposal.filename if proposal else "")
         if len(pending) >= RECONCILE_FLUSH_EVERY and not flush():
             return 1
 

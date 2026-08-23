@@ -368,8 +368,16 @@ the loop started.
 
 `log_decision()` writes reconciliation's own JSONL shape — one line per
 row *considered*, not per row acted on:
-`{row, folder, wanted, status, chosen, reason, timestamp}`, with `status`
-one of `accepted`/`typed`/`rejected`/`no_candidate`/`ambiguous`/`stopped`.
+`{row, folder, wanted, status, chosen, proposed, matches, reason,
+timestamp}`, with `status` one of
+`accepted`/`typed`/`rejected`/`no_candidate`/`ambiguous`/`stopped`. Every
+key is on every line, empty where it does not apply. `chosen` is what was
+written and so is empty on every path but an acceptance; `proposed` is what
+the tool put forward, which is the only record of *what* a rejection turned
+down; `matches` names the files an `ambiguous` row could not be chosen
+between. `accepted` versus `typed` comes from how the operator answered
+(`[y]` versus `[e]`), not from comparing the two strings — a name typed at
+`[e]` is still typed when it happens to equal the proposal.
 This is a different record than `upload`/`sync-metadata`'s per-row-result
 log below, because it answers a different question later: not "did this
 identifier upload", but "what did a human decide about this row, and

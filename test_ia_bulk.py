@@ -7330,6 +7330,9 @@ def test_prompt_typed_name_is_resolved_before_it_is_accepted(tmp_path):
     )
     assert decision.action == "accept"
     assert decision.filename == "Finnish Meat Market.jpg"   # the RESOLVED name
+    # how it was answered, not what was answered - the decision log has to
+    # tell a typed name from an accepted proposal even when they agree
+    assert decision.typed is True
 
 
 def test_prompt_reprompts_when_a_typed_name_does_not_resolve(tmp_path, capsys):
@@ -7504,6 +7507,105 @@ def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch)
     cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
 
     assert written == []
+
+
+def _reconcile_log_lines(tmp_path):
+    logs = sorted((tmp_path / "logs").glob("reconcile-files-*.jsonl"))
+    assert len(logs) == 1
+    return [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
+
+
+def test_cmd_reconcile_files_logs_what_was_decided_about_every_row(tmp_path, monkeypatch):
+    """One line per row *considered*. Prompt-per-proposal leaves no other
+    record of what a volunteer decided, so a rejected proposal has to say
+    what was turned down and an ambiguous row has to name the files it
+    could not choose between - the console says both and used to be the
+    only place that did."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another title"],
+            ["SOP CD 2", "Liberty.jpg", "A third title"],
+        ],
+        {
+            "SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"],
+            "SOP CD 2": ["Liberty.JPG", "liberty.jpeg"],
+        },
+        [
+            Decision(action="accept", filename="Finnish Meat Market.jpg"),
+            Decision(action="reject", filename=""),
+        ],
+    )
+
+    assert cmd_reconcile_files(_reconcile_args(tmp_path, registry_path)) == 0
+    accepted, rejected, ambiguous = _reconcile_log_lines(tmp_path)
+
+    assert accepted["row"] == 2
+    assert accepted["folder"] == "SOP CD 1"
+    assert accepted["wanted"] == "Finnis Meat Market.jpg"
+    assert accepted["status"] == "accepted"
+    assert accepted["chosen"] == "Finnish Meat Market.jpg"
+    assert accepted["proposed"] == "Finnish Meat Market.jpg"
+    assert accepted["reason"] == "edit distance 1"
+    assert accepted["matches"] == []
+    assert accepted["timestamp"].endswith("Z")
+
+    assert rejected["row"] == 3
+    assert rejected["status"] == "rejected"
+    assert rejected["chosen"] == ""
+    assert rejected["proposed"] == "Alderbrook Hall.jpg"   # what was turned down
+    assert rejected["reason"] == "edit distance 1"
+
+    assert ambiguous["row"] == 4
+    assert ambiguous["status"] == "ambiguous"
+    assert ambiguous["chosen"] == ""
+    assert sorted(ambiguous["matches"]) == ["Liberty.JPG", "liberty.jpeg"]
+
+
+def test_cmd_reconcile_files_logs_a_typed_name_as_typed_even_when_it_matches_the_proposal(
+    tmp_path, monkeypatch
+):
+    """`typed` records how the operator answered, not whether the two
+    strings agree. Comparing them called a name a human typed at [e]
+    `accepted`, claiming the tool proposed something it did not."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg", typed=True)],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    (entry,) = _reconcile_log_lines(tmp_path)
+
+    assert entry["status"] == "typed"
+    assert entry["chosen"] == "Finnish Meat Market.jpg"
+    assert entry["proposed"] == "Finnish Meat Market.jpg"
+
+
+def test_cmd_reconcile_files_logs_a_stop(tmp_path, monkeypatch):
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="stop", filename="")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    (entry,) = _reconcile_log_lines(tmp_path)
+
+    assert entry["status"] == "stopped"
+    assert entry["chosen"] == ""
 
 
 def test_cmd_reconcile_files_drops_a_correction_whose_row_moved_mid_session(tmp_path, monkeypatch, capsys):
