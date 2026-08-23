@@ -64,8 +64,10 @@ leaving a row alone. That path is not a bare write to the Sheet — the typed
 string goes through the same `resolve_file()` every other path in this tool
 uses. A name that does not resolve to exactly one real file in the row's
 folder is refused with `resolve_file()`'s own error and asked again; a name
-that resolves to a file another row in this run already claimed is refused
-too, naming the row that has it.
+that resolves to a file another row in this run already claimed is
+refused too, with a message saying the file is already used by another
+row (not which one — `claimed` is a set of paths, with no row number
+attached to remember).
 
 The reason is structural, not extra caution. `reconcile-files` exists to
 fix rows where what a human typed does not match what is on disk — a prompt
@@ -111,12 +113,14 @@ operator working a ~10,000-row collection over many sessions looks like.
 The run still reports the count ("N row(s) still unresolved"); it just is
 not what decides the exit code.
 
-Only a run that could not do its job at all returns `1` — the Sheet's ID
-is still the registry's placeholder, it has no column matching
-`file_template`'s name field, or a write to it fails outright. Each of
-those means nothing here can work around the problem, not that a row
-turned out to be broken. A non-zero exit that persists for the weeks this
-backlog will realistically take to clear teaches the operator to stop
-reading it — the same trap `READINESS.md`'s "A bad row is skipped; a bad
+Only a run that could not do its job at all returns `1` — `read_sheet()`
+never even reached the rows (the Sheet's ID is still the registry's
+placeholder, the spreadsheet couldn't be read at all, or it had no data
+rows), the Sheet has no column matching `file_template`'s name field, or
+a write to it fails outright. Every one of those is a reason nothing here
+can work around the problem, not that a row turned out to be broken. A
+non-zero exit that persists for the weeks this backlog will realistically
+take to clear teaches the operator to stop reading it — the same trap
+`READINESS.md`'s "A bad row is skipped; a bad
 header stops the whole run" already rejects for `validate` and `upload`,
 reapplied here rather than relearned.

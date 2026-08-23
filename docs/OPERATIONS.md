@@ -104,13 +104,19 @@ for the prompt keys and exactly what it does and does not touch.
 
 **Why before validate.** "Why this is a hard rule" below walks through the
 real case this project already hit: of three rows that failed file
-resolution in a nine-row rehearsal, two were real, unnoticed
-mismatches — not because anything was missing, but because a volunteer's
-transcription, correct by eye, didn't survive being copied off source
-media. `validate`'s error list and not-ready breakdown are only a useful
-signal if a row reported broken is actually broken rather than merely
-mistyped, so working through that class of mismatch first is what makes
-the rest of `validate`'s report worth trusting. See
+resolution in a nine-row rehearsal, two were real, unnoticed mismatches —
+of two different kinds. `Finnis Meat Market.jpg` vs `Finnish Meat
+Market.jpg` is a plain human typo. `Roy's Shell.jpg` vs ` Roy_s  Shell.jpg`
+is not a typo at all: apostrophes and doubled spaces get mangled when
+files are copied off source media, so a volunteer's transcription of that
+one, correct by eye, still doesn't match the disk — no amount of care
+would have caught it. `reconcile-files` needs both of its matching passes
+because of that split: an exact match after normalization catches the
+`Roy_s` kind, edit distance catches the `Finnis` kind. `validate`'s error
+list and not-ready breakdown are only a useful signal if a row reported
+broken is actually broken rather than mismatched in one of these two
+ways, so working through both first is what makes the rest of
+`validate`'s report worth trusting. See
 [`docs/decisions/RECONCILIATION.md`](decisions/RECONCILIATION.md) for why
 reconciliation only ever proposes a correction rather than applying one,
 and why its exit code stays `0` while rows remain unresolved.
