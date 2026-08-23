@@ -38,7 +38,7 @@ from ia_bulk import (
     is_rate_limit_error,
     UploadFailed,
 )
-from project_config import ProjectConfig
+from project_config import ProjectConfig, DEFAULT_PHOTO_EXTENSIONS
 
 
 class FakeResponse:
@@ -155,6 +155,7 @@ def _sheet_config(**overrides) -> ProjectConfig:
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
     return dataclasses.replace(base, **overrides)
 
@@ -1212,6 +1213,7 @@ def test_build_sheet_client_reads_the_real_sheet_id_when_live(monkeypatch):
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     client = build_sheet_client(config, live=True)
@@ -1235,6 +1237,7 @@ def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     client = build_sheet_client(config, live=False)
@@ -1271,6 +1274,7 @@ def test_build_sheet_client_passes_credentials_through_to_discovery_build(monkey
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     build_sheet_client(config, live=True)
