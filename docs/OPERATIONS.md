@@ -96,9 +96,13 @@ python ia_bulk.py reconcile-files --project sarasoldphotos --dry-run
 python ia_bulk.py reconcile-files --project sarasoldphotos
 ```
 
-It reads the Sheet live, finds every row whose filename cell doesn't
-resolve, and proposes a correction for the ones it can — one row at a
-time, nothing written until you press `[y]` or type one at `[e]`. See
+It reads the Sheet live, finds every row that *named* a file which
+doesn't resolve, and proposes a correction for the ones it can — one row
+at a time, nothing written until you press `[y]` or type one at `[e]`. A
+row whose filename cell is blank is not yet catalogued rather than broken:
+it is reported as a single count and never prompted about, so a run on the
+full Sheet asks about the couple of hundred rows an operator can act on
+rather than the ~2,900 that have no filename to correct. See
 [`README.md`](../README.md#reconcile-files-correct-a-filename-cell-that-doesnt-match-the-drive)
 for the prompt keys and exactly what it does and does not touch.
 
@@ -122,8 +126,8 @@ reconciliation only ever proposes a correction rather than applying one,
 and why its exit code stays `0` while rows remain unresolved.
 
 Safe to run repeatedly — a Sheet with nothing left to reconcile prints
-`nothing to reconcile - every row's filename resolves against the drive`
-and does nothing else.
+`nothing to reconcile - every row with a filename resolves against the
+drive` and does nothing else.
 
 ## 1. Validate (no uploads, no writes)
 

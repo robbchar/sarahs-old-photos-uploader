@@ -348,7 +348,14 @@ python ia_bulk.py reconcile-files --project sarasoldphotos
 
 It reads the Sheet live and resolves every row's file the same way
 `validate`/`upload` do. Rows that resolve are left alone entirely — never
-prompted about, never written to. For each row that does **not** resolve,
+prompted about, never written to. So are rows nobody has catalogued yet:
+a row whose filename cell is blank asserted no file, so there is nothing
+to be wrong and nothing to propose — they are counted in one line
+(`2,914 rows not yet catalogued - no filename to reconcile, skipped`) and
+never prompted about, the same not-ready-versus-broken split
+[`docs/decisions/READINESS.md`](docs/decisions/READINESS.md) draws for
+`validate` and `upload`. For each row that named a file and does **not**
+resolve,
 it looks for a single best match among the files still unclaimed in that
 row's own folder and asks before touching the Sheet:
 

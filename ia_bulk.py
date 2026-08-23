@@ -1256,16 +1256,31 @@ class FileSurvey:
     `claimed` is built before any matching runs, and `unclaimed` is its
     complement. That ordering is the whole safety property: a file another
     row already resolves to can never be proposed to a second row, which is
-    the misattribution hazard in issue #1."""
+    the misattribution hazard in issue #1.
+
+    `unresolved` holds only rows that ASSERTED a filename and were wrong.
+    Rows whose file_template cells are blank are counted in `not_ready` and
+    nowhere else - see survey_files()."""
 
     unresolved: dict[int, str]
     wanted: dict[int, str]
     claimed: set[str]
     unclaimed: dict[str, list[str]]
+    not_ready: list[int]
 
 
 def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurvey:
     """Resolve every row, then work out which files nothing points at.
+
+    A row with a blank file_template cell is NOT unresolved - it is
+    not-ready, the same split resolve_sheet_files() draws between `errors`
+    and `blank`. Nobody asserted a file, so there is nothing to be wrong and
+    nothing a proposal could be matched against. Filing those as unresolved
+    made reconcile-files raise one dead prompt per uncatalogued row: on the
+    real Sheet that is ~2,900 prompts with no proposal and no candidates,
+    burying the ~150-300 genuinely fixable rows - the exact failure
+    docs/decisions/READINESS.md exists to prevent. They are counted in
+    `not_ready` so the run can say how many it passed over in one line.
 
     Deliberately does not mutate rows, unlike resolve_sheet_files(): this runs
     before any decision is made, and a row's cells must still read as the
@@ -1276,18 +1291,22 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
     wanted: dict[int, str] = {}
     claimed: set[str] = set()
     folders: set[str] = set()
+    not_ready: list[int] = []
 
     for offset, row in enumerate(rows):
         row_number = offset + 2
         folder = (row.get(fields[0]) or "").strip() if fields else ""
-        folders.add(folder)
         name_field = fields[-1] if fields else ""
 
         blank = [name for name in fields if not (row.get(name) or "").strip()]
         if blank:
-            unresolved[row_number] = folder
-            wanted[row_number] = (row.get(name_field) or "").strip()
+            not_ready.append(row_number)
             continue
+
+        # After the blank check: a folder only an uncatalogued row names has
+        # no row that could be prompted about it, so listing it is a disk
+        # scan whose result nothing reads.
+        folders.add(folder)
         try:
             claimed.add(resolve_file(config.files_dir, candidate_path(config.file_template, row), listing_cache))
         except FileResolutionError:
@@ -1306,7 +1325,13 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
             and entry.suffix.lower() in config.photo_extensions
             and f"{folder}/{entry.name}" not in claimed
         )
-    return FileSurvey(unresolved=unresolved, wanted=wanted, claimed=claimed, unclaimed=unclaimed)
+    return FileSurvey(
+        unresolved=unresolved,
+        wanted=wanted,
+        claimed=claimed,
+        unclaimed=unclaimed,
+        not_ready=not_ready,
+    )
 
 
 @dataclass(frozen=True)
@@ -3412,11 +3437,19 @@ def cmd_reconcile_files(args) -> int:
         return 1
 
     survey = survey_files(sheet.rows, config)
+    if survey.not_ready:
+        # One contained line, never one line (let alone one prompt) per row.
+        # The real Sheet is ~3,000 rows of which ~2,900 carry no filename at
+        # all; those are not-ready, not broken, and there is nothing an
+        # operator could decide about them here. Same judgment `upload`
+        # makes about the same rows - see docs/decisions/READINESS.md.
+        print(f"{_pluralize(len(survey.not_ready), 'row')} not yet catalogued - "
+              "no filename to reconcile, skipped")
     if not survey.unresolved:
-        print("nothing to reconcile - every row's filename resolves against the drive")
+        print("nothing to reconcile - every row with a filename resolves against the drive")
         return 0
 
-    print(f"{_pluralize(len(survey.unresolved), 'row')} did not resolve")
+    print(f"{_pluralize(len(survey.unresolved), 'row')} named a file that does not resolve")
     print()
 
     log_path = None if dry_run else open_log(args.log_dir, "reconcile-files")
@@ -3451,7 +3484,7 @@ def cmd_reconcile_files(args) -> int:
             if f"{folder}/{name}" not in survey.claimed
         ]
         try:
-            proposal = propose_match(wanted, candidates) if wanted else None
+            proposal = propose_match(wanted, candidates)
             reason = proposal.reason if proposal else ""
         except AmbiguousMatch as exc:
             print(f"row {row_number}  '{wanted}'  matches {len(exc.matches)} files - "

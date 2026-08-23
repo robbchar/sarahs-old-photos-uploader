@@ -314,7 +314,13 @@ a `FileSurvey` splitting the result into `claimed` (every disk file some
 row currently resolves to) and `unclaimed` (every file matching the
 project's `photo_extensions`, in a row's own folder, that no row claims) —
 plus `unresolved`/`wanted`, the row numbers that failed and what each
-one's filename cell said. Unlike `resolve_sheet_files()`, it never mutates
+one's filename cell said. A row whose `file_template` cells are blank is
+counted in `not_ready` and appears in none of the other three: it asserted
+no file, so it is not-ready rather than broken (the same split
+`resolve_sheet_files()` draws between `errors` and `blank`), and
+`cmd_reconcile_files` reports the count in one line rather than raising a
+prompt with no proposal and no candidates for each of the ~2,900
+uncatalogued rows. Unlike `resolve_sheet_files()`, it never mutates
 the rows it's given: reconciliation shows a row's own cells to a human
 before any decision is made, so they have to still read exactly as
 written.

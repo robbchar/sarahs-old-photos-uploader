@@ -395,12 +395,31 @@ def test_survey_files_separates_resolved_rows_from_unresolved(tmp_path):
     assert survey.unclaimed == {"SOP CD 1": ["Finnish Meat Market.jpg"]}
 
 
-def test_survey_files_treats_a_blank_filename_cell_as_unresolved(tmp_path):
+def test_survey_files_files_a_blank_filename_cell_as_not_ready_not_unresolved(tmp_path):
+    """A row that asserted no file is not-ready, not broken - the same split
+    resolve_sheet_files() draws between `errors` and `blank`. Filed as
+    unresolved it becomes a prompt with no proposal and no candidates, once
+    per uncatalogued row, which on the real Sheet is ~2,900 of them."""
     (tmp_path / "SOP CD 1").mkdir()
     config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
     survey = survey_files([{"folder": "SOP CD 1", "name": ""}], config)
-    assert survey.unresolved == {2: "SOP CD 1"}
-    assert survey.wanted == {2: ""}
+    assert survey.unresolved == {}
+    assert survey.wanted == {}
+    assert survey.not_ready == [2]
+
+
+def test_survey_files_lists_an_uppercase_extension_as_a_candidate(tmp_path):
+    """161 of the 189 sample files are `.JPG`. A regression here would make
+    a whole folder invisible as candidates, and would present as "the tool
+    just never proposes anything" rather than as an error."""
+    folder = tmp_path / "SOP CD 2 COE"
+    folder.mkdir()
+    (folder / "001_seaside_beach.JPG").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    survey = survey_files([{"folder": "SOP CD 2 COE", "name": "Nothing Like It.jpg"}], config)
+
+    assert survey.unclaimed == {"SOP CD 2 COE": ["001_seaside_beach.JPG"]}
 
 
 def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers():
@@ -7454,6 +7473,63 @@ def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch)
     cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
 
     assert written == []
+
+
+def test_cmd_reconcile_files_never_prompts_about_an_uncatalogued_row(tmp_path, monkeypatch, capsys):
+    """The live Sheet is ~3,000 rows of which ~2,900 carry no filename at
+    all. A row that asserted nothing has no proposal, no candidates and
+    nothing an operator could decide - prompting about it buries the
+    handful of genuinely fixable rows under thousands of identical
+    non-problems, which is the exact failure the readiness split exists to
+    prevent (docs/decisions/READINESS.md)."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    prompted = []
+
+    def record(row_number, folder, wanted, proposal, candidates, config, claimed):
+        prompted.append(row_number)
+        assert proposal is not None
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]]
+        + [["SOP CD 1", "", ""] for _ in range(8)],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", record)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert prompted == [2]                      # the one real mismatch, not all nine
+    assert "1 row named a file that does not resolve" in out
+    assert "8 rows not yet catalogued" in out   # one contained line, not eight
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_dry_run_says_nothing_about_uncatalogued_rows(tmp_path, monkeypatch, capsys):
+    """--dry-run floods the same way a real run prompts: one
+    `no candidate in ''` line per uncatalogued row."""
+    from ia_bulk import cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "", ""] for _ in range(8)],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "no candidate" not in out
+    assert "8 rows not yet catalogued" in out
+    assert "nothing to reconcile" in out
+    assert exit_code == 0
 
 
 def test_cmd_reconcile_files_dry_run_neither_prompts_nor_writes(tmp_path, monkeypatch, capsys):
