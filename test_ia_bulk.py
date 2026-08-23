@@ -6978,3 +6978,93 @@ def test_a_successful_row_prints_no_error_line(tmp_path, monkeypatch, capsys):
 
     assert "    - " not in out
     assert exit_code == 0
+
+
+def test_not_attempted_does_not_double_count_a_moved_row_from_an_earlier_chunk(
+    tmp_path, monkeypatch, capsys
+):
+    """Pins the `settled` accounting in SheetUploadRun.execute().
+
+    The count used to be `total - done - len(moved)`, computed against only
+    the CURRENT chunk's moved list. A row reported as moved in an EARLIER
+    chunk was therefore counted twice: once when it was reported, and again
+    inside `total - done` when a later chunk stopped the run. A three-target
+    run could report "4 rows not attempted".
+
+    This is the shape no shipped test had, which is why the fix went in
+    unpinned - restoring the old formula left the whole suite green. It needs
+    all three of: more than one chunk, a moved row in an EARLIER chunk, and a
+    run-stopping failure in a LATER one.
+
+    Three targets at chunk_size 1:
+      chunk 1 - row 2 has moved, so it is reported and settled. Its reserve
+                batch is empty, so no Sheet write happens and the run
+                continues to the next chunk.
+      chunk 2 - row 3 verifies clean and its reserve write fails, stopping
+                the run.
+
+    Correct: 1 moved + 2 never attempted = 3. The old formula gave 4.
+    """
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in (1, 2, 3)
+    ]
+
+    def move_row_2_before_the_first_chunk_verifies(live_grid, read_count):
+        # read 1 is the initial grid read; read 2 is chunk 1's pre-reserve
+        # guard. Changing the file cell changes that row's fingerprint, which
+        # is what split_moved_targets compares.
+        if read_count == 2:
+            live_grid[1][1] = "somethingelse.jpg"
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+        before_read=move_row_2_before_the_first_chunk_verifies,
+        # chunk 1 writes nothing - its only target moved, so the reserve batch
+        # is empty - which makes chunk 2's reserve the run's first real write.
+        raise_on_write=1,
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, chunk_size=1)
+    )
+    out = capsys.readouterr().out
+
+    # The count itself: 1 moved + 2 never reached. Not 4.
+    assert "3 rows not attempted" in out
+    assert "4 rows not attempted" not in out
+    # and the run really did stop before uploading anything
+    assert recorder.uploads == []
+    assert exit_code == 1
+
+
+def test_not_attempted_summary_says_where_to_look(tmp_path, monkeypatch, capsys):
+    """The wording is load-bearing and was also unpinned: the covering test
+    asserted only that the count appeared, so reverting "see the reason on
+    stderr above" to a vaguer "see the messages above" left the suite green.
+    The reason for stopping is printed to STDERR while this summary is on
+    STDOUT, so an operator who piped one away needs to be told which stream
+    to go looking in."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        [f"Photo {n}", f"photo{n}.jpg", "", "", "", ""] for n in (1, 2)
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        raise_on_write=1,
+    )
+
+    cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, chunk_size=1)
+    )
+    out = capsys.readouterr().out
+
+    assert "not attempted - the run stopped early; see the reason on stderr above" in out
