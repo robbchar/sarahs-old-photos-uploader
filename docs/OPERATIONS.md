@@ -327,8 +327,20 @@ columns that changed. Blank cell = leave alone; literal `REMOVE_TAG` = delete
 that field. `noindex` cannot be changed this way —
 see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3).
 
-**To rehearse a correction first**, point `--from-log` at the log of the
-upload run whose items you are correcting:
+Both of the above are the `--csv` fallback. Normally the Sheet **is** the
+correction — edit the cell, then:
+
+```bash
+python ia_bulk.py sync-metadata --project sarasoldphotos --dry-run
+python ia_bulk.py sync-metadata --project sarasoldphotos --live
+```
+
+Every row marked uploaded is sent to the item its own `ia_url` cell names, so
+nothing needs a log and rows uploaded by different runs are each targeted
+correctly. See [`DECISIONS.md`](DECISIONS.md), "The Sheet is the correction".
+
+**On the `--csv` path**, point `--from-log` at the log of the upload run whose
+items you are correcting:
 
 ```bash
 python ia_bulk.py sync-metadata data/update-metadata.csv --project sarasoldphotos --from-log logs/upload-20260823T161331Z.jsonl

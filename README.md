@@ -273,20 +273,52 @@ Other behavior, both paths:
 
 ### `sync-metadata` — update metadata on already-uploaded items
 
-`--project` is required on the command line for consistency with the other
-two commands, but `sync-metadata` never reads it: the CSV's own columns are
-what gets sent, and `check_identifier` validates identifiers against every
-project in the registry rather than the one named here.
+The Sheet is the correction. Fix a description in the Sheet, run this, and it
+is on the site:
 
 ```bash
-# correcting a real, live batch
-python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos --live
-
-# rehearsing against the items a previous test upload created
-python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos --from-log logs/upload-20260823T161331Z.jsonl
+python ia_bulk.py sync-metadata --project sarasoldphotos --dry-run
+python ia_bulk.py sync-metadata --project sarasoldphotos
 ```
 
-**`--from-log` is required in test mode.** A test item is named
+It reads the Sheet live, takes every row marked uploaded (`ia_uploaded` set),
+and sends that row's current metadata to the item named in its `ia_url` cell.
+Nothing has to be re-derived: `ia_url` is what `upload`'s confirm write
+recorded, so it already names the exact item — including the per-run
+`zztest-` stamp in test mode, even when different rows were uploaded by
+different runs.
+
+The fields sent are the same ones `upload` sends (`sheet_metadata_fields()`),
+so the two commands cannot disagree about what a row means. Tool-owned `ia_`
+columns, `(LCPS Internal)` columns, and the generated `mediatype`/
+`collection` are all excluded — Internet Archive will not change an item's
+mediatype after upload anyway.
+
+Every uploaded row is sent every run. Internet Archive answers *no changes to
+`_meta.xml`* for an item that already matches, which is counted as
+`unchanged` rather than an error, so a full sync is idempotent and needs no
+change tracking.
+
+A blank cell means **leave this field alone**, not "delete it" — so an
+accidental cell clear can never strip metadata from a permanent public item.
+To actually delete a field, put the literal `REMOVE_TAG` in that cell (the
+same sentinel the official `ia` CLI's `--modify field:REMOVE_TAG` uses).
+
+`--live` reads the real Sheet and targets the real, permanent items. The
+command refuses to send a live correction to a `zztest-` item, or a rehearsal
+correction to a real one.
+
+#### The `--csv` fallback
+
+```bash
+python ia_bulk.py sync-metadata --csv updates.csv --project sarasoldphotos --live
+python ia_bulk.py sync-metadata --csv updates.csv --project sarasoldphotos --from-log logs/upload-20260823T161331Z.jsonl
+```
+
+Offline only, and a hand-prepared CSV rather than the Sheet. Needs an
+`identifier` column plus whichever columns changed.
+
+**`--from-log` is required on this path in test mode.** A test item is named
 `zztest-<stamp>-<identifier>`, and the stamp is unique to the run that
 created it, so the CSV alone cannot say which items to correct — deriving
 the target from this run's stamp would name an item that has never existed.

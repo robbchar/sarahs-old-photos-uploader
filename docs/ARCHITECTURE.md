@@ -284,6 +284,27 @@ fabricates. It also passes `checksum=True`, so re-running `upload` against
 a CSV whose files haven't changed skips re-uploading (and re-triggering
 IA's `derive` task) for anything already present with a matching MD5.
 
+## Correcting an uploaded item
+
+`sync-metadata` reads the Sheet live like `validate` and `upload`. Its scope
+is every row `classify_row()` calls DONE, and its target for each is the
+identifier in that row's own `ia_url` cell — which `upload`'s confirm write
+put there, complete with the per-run `zztest-` stamp in test mode. Nothing is
+re-derived, so a Sheet whose rows were uploaded by different runs under
+different stamps is handled without the command knowing that happened.
+
+The fields sent come from `sheet_metadata_fields()`, shared with `upload`, so
+a column that uploads but does not sync cannot exist. Blank cells are dropped
+by `update_metadata_row()` — blank means "leave this field alone", and
+`REMOVE_TAG` deletes. Every DONE row is sent every run; IA's *no changes to
+`_meta.xml`* response becomes `MetadataUnchanged` and is counted as
+`unchanged`, which is what makes that idempotent.
+
+The `--csv` path is the offline fallback and is the only one that needs
+`--from-log`: a CSV carries real identifiers, so in test mode the stamped
+target has to come from the upload log's `uploaded_as` field. See
+[`DECISIONS.md`](DECISIONS.md), "The Sheet is the correction".
+
 ## Logging and resume
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:

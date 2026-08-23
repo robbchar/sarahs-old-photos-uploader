@@ -3525,7 +3525,7 @@ def test_build_parser_validate_subcommand_omits_csv_to_select_the_sheet_path():
     [
         ("validate", []),
         ("upload", ["--csv", "items.csv"]),
-        ("sync-metadata", ["updates.csv"]),
+        ("sync-metadata", ["--csv", "updates.csv"]),
     ],
 )
 def test_build_parser_requires_project_on_every_subcommand(subcommand, extra_args):
@@ -3583,11 +3583,22 @@ def test_build_parser_upload_subcommand_accepts_write_identifier_and_dry_run():
 
 def test_build_parser_sync_metadata_subcommand_defaults():
     parser = build_parser()
-    args = parser.parse_args(["sync-metadata", "updates.csv", "--project", "astoriaphotos"])
+    args = parser.parse_args(["sync-metadata", "--csv", "updates.csv", "--project", "astoriaphotos"])
     assert args.command == "sync-metadata"
     assert args.project == "astoriaphotos"
     assert args.csv == "updates.csv"
     assert args.live is False
+
+
+def test_build_parser_sync_metadata_defaults_to_the_sheet():
+    """--csv is the offline fallback here exactly as it is for validate and
+    upload. It was a REQUIRED POSITIONAL, so there was no way to ask for the
+    Sheet at all: `sync-metadata --project X` exited with "the following
+    arguments are required: csv"."""
+    parser = build_parser()
+    args = parser.parse_args(["sync-metadata", "--project", "astoriaphotos"])
+    assert args.csv is None
+    assert args.dry_run is False
 
 
 def test_main_dispatches_to_cmd_validate(monkeypatch, tmp_path):
@@ -6486,3 +6497,240 @@ def test_load_uploaded_as_skips_carried_over_records_that_name_no_target(tmp_pat
 
     assert load_uploaded_as(log_path, live=False) == {}
     assert capsys.readouterr().err == ""
+
+
+SYNC_STAMP = "20260823t161331"
+SYNC_URL = f"https://archive.org/details/zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001"
+
+
+def _synced_grid(rows=None):
+    """A Sheet whose rows are already uploaded, as upload's confirm write
+    leaves it: ia_identifier, ia_uploaded and ia_url all populated."""
+    default = [[
+        "Stone Customshouse", "photo1.jpg",
+        "lcps-astoriaphotos-00001", "2026-08-23T16:13:31Z", SYNC_URL, "photo1.jpg",
+    ]]
+    return [SHEET_HEADER] + (default if rows is None else rows)
+
+
+def _sync_sheet_args(tmp_path, registry_path, **overrides):
+    args = Namespace(
+        csv=None,
+        project="astoriaphotos",
+        registry=str(registry_path),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        from_log=None,
+        dry_run=False,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def _setup_sync_sheet(tmp_path, monkeypatch, grid, sent):
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    client = FakeSheetClient(grid)
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: client)
+    monkeypatch.setattr(
+        "ia_bulk.update_metadata_row",
+        lambda metadata, target: sent.append((target, metadata)),
+    )
+    return registry_path
+
+
+def test_sync_from_sheet_sends_the_sheets_own_metadata_to_the_recorded_item(
+    tmp_path, monkeypatch, capsys
+):
+    """The round trip the Sheet-as-source-of-truth model promises: edit a
+    description in the Sheet, run this, it is on the site. No CSV, no log, no
+    flags - ia_url is the Sheet's own record of which item the row became, so
+    nothing has to be re-derived."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert len(sent) == 1
+    target, metadata = sent[0]
+    assert target == f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001"
+    assert metadata["title"] == "Stone Customshouse"
+    assert "1 item(s) updated successfully" in out
+    assert exit_code == 0
+
+
+def test_sync_from_sheet_never_sends_tool_owned_or_pipeline_owned_columns(
+    tmp_path, monkeypatch
+):
+    """Same filter upload uses (sheet_metadata_fields), so the two commands
+    cannot disagree about what a row means. mediatype matters twice here:
+    Internet Archive will not change it after upload."""
+    from ia_bulk import cmd_sync_metadata
+
+    header = SHEET_HEADER + ["Notes (LCPS Internal)", "Mediatype", "Identifier"]
+    grid = [header] + [[
+        "Stone Customshouse", "photo1.jpg",
+        "lcps-astoriaphotos-00001", "2026-08-23T16:13:31Z", SYNC_URL, "photo1.jpg",
+        "donor phone number", "texts", "CD 1 01 53 58 1 Central SS",
+    ]]
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+
+    _, metadata = sent[0]
+    assert "title" in metadata
+    for excluded in (
+        "notes_lcps_internal",
+        "ia_identifier", "ia_uploaded", "ia_url", "ia_identifier_bib",
+        "mediatype",
+        "identifier",
+        "file",
+    ):
+        assert excluded not in metadata, excluded
+
+
+def test_sync_from_sheet_skips_rows_that_are_not_uploaded_yet(tmp_path, monkeypatch):
+    """An UNASSIGNED row has no item to correct, and a RESERVED row whose
+    upload never confirmed is upload's problem, not this command's."""
+    from ia_bulk import cmd_sync_metadata
+
+    grid = _synced_grid([
+        ["Uploaded", "photo1.jpg", "lcps-astoriaphotos-00001",
+         "2026-08-23T16:13:31Z", SYNC_URL, "photo1.jpg"],
+        ["Never uploaded", "photo2.jpg", "", "", "", ""],
+        ["Reserved only", "photo3.jpg", "lcps-astoriaphotos-00002", "", "", ""],
+    ])
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+
+    assert [target for target, _ in sent] == [f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001"]
+    assert exit_code == 0
+
+
+def test_sync_from_sheet_reports_an_uploaded_row_with_no_usable_url(
+    tmp_path, monkeypatch, capsys
+):
+    """A row the operator edited expecting the edit to reach the site must not
+    be silently skipped."""
+    from ia_bulk import cmd_sync_metadata
+
+    grid = _synced_grid([
+        ["Lost its url", "photo1.jpg", "lcps-astoriaphotos-00001",
+         "2026-08-23T16:13:31Z", "", "photo1.jpg"],
+    ])
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "does not look like an Internet Archive item URL" in out
+    assert exit_code == 1
+
+
+def test_sync_from_sheet_refuses_to_send_a_live_correction_to_a_test_item(
+    tmp_path, monkeypatch, capsys
+):
+    """Not recoverable by rerunning, so it is refused rather than reported
+    afterwards."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, live=True))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "Refusing to send a live correction to a rehearsal item" in out
+    assert exit_code == 1
+
+
+def test_sync_from_sheet_refuses_to_send_a_test_correction_to_a_real_item(
+    tmp_path, monkeypatch, capsys
+):
+    from ia_bulk import cmd_sync_metadata
+
+    grid = _synced_grid([
+        ["Real item", "photo1.jpg", "lcps-astoriaphotos-00001", "2026-08-23T16:13:31Z",
+         "https://archive.org/details/lcps-astoriaphotos-00001", "photo1.jpg"],
+    ])
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "Refusing to send a rehearsal correction to a permanent item" in out
+    assert exit_code == 1
+
+
+def test_sync_from_sheet_counts_an_unchanged_item_as_unchanged_not_a_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """This is what makes "send every DONE row" idempotent, so no per-row
+    change detection and no fifth ia_ column are needed."""
+    from ia_bulk import MetadataUnchanged, cmd_sync_metadata
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    client = FakeSheetClient(_synced_grid())
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: client)
+
+    def unchanged(metadata, target):
+        raise MetadataUnchanged(target)
+
+    monkeypatch.setattr("ia_bulk.update_metadata_row", unchanged)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert "0 item(s) updated successfully, 1 unchanged, 0 error(s)" in out
+    assert exit_code == 0
+
+
+def test_sync_from_sheet_dry_run_sends_nothing(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "would update metadata on 1 item" in out
+    assert f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001" in out
+    assert not (tmp_path / "logs").exists()
+    assert exit_code == 0
+
+
+def test_sync_from_sheet_rejects_csv_only_log_flags(tmp_path, monkeypatch, capsys):
+    """--resume-from and --from-log both name a prior run's log, which the
+    Sheet path does not need: ia_uploaded and ia_url are the record."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+
+    for flag in ("resume_from", "from_log"):
+        exit_code = cmd_sync_metadata(
+            _sync_sheet_args(tmp_path, registry_path, **{flag: "logs/upload.jsonl"})
+        )
+        assert exit_code == 1
+        assert "is a --csv-path flag" in capsys.readouterr().err
+    assert sent == []

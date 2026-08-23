@@ -1846,6 +1846,43 @@ def split_moved_targets(
     return still_there, moved
 
 
+def sheet_metadata_fields(column_map: ColumnMap) -> frozenset[str]:
+    """The normalized column names whose values this tool sends to Internet
+    Archive as item metadata.
+
+    One definition, shared by `upload` and `sync-metadata`, so the two cannot
+    disagree about what a row means - a column that uploads but does not sync
+    (or the reverse) would leave the Sheet and the item permanently out of
+    step in a way neither command reports.
+
+    Subtracts PIPELINE_OWNED_FIELDS as well as DROPPED_BY_UPLOAD_ROW.
+    `mediatype` and `collection` are generated, and upload overwrites them
+    anyway, so excluding them here changes nothing for upload - but for sync
+    it matters twice over: Internet Archive will not change an item's
+    mediatype after upload, and `collection` is membership, not metadata."""
+    return (
+        frozenset(column_map.uploadable_fields())
+        - DROPPED_BY_UPLOAD_ROW
+        - PIPELINE_OWNED_FIELDS
+    )
+
+
+def identifier_from_url(url: str) -> str | None:
+    """The item identifier out of an `ia_url` cell, or None if the cell is not
+    one of this tool's own URLs.
+
+    `ia_url` is what upload's confirm write recorded, so in test mode it
+    already carries THAT run's stamp. This is why the Sheet path needs no
+    equivalent of the --csv path's --from-log: the Sheet is its own record of
+    what landed where. Returns None rather than guessing at an unrecognised
+    cell - a human having pasted something is far likelier than the URL prefix
+    having changed."""
+    url = url.strip()
+    if not url.startswith(ITEM_URL_PREFIX):
+        return None
+    return url[len(ITEM_URL_PREFIX):].strip("/") or None
+
+
 def sheet_upload_metadata(
     target: UploadTarget, uploadable: frozenset[str], mediatype: str
 ) -> dict[str, str]:
@@ -2001,7 +2038,7 @@ class SheetUploadRun:
         the same set 10,000 times. cached_property works on a frozen
         dataclass because it writes through __dict__ rather than
         __setattr__."""
-        return frozenset(self.column_map.uploadable_fields()) - DROPPED_BY_UPLOAD_ROW
+        return sheet_metadata_fields(self.column_map)
 
     def execute(self, targets: list[UploadTarget]) -> dict[str, int]:
         """One chunk at a time: verify, reserve, upload, verify, confirm,
@@ -2689,6 +2726,141 @@ def upload_from_sheet(args) -> int:
     )
 
 
+@dataclass(frozen=True)
+class SyncTarget:
+    """One already-uploaded row whose Sheet metadata this run will push to
+    Internet Archive."""
+
+    row_number: int
+    identifier: str        # the real, permanent one, from ia_identifier
+    uploaded_as: str       # the item to actually send to, from ia_url
+    metadata: dict[str, str]
+
+
+def plan_sync_targets(
+    rows: list[dict[str, str]], column_map: ColumnMap, live: bool
+) -> tuple[list[SyncTarget], list[RowValidation]]:
+    """Decides which rows this run will correct, and what it will send.
+
+    Scope is RowState.DONE and nothing else. An UNASSIGNED row has no item to
+    correct, and a RESERVED row's upload never confirmed - correcting metadata
+    on an item that may not exist is a different problem, and `upload` already
+    retries those under their existing identifier.
+
+    Every DONE row is sent, not only rows that look changed. Internet Archive
+    answers "no changes to _meta.xml" for an item that already matches, which
+    update_metadata_row turns into MetadataUnchanged and the runner counts as
+    `unchanged` rather than an error - so a full sync is idempotent by
+    construction and needs no per-row change detection, no extra tool-owned
+    column, and no second place for the Sheet and the item to drift apart.
+
+    Blank cells are dropped by update_metadata_row, so a cleared cell means
+    "leave this field alone" and REMOVE_TAG deletes - identical to the --csv
+    path. A Sheet cell cleared by accident can therefore never strip metadata
+    from a permanent public item.
+
+    Returns (targets, problems). A DONE row this run cannot safely target is a
+    problem rather than a silent skip: the operator edited it expecting the
+    edit to reach the site."""
+    fields = sheet_metadata_fields(column_map)
+    targets: list[SyncTarget] = []
+    problems: list[RowValidation] = []
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2
+        if classify_row(row) is not RowState.DONE:
+            continue
+
+        identifier = (row.get(IA_IDENTIFIER_COLUMN) or "").strip()
+        uploaded_as = identifier_from_url(row.get(IA_URL_COLUMN) or "")
+
+        if uploaded_as is None:
+            problems.append(
+                RowValidation(
+                    row_number=row_number,
+                    identifier=identifier,
+                    errors=[
+                        f"row is marked uploaded but its '{IA_URL_COLUMN}' cell is blank or "
+                        "does not look like an Internet Archive item URL, so there is no "
+                        "item to correct - restore it from the upload log, or clear "
+                        f"'{IA_UPLOADED_COLUMN}' to have `upload` do the row again"
+                    ],
+                )
+            )
+            continue
+
+        # The Sheet is the mode boundary (test and live are different
+        # spreadsheets), so a mismatch here means the wrong Sheet is in the
+        # registry or someone pasted a URL across - either way, sending a
+        # live correction to a test item, or the reverse, is not recoverable
+        # by rerunning.
+        is_test_item = uploaded_as.startswith(TEST_IDENTIFIER_PREFIX)
+        if live and is_test_item:
+            problems.append(
+                RowValidation(
+                    row_number=row_number,
+                    identifier=identifier,
+                    errors=[
+                        f"--live, but '{IA_URL_COLUMN}' points at the test item "
+                        f"'{uploaded_as}'. Refusing to send a live correction to a "
+                        "rehearsal item"
+                    ],
+                )
+            )
+            continue
+        if not live and not is_test_item:
+            problems.append(
+                RowValidation(
+                    row_number=row_number,
+                    identifier=identifier,
+                    errors=[
+                        f"test mode, but '{IA_URL_COLUMN}' points at the real item "
+                        f"'{uploaded_as}'. Refusing to send a rehearsal correction to a "
+                        "permanent item - pass --live if that is what you meant"
+                    ],
+                )
+            )
+            continue
+
+        targets.append(
+            SyncTarget(
+                row_number=row_number,
+                identifier=identifier,
+                uploaded_as=uploaded_as,
+                metadata={key: value for key, value in row.items() if key in fields},
+            )
+        )
+
+    return targets, problems
+
+
+def run_sheet_sync(targets: list[SyncTarget], log_path: Path, live: bool) -> dict[str, int]:
+    """Its own loop rather than run_rows(): that helper keys everything off
+    `row["identifier"]`, and on the Sheet path that column holds the DONOR's
+    archival reference, not this tool's identifier. Reusing it would have
+    meant writing the tool's identifier into a column that means something
+    else."""
+    counts = {"success": 0, "unchanged": 0, "failure": 0}
+    total = len(targets)
+    for position, target in enumerate(targets, start=1):
+        print(f"[{position}/{total}] updating metadata for {target.uploaded_as}")
+        try:
+            update_metadata_row(target.metadata, target.uploaded_as)
+        except MetadataUnchanged:
+            counts["unchanged"] += 1
+            log_result(log_path, target.identifier, "", "unchanged", live, uploaded_as=target.uploaded_as)
+        except Exception as exc:
+            counts["failure"] += 1
+            log_result(
+                log_path, target.identifier, "", "failure", live,
+                error=str(exc), uploaded_as=target.uploaded_as,
+            )
+        else:
+            counts["success"] += 1
+            log_result(log_path, target.identifier, "", "success", live, uploaded_as=target.uploaded_as)
+    return counts
+
+
 def check_uploaded_as(
     rows: list[dict[str, str]],
     targets: dict[str, str],
@@ -2727,6 +2899,141 @@ def check_uploaded_as(
 
 
 def cmd_sync_metadata(args) -> int:
+    """`--csv` is the offline fallback, exactly as it is for validate and
+    upload. Without it the Sheet is read live and IS the correction: edit a
+    description in the Sheet, run this, it is on the site. That round trip is
+    the whole point of the Sheet being the source of truth, and this command
+    was the last one still requiring a hand-made CSV to do it."""
+    csv_path = getattr(args, "csv", None)
+    if csv_path is not None:
+        return sync_from_csv(args)
+    return sync_from_sheet(args)
+
+
+def sync_from_sheet(args) -> int:
+    registry = load_registry(args.registry)
+    config = load_project_config(registry, args.project)
+
+    live = bool(args.live)
+    dry_run = bool(getattr(args, "dry_run", False))
+    sheet_id = config.sheet_id_for(live)
+    mode = "live" if live else "test"
+
+    print(
+        f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', "
+        f"tab '{config.sheet_tab}'"
+    )
+    if dry_run:
+        print("--dry-run: nothing is sent to Internet Archive")
+    print()
+
+    for flag in ("resume_from", "from_log"):
+        # Both name a prior run's LOG, which the Sheet path does not need: the
+        # Sheet's own ia_uploaded/ia_url columns are the record of what was
+        # uploaded and where it went.
+        if getattr(args, flag, None):
+            name = "--" + flag.replace("_", "-")
+            print(
+                f"{name} is a --csv-path flag. On the Sheet path, 'ia_uploaded' and 'ia_url' "
+                "are the record of what was uploaded and which item it became, so there is "
+                "no log to read.",
+                file=sys.stderr,
+            )
+            return 1
+
+    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
+        print(
+            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
+            f"placeholder '{sheet_id}' - edit it in {args.registry} to the real Google Sheet "
+            "ID before running sync-metadata.",
+            file=sys.stderr,
+        )
+        return 1
+
+    client = build_sheet_client(config, live)
+    try:
+        grid = client.read_grid()
+    except HttpError as exc:
+        print(
+            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
+            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
+            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
+            "been shared with the Google account you authorized as.",
+            file=sys.stderr,
+        )
+        return 1
+
+    column_map, rows = grid_to_rows(grid)
+    if not rows:
+        print(
+            "the Sheet has no data rows (only a header, or nothing at all) - check that "
+            "'sheet_tab' in the project's registry entry names the right tab, and that "
+            "the Sheet has actually been populated and shared"
+        )
+        return 1
+
+    # A header defect corrupts every row's field names identically, and unlike
+    # upload there is no per-row way around it.
+    header_errors = check_column_map(column_map)
+    if header_errors:
+        print("\n".join(f"    - {error}" for error in header_errors))
+        print(
+            "the Sheet's header row has problems that affect every row - refusing to send "
+            "metadata until they are fixed",
+            file=sys.stderr,
+        )
+        return 1
+
+    targets, problems = plan_sync_targets(rows, column_map, live)
+
+    if problems:
+        print("\n".join(_format_result_lines(problems)))
+        print(
+            f"{_pluralize(len(problems), 'row')} marked uploaded but not safely targetable "
+            "and will be skipped; this command still exits non-zero so a partial run is "
+            "never mistaken for a clean one"
+        )
+        print()
+
+    print(format_field_receipt(column_map))
+    print()
+
+    if not targets:
+        print("nothing to sync - no row is marked uploaded yet")
+        return 1 if problems else 0
+
+    if dry_run:
+        print(f"would update metadata on {_pluralize(len(targets), 'item')}:")
+        for target in targets:
+            fields = ", ".join(
+                name for name, value in sorted(target.metadata.items()) if value.strip()
+            )
+            print(f"  row {target.row_number}: {target.uploaded_as} <- {fields or '(nothing)'}")
+        return 1 if problems else 0
+
+    log_path = open_log(args.log_dir, "sync-metadata")
+    try:
+        log_run_header(log_path, config, column_map, live, dry_run)
+    except Exception as exc:
+        print(
+            f"could not write the run-header record to {log_path}: {exc}. Continuing without "
+            "it - this only affects the log's own audit trail.",
+            file=sys.stderr,
+        )
+
+    counts = run_sheet_sync(targets, log_path, live)
+
+    print(
+        f"{counts['success']} item(s) updated successfully, {counts['unchanged']} unchanged, "
+        f"{counts['failure']} error(s)"
+    )
+    if problems:
+        print(f"{_pluralize(len(problems), 'row')} skipped (not safely targetable)")
+    print(f"log written to {log_path}")
+    return 1 if (counts["failure"] or problems) else 0
+
+
+def sync_from_csv(args) -> int:
     data = read_csv(args.csv)
     rows = data.rows
     registry = load_registry(args.registry)
@@ -2894,10 +3201,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sync_parser = subparsers.add_parser("sync-metadata", help="Update metadata on already-uploaded items")
-    sync_parser.add_argument("csv", help="Path to the CSV of identifier + changed metadata columns")
+    sync_parser.add_argument(
+        "--csv",
+        default=None,
+        help=(
+            "Correct from this CSV instead of the project's Sheet. Without it the Sheet is "
+            "read live and its own columns are the correction - edit a description there, "
+            "run this, and it is on the site."
+        ),
+    )
     sync_parser.add_argument("--project", required=True, help="Project ID from the registry")
     sync_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
-    sync_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
+    sync_parser.add_argument("--live", action="store_true", help="Read the project's real Sheet and target the real, permanent items instead of the test Sheet and its zztest- rehearsal items")
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Send nothing; print the items that would be updated and which fields would go to each (Sheet path only)",
+    )
     sync_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
     sync_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped")
     sync_parser.add_argument(

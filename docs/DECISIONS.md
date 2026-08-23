@@ -684,7 +684,52 @@ row's identifier is already in the Sheet — that is what RESERVED means — and
 after the reserve write so are this run's own, so checking either would stop
 every ordinary run on its own writes.
 
-## `sync-metadata` reads its targets from the upload log
+## The Sheet is the correction
+
+*Decided 2026-08-23.*
+
+`validate` and `upload` moved to reading the Sheet live; `sync-metadata` did
+not, and was the last command still requiring a hand-made CSV. That left the
+round trip the whole "Sheet is the source of truth" premise promises — fix a
+description in the Sheet, have it show up on the site — impossible without
+exporting a CSV by hand first. Worse, `--csv` was a required POSITIONAL, so
+`sync-metadata --project X` did not fail informatively; it printed an argparse
+usage error about a missing `csv`.
+
+The Sheet already held everything needed. `upload`'s confirm write records
+`ia_uploaded` (this row is done) and `ia_url` (the item it became), and
+`ia_url` carries the per-run `zztest-` stamp in test mode. So the Sheet path
+needs no log, no CSV, and no stamp arithmetic: read `ia_url`, send that row's
+current columns. It handles a Sheet whose rows were uploaded by *different*
+runs, under different stamps, without knowing that happened.
+
+Four choices:
+
+- **Scope is `RowState.DONE` and nothing else.** An UNASSIGNED row has no item
+  to correct; a RESERVED row's upload never confirmed, and `upload` already
+  retries those.
+- **Every DONE row is sent, every run.** Internet Archive answers *no changes
+  to `_meta.xml`* for an item that already matches, which becomes
+  `MetadataUnchanged` and is counted as `unchanged`. That makes a full sync
+  idempotent by construction, so there is no need for per-row change
+  detection, a fifth `ia_` column, or a second place for the Sheet and the
+  item to drift apart.
+- **A blank cell means "leave this field alone", as on the `--csv` path.**
+  Treating the Sheet as literally canonical — blank means delete — is more
+  faithful in principle, but an accidental clear, a bad paste, or a row shift
+  would silently strip metadata from a permanent public item with no undo.
+  `REMOVE_TAG` deletes, deliberately and visibly, and one rule holds across
+  both paths.
+- **Mode mismatches are refused, not reported afterwards.** The Sheet is
+  itself the mode boundary (test and live are different spreadsheets), so an
+  `ia_url` pointing the wrong way means the wrong Sheet is in the registry or
+  someone pasted across. Sending a live correction to a rehearsal item, or the
+  reverse, is not fixed by rerunning.
+
+`sheet_metadata_fields()` is shared with `upload`, so a column that uploads
+but does not sync — or the reverse — cannot exist.
+
+## `sync-metadata --csv` reads its targets from the upload log
 
 *Decided 2026-08-23, closing a defect introduced by the per-run stamp above.*
 
