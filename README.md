@@ -378,6 +378,13 @@ screen — the same "never guess between two" rule `resolve_file()` follows
 everywhere else; see
 [`docs/decisions/RECONCILIATION.md`](docs/decisions/RECONCILIATION.md).
 
+A header defect — two Sheet columns whose names normalize to the same IA
+field, or one that normalizes to nothing — stops the run before anything is
+proposed, because it corrupts every row identically and would send the
+correction to a different column than the one the value was read from. A
+single *data* row longer than the header is skipped and named instead; the
+rest of the run proceeds.
+
 It writes only the `file_name` column — whichever Sheet column
 `file_template`'s last segment names — never `folder_on_lacie_drive`, and
 never anything else on the row. A wrong folder cell is left for a human;

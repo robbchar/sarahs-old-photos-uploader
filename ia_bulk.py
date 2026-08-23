@@ -1486,6 +1486,26 @@ def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> Fi
     return FileOutcomes(errors=errors, blank=blank)
 
 
+def split_structure_results(
+    structure_results: list[RowValidation], row_count: int
+) -> tuple[list[RowValidation], list[RowValidation]]:
+    """Split sheet_structure_validation()'s output into (header-level,
+    per-data-row) - the two halves every Sheet command treats differently: a
+    bad header stops the whole run, a bad row is skipped.
+
+    check_grid_shape and validate_rows both number rows `offset + 2`, so
+    `row_number - 2` indexes the data rows exactly. The bounds check is
+    load-bearing, not defensive: a bare `row_number - 2` would quietly fold
+    row 1 - where check_column_map's header defects are filed - into the LAST
+    data row via negative indexing."""
+    header_level: list[RowValidation] = []
+    per_row: list[RowValidation] = []
+    for entry in structure_results:
+        index = entry.row_number - 2
+        (per_row if 0 <= index < row_count else header_level).append(entry)
+    return header_level, per_row
+
+
 def validate_sheet_grid(
     rows: list[dict[str, str]],
     registry: dict,
@@ -1544,16 +1564,14 @@ def validate_sheet_grid(
             dict.fromkeys(row_result.missing_fields + blank_cells)
         )
 
-    header_results: list[RowValidation] = []
-    for entry in structure_results:
-        index = entry.row_number - 2
-        if 0 <= index < len(row_results):
-            row_result = row_results[index]
-            # structural errors first: a long row's mis-attributed values are
-            # the likely cause of whatever content errors follow.
-            row_result.errors = entry.errors + row_result.errors
-        else:
-            header_results.append(entry)
+    header_results, row_structure_results = split_structure_results(
+        structure_results, len(row_results)
+    )
+    for entry in row_structure_results:
+        # structural errors first: a long row's mis-attributed values are
+        # the likely cause of whatever content errors follow.
+        row_result = row_results[entry.row_number - 2]
+        row_result.errors = entry.errors + row_result.errors
 
     return header_results, row_results
 
@@ -3450,6 +3468,37 @@ def cmd_reconcile_files(args) -> int:
     except SheetSetupFailed:
         return 1
 
+    # A bad row is skipped; a bad header stops the whole run - the same split
+    # `upload` makes, for the same reason: a header defect corrupts every row
+    # identically, so unlike a bad row it cannot be routed around. It is not
+    # merely a missing warning here. Two headers normalizing to `file_name`
+    # leave grid_to_rows reading the LAST of them (dict comprehension, last
+    # key wins) while the write below targets the FIRST - so the correction
+    # lands in a column nothing reads, the effective cell keeps its stale
+    # value, and the run reports success. structural_rows are individual data
+    # rows whose cells may be shifted relative to the header (check_grid_shape);
+    # those are skipped rather than fatal.
+    header_defects, structural_rows = split_structure_results(
+        sheet.structure_results, len(sheet.rows)
+    )
+    if header_defects:
+        print("\n".join(_format_result_lines(header_defects)))
+        print()
+        print(
+            "the Sheet's header row has problems that affect every row - refusing to "
+            "reconcile anything until they are fixed",
+            file=sys.stderr,
+        )
+        return 1
+    if structural_rows:
+        print("\n".join(_format_result_lines(structural_rows)))
+        print(
+            f"{_pluralize(len(structural_rows), 'row')} above may have cells shifted "
+            "against the header - skipped, since which cell a correction would land in "
+            "is exactly what is in doubt"
+        )
+        print()
+
     name_field = template_fields(config.file_template)[-1]
     try:
         name_column = next(
@@ -3465,6 +3514,8 @@ def cmd_reconcile_files(args) -> int:
         return 1
 
     survey = survey_files(sheet.rows, config)
+    skipped_rows = {entry.row_number for entry in structural_rows}
+    to_review = [n for n in sorted(survey.unresolved) if n not in skipped_rows]
     if survey.not_ready:
         # One contained line, never one line (let alone one prompt) per row.
         # The real Sheet is ~3,000 rows of which ~2,900 carry no filename at
@@ -3473,11 +3524,11 @@ def cmd_reconcile_files(args) -> int:
         # makes about the same rows - see docs/decisions/READINESS.md.
         print(f"{_pluralize(len(survey.not_ready), 'row')} not yet catalogued - "
               "no filename to reconcile, skipped")
-    if not survey.unresolved:
+    if not to_review:
         print("nothing to reconcile - every row with a filename resolves against the drive")
         return 0
 
-    print(f"{_pluralize(len(survey.unresolved), 'row')} named a file that does not resolve")
+    print(f"{_pluralize(len(to_review), 'row')} named a file that does not resolve")
     print()
 
     log_path = None if dry_run else open_log(args.log_dir, "reconcile-files")
@@ -3496,7 +3547,7 @@ def cmd_reconcile_files(args) -> int:
         pending = []
         return True
 
-    for row_number in sorted(survey.unresolved):
+    for row_number in to_review:
         folder = survey.unresolved[row_number]
         wanted = survey.wanted[row_number]
         # survey.unclaimed is a snapshot taken once, before any row in this
@@ -3559,7 +3610,7 @@ def cmd_reconcile_files(args) -> int:
 
     print()
     print(f"{accepted} filename(s) corrected")
-    remaining = len(survey.unresolved) - accepted
+    remaining = len(to_review) - accepted
     if remaining:
         print(f"{_pluralize(remaining, 'row')} still unresolved")
     if stopped:

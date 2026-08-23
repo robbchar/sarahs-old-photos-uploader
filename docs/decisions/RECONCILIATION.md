@@ -116,9 +116,14 @@ not what decides the exit code.
 Only a run that could not do its job at all returns `1` — `read_sheet()`
 never even reached the rows (the Sheet's ID is still the registry's
 placeholder, the spreadsheet couldn't be read at all, or it had no data
-rows), the Sheet has no column matching `file_template`'s name field, or
+rows), the Sheet's header row carries a defect that corrupts every row
+alike (two columns normalizing to one IA field name, or one normalizing to
+nothing), the Sheet has no column matching `file_template`'s name field, or
 a write to it fails outright. Every one of those is a reason nothing here
-can work around the problem, not that a row turned out to be broken. A
+can work around the problem, not that a row turned out to be broken — a
+defect in one *data* row (a row longer than the header, whose cells may all
+be shifted against it) is deliberately not in that list: that row alone is
+skipped, named on screen, and the rest of the run proceeds. A
 non-zero exit that persists for the weeks this backlog will realistically
 take to clear teaches the operator to stop reading it — the same trap
 `READINESS.md`'s "A bad row is skipped; a bad

@@ -7395,7 +7395,7 @@ def test_prompt_stops_the_run():
 RECONCILE_HEADER = ["Folder on LaCie Drive", "File Name", "Title"]
 
 
-def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions):
+def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions, header=None):
     """A reconcile world: files on disk, a registry, a client that records
     every write, and a canned answer per prompt."""
     for folder, names in disk.items():
@@ -7427,7 +7427,7 @@ def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions):
         def write_cells(self, updates):
             written.extend(updates)
 
-    grid = [RECONCILE_HEADER] + sheet_rows
+    grid = [header or RECONCILE_HEADER] + sheet_rows
     monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: RecordingClient(grid))
 
     answers = iter(decisions)
@@ -7496,6 +7496,70 @@ def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch)
     cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
 
     assert written == []
+
+
+def test_cmd_reconcile_files_refuses_a_sheet_whose_headers_collide(tmp_path, monkeypatch, capsys):
+    """Two headers normalizing to `file_name` corrupt every row identically,
+    so - unlike a bad row - the defect cannot be routed around by skipping
+    it. It is not just a missing warning: grid_to_rows reads the LAST such
+    column while the write targets the FIRST, so the correction would land
+    in a column nothing reads, leaving the stale value in place and the run
+    reporting success."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("a Sheet with a header defect must not be reconciled")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+        header=["Folder on LaCie Drive", "File Name", "File  name", "Title"],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert written == []
+    assert "refusing to reconcile anything" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_reconcile_files_skips_a_row_whose_cells_are_shifted(tmp_path, monkeypatch, capsys):
+    """A data row longer than the header may have every cell shifted against
+    it, so which cell a correction would land in is exactly what is in
+    doubt. One bad row is skipped, not fatal - the rest of the run still
+    works, which is the split READINESS.md draws."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    prompted = []
+
+    def record(row_number, folder, wanted, proposal, candidates, config, claimed):
+        prompted.append(row_number)
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title", "an extra cell"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", record)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert prompted == [3]
+    assert written == [CellUpdate("B3", "Alderbrook Hall.jpg")]
+    assert "may have cells shifted" in out
+    assert exit_code == 0
 
 
 def test_cmd_reconcile_files_refuses_one_file_for_two_case_divergent_folder_cells(tmp_path, monkeypatch):
