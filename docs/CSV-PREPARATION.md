@@ -1,9 +1,21 @@
 # CSV Preparation
 
-Turning the raw LCPS Google Sheet export into a CSV this tool can safely
-consume. **This is a manual step by design** — `ia_bulk.py` does not transform
-the export, and it is the single most error-prone part of the pipeline, because
-most of the ways it goes wrong do not fail loudly.
+**This is the offline `--csv` procedure, not the required first step.** By
+default, `validate`/`upload` read a project's Google Sheet directly over the
+Sheets API — there is no export to prepare on that path. The traps documented
+below (an unquoted comma splitting a header, stray whitespace, a `Date`/`date`
+mismatch) are artifacts of CSV *parsing*, not of the data: the Sheets API
+returns cells as a grid, so a header containing a comma is just a header
+containing a comma there. See
+[`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+Read this document only if you are deliberately validating or uploading from
+a hand-prepared CSV export instead of the live Sheet — offline work, or a
+dry run.
+
+Turning a raw Sheet export into a CSV this tool can safely consume. **This is
+a manual step by design** — `ia_bulk.py` does not transform the export, and
+it is the single most error-prone part of *this offline path*, because most
+of the ways it goes wrong do not fail loudly.
 
 ## Required schema
 
@@ -107,7 +119,11 @@ through whatever it reports:
 
 Auto-transforming the export would mean guessing at header intent, and a wrong
 guess writes permanent metadata. A human confirming the mapping once per batch
-is cheaper than un-picking 10,000 mislabeled items. There is a
-[standing idea](../README.md) to automate the *export* step (fetching the CSV
-from the Sheet); that is separate from — and does not remove the need for —
-this schema check.
+is cheaper than un-picking 10,000 mislabeled items. Automating the *export*
+step itself was raised early on and was superseded, not merely deferred:
+`validate`/`upload` now read the Sheet directly by default (the note at the
+top of this document), which is what actually removed the export step for the
+normal path — see
+[`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+This document, and the manual transform it describes, still applies whenever
+you deliberately choose the offline `--csv` path.

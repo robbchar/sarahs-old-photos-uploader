@@ -9,6 +9,41 @@ a run's output.
 a `test_collection` run (`"live": false`). The first real run is still ahead,
 and several things below have never been exercised against production.
 
+## Google Cloud prerequisites (one-time, per operator)
+
+Reading and writing the Sheet uses Google OAuth as a real signed-in person,
+not a service account and not an API key — both were considered and ruled
+out; see [`docs/DECISIONS.md`](DECISIONS.md#still-open), "Which Google
+credential type the Sheet integration uses". Concretely, before the first
+run on a machine:
+
+- The Google Cloud project backing this integration must have its OAuth
+  consent screen set to **Internal** user type, and the project itself must
+  sit inside the **lcpsociety.org** Google Workspace organization. Internal
+  apps skip Google's verification review and are not subject to the 7-day
+  refresh-token expiry that External apps in Testing status get.
+- Whoever runs `ia_bulk.py` and completes the one-time browser consent must
+  do so with an **`@lcpsociety.org` account**. A personal `gmail.com` account
+  cannot authorize an Internal app — Google refuses with `org_internal`.
+- An OAuth 2.0 **Desktop app** client ID's downloaded JSON secret must be
+  saved to `.ignored/google-client-secret.json` (relative to the project
+  root; never committed — everything under `.ignored/` is gitignored).
+- The target Sheet (both the real one and the test one named in the
+  project's registry entry) must be shared with — or owned by — that same
+  `@lcpsociety.org` account, with **edit** access. `upload` writes
+  `ia_identifier`/`ia_uploaded`/`ia_url`/`ia_identifier_bib` back to the
+  Sheet, so read-only sharing is not enough even in test mode with
+  `--write-identifier`.
+
+**First run, on a terminal a human is sitting at:** running any Sheet-reading
+command (`validate` or `upload`, no special flag needed) opens a browser for
+the consent screen once. Approve it as the `@lcpsociety.org` account above,
+and the resulting token is cached to `.ignored/google-token.json`. Every
+later run — including an unattended one, like a cron job — reuses and
+silently refreshes that cached token; it only fails loudly if the token is
+missing, unreadable, or its refresh token has been revoked, in which case
+re-run from an interactive terminal to re-consent.
+
 ## The pipeline
 
 ```
@@ -30,14 +65,23 @@ the normal route: it is a snapshot that goes stale the moment someone edits
 the Sheet, so treat one as disposable and re-export before trusting it rather
 than reusing yesterday's file.
 
-## 1. Prepare the CSV
+Bringing a batch up from nothing to permanent Internet Archive items is the
+four numbered phases below — validate, rehearse, go live, correct — matching
+the pipeline diagram above exactly. None of them starts with a CSV export;
+that only exists on the offline fallback described immediately below, which
+is not one of the four phases and is not something every run needs.
 
-The raw Sheet export **does not** match the schema this tool requires and will
-silently produce wrong metadata if you skip this step. Follow
-[`CSV-PREPARATION.md`](CSV-PREPARATION.md) — this is the highest-risk step in
-the whole pipeline.
+### Offline path: preparing a CSV
 
-## 2. Validate (no uploads, no writes)
+Skip this unless you are deliberately validating or uploading from a
+hand-prepared CSV instead of reading the live Sheet (offline work, or a
+frozen snapshot to compare against). The raw Sheet export **does not** match
+the schema `validate --csv`/`upload --csv` require and will silently produce
+wrong metadata if this step is skipped. Follow
+[`CSV-PREPARATION.md`](CSV-PREPARATION.md) — it is the highest-risk step on
+that path.
+
+## 1. Validate (no uploads, no writes)
 
 > **Run this before every `upload`, every time.** It is not optional and it is
 > not a first-run-only step. `validate` performs the *same* file resolution
@@ -136,7 +180,7 @@ Only a row that was actually in this run's scope — ready, but broken —
 affects `upload`'s exit code. A not-ready row was never going to be uploaded
 regardless, so it does not flip the exit code; if it did, `upload` would
 return non-zero on every run until all ~2,900 uncatalogued rows are filled
-in, which trains an operator to stop trusting the exit code at all. See §3
+in, which trains an operator to stop trusting the exit code at all. See §2
 below for `upload`'s modes.
 
 It also prints a **field receipt** — every metadata field name the run would
@@ -168,7 +212,7 @@ mangled when files are copied off source media, so the Sheet cell a volunteer
 typed by eye will not match the filename on disk. Expect this class of error
 to recur across a 10,000-row collection.
 
-## 3. Test run
+## 2. Test run
 
 ```bash
 # against the project's test Sheet (the normal path)
@@ -203,7 +247,7 @@ link once `--write-identifier` (or `--live`) has run. Spot-check a few of
 those URLs in a browser and confirm the metadata fields are the ones you
 meant, with the values you meant.
 
-## 4. Live run
+## 3. Live run
 
 ```bash
 python ia_bulk.py upload --project sarasoldphotos --live
@@ -250,7 +294,7 @@ files in the wrong place under a permanent identifier.
       Re-check only if the registry value changes again.
 - [ ] `validate --project <id> --live` was run **today, against the real
       Sheet, and exited 0** — not a validate of the test Sheet, and not
-      yesterday's. See §2; this is the cheapest check on this list and the one
+      yesterday's. See §1; this is the cheapest check on this list and the one
       most likely to find something.
 - [ ] That same run's **"N rows ready to upload (no identifier yet)"** line was
       read, and N is the number you expect. **Exiting 0 no longer means "every
@@ -272,10 +316,10 @@ files in the wrong place under a permanent identifier.
 Identifiers are permanent. An item uploaded under the wrong identifier cannot
 be renamed, only darkened by IA staff on request.
 
-## 5. Corrections
+## 4. Corrections
 
 ```bash
-python ia_bulk.py sync-metadata data/update-metadata.csv --live
+python ia_bulk.py sync-metadata data/update-metadata.csv --project sarasoldphotos --live
 ```
 
 Decoupled from upload and safe to re-run. Needs only `identifier` plus the

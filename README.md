@@ -1,17 +1,20 @@
 # IA Bulk Upload CLI
 
 A small Python CLI for validating, uploading, and syncing metadata for
-Internet Archive items in bulk, driven by a CSV exported from the LCPS
-Google Sheet. Built for the Lower Columbia Preservation Society's (LCPS)
-Astoria historical photo archive, but kept generic to "a project" so a
-second LCPS project can reuse the same pipeline.
+Internet Archive items in bulk, reading a project's Google Sheet directly
+and live over the Sheets API. Built for the Lower Columbia Preservation
+Society's (LCPS) Astoria historical photo archive, but kept generic to "a
+project" so a second LCPS project can reuse the same pipeline. A
+hand-prepared CSV export remains a deliberate offline/dry-run fallback for
+`validate` and `upload` — see "Offline `--csv` path" below.
 
 ## Docs
 
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — runbook: how to run a batch,
   pre-live checklist, resuming, batch limits. **Start here to run something.**
-- [`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) — turning the raw Sheet
-  export into the required schema, and the traps that don't fail loudly.
+- [`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) — the offline `--csv`
+  path only: turning a raw Sheet export into the required schema, and the
+  traps that don't fail loudly.
 - [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) — verified defects and gaps,
   with reproductions.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — full design: CSV schema,
@@ -88,11 +91,11 @@ python ia_bulk.py validate --project sarasoldphotos
 python ia_bulk.py validate --project sarasoldphotos --csv items.csv --files-dir ./photos
 ```
 
-Note: the full Sheet-workflow write-up (registry fields, Google Cloud
-prerequisites, the reserve/upload/confirm protocol) is still to be documented
-in a later task; this is a minimal correction so the command above stays
-accurate. See `docs/DECISIONS.md` ("The Sheet is read live") in the
-meantime.
+For the Google Cloud setup this requires (OAuth consent screen, the
+`@lcpsociety.org` account requirement, the one-time browser consent) see
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md), "Google Cloud prerequisites"; for
+the reserve/upload/confirm protocol and registry fields in full see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and "Project registry" above.
 
 Sheet path: checks the header for colliding or empty field names and any data
 row longer than the header, injects `mediatype` from the registry, resolves
@@ -292,28 +295,38 @@ python ia_bulk.py upload --project sarasoldphotos --live
 ```
 
 **Before any `--live` run**, confirm both of these by hand — neither is
-validated automatically, and both ship as placeholders (see
+validated automatically against Internet Archive (see
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#known-gaps)):
-- `projects_registry.json`'s `collection_key`
-- the project's `ia_collection` in `projects_registry.json`
+- `projects_registry.json`'s `collection_key` — still unconfirmed against how
+  LCPS actually names its collection.
+- the project's `ia_collection` in `projects_registry.json` — for
+  `sarasoldphotos`, already confirmed by hand against archive.org on
+  2026-08-22 (see [`docs/DECISIONS.md`](docs/DECISIONS.md#still-open)); a
+  second project's registry entry would need the same one-time check.
 
 `--dry-run` is the cheapest way to check the second one: it prints every
 identifier it would mint and every cell it would write, and touches nothing.
 
-## Known limitation: raw Sheet export needs preparation
+## Offline `--csv` path
 
-The raw CSV exported from the LCPS Google Sheet does not match the schema
-`validate`/`upload` require (capitalized headers, no `mediatype` column).
-It must be transformed by hand into the required lowercase schema before
-running this tool. This is a deliberate manual step, not something this
-CLI automates.
+By default `validate`/`upload` read the project's Sheet directly, live, over
+the Google Sheets API — see "Commands" above and
+[`docs/DECISIONS.md`](docs/DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+Nothing needs preparing on that path; there is no export step and nothing
+local to go stale.
 
-`validate` catches the structural failures this creates — ragged rows, stray
-whitespace and duplicates in the header, and case variants of the columns the
-script reads by name. It cannot catch a *misspelled* header or a value entered
-in the wrong Sheet column, since neither is distinguishable from an intentional
-one. Follow [`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) and eyeball a
-test upload before going live.
+`--csv` is a deliberate offline/dry-run fallback for validating or uploading
+from a hand-prepared CSV instead. A raw Sheet export does not match the
+schema `validate --csv`/`upload --csv` require (capitalized headers, no
+`mediatype` column) and must be transformed by hand into the required
+lowercase schema first — a deliberate manual step, not something this CLI
+automates. `validate --csv` catches the structural failures this creates —
+ragged rows, stray whitespace and duplicates in the header, and case variants
+of the columns the script reads by name. It cannot catch a *misspelled*
+header or a value entered in the wrong column, since neither is
+distinguishable from an intentional one. Follow
+[`docs/CSV-PREPARATION.md`](docs/CSV-PREPARATION.md) and eyeball a test
+upload before going live.
 
 ## Tests
 
