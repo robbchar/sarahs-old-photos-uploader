@@ -392,7 +392,21 @@ today's quota.
 
 ## Resuming a failed run
 
-Every run writes `logs/<command>-<timestamp>.jsonl`, one line per row:
+**A failing row prints why, as it happens**, indented under its own progress
+line in the same style `validate` uses:
+
+```
+[3/8] uploading zztest-...-lcps-sarasoldphotos-00003 (SOP CD 1/CD 1 01 51 26 1.jpg)
+    - Error retrieving metadata from https://archive.org/metadata/... ReadTimeoutError: read timeout=12
+```
+
+Long messages are collapsed to one line and truncated; the log below keeps
+the complete text. That distinction matters most for the transient case above
+— a read timeout is archive.org being slow, not anything wrong with the row,
+and a rerun picks it up. Without the message on screen there is no way to tell
+that apart from a real refusal such as `Access Denied`.
+
+Every run also writes `logs/<command>-<timestamp>.jsonl`, one line per row:
 
 ```json
 {"identifier": "...", "file": "...", "status": "success|unchanged|failure|unconfirmed",

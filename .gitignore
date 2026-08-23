@@ -5,3 +5,5 @@ __pycache__/
 data/
 .vscode/
 .ignored/
+# Worktrees live here; never part of the tree itself.
+.claude/worktrees/

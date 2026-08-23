@@ -548,6 +548,29 @@ def format_field_receipt(column_map: ColumnMap) -> str:
     return "\n".join(lines)
 
 
+CONSOLE_ERROR_WIDTH = 300
+
+
+def format_row_error(exc: Exception) -> str:
+    """A failing row's error, as one line to print underneath it.
+
+    "1 error(s)" plus a path to a JSONL file was the entire console output
+    for a failed row. This tool is meant to be run by volunteers who are
+    comfortable with spreadsheets and not with code, and the information
+    already existed - the log's `error` field held the full message, it just
+    never reached the screen.
+
+    Whitespace is collapsed because Internet Archive's S3 failures carry a
+    multi-line XML body; dumped raw under a progress line it swamps the
+    [N/M] rhythm the operator is reading. Truncated for the same reason. The
+    log keeps the complete text, which is what the log is for.
+    """
+    text = " ".join(str(exc).split())
+    if len(text) > CONSOLE_ERROR_WIDTH:
+        text = text[:CONSOLE_ERROR_WIDTH - 3] + "..."
+    return text
+
+
 def _pluralize(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -1567,6 +1590,7 @@ def run_rows(
             log_result(log_path, identifier, file_value, "unchanged", live, uploaded_as=target_identifier)
         except Exception as exc:
             counts["failure"] += 1
+            print(f"    - {format_row_error(exc)}")
             log_result(
                 log_path, identifier, file_value, "failure", live, error=str(exc), uploaded_as=target_identifier
             )
@@ -2110,6 +2134,7 @@ class SheetUploadRun:
                     # message is the server's either way - and additionally
                     # ends the run after this chunk's confirm write.
                     counts["failure"] += 1
+                    print(f"    - {format_row_error(exc)}")
                     self._log(target, "failure", error=str(exc))
                     if is_rate_limit_error(exc):
                         rate_limited = True
@@ -2964,6 +2989,7 @@ def run_sheet_sync(targets: list[SyncTarget], log_path: Path, live: bool) -> dic
             log_result(log_path, target.identifier, "", "unchanged", live, uploaded_as=target.uploaded_as)
         except Exception as exc:
             counts["failure"] += 1
+            print(f"    - {format_row_error(exc)}")
             log_result(
                 log_path, target.identifier, "", "failure", live,
                 error=str(exc), uploaded_as=target.uploaded_as,
