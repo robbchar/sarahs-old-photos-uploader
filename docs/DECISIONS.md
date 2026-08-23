@@ -536,39 +536,73 @@ anything. Both are recorded in the `run_header` log record (see
 or used a non-default `--chunk-size`, stays reconstructable from its own log
 alone.
 
-## Rate-limit detection matches a status code, not vendor text — and is unverified
+## Rate-limit detection uses a parsed status code, never message text
 
-*Decided 2026-08-22.*
+*Decided 2026-08-22. Revised 2026-08-22 after review found the first version
+could false-positive.*
 
-`is_rate_limit_error()` matches only `"429"`/`"503"` as they appear in
-`upload_row()`'s own `f"failed with status {response.status_code}: ..."`
-message — the one representation of an IA upload failure this codebase
-constructs itself and can vouch for. 503 is Internet Archive's documented S3
-overload signal (the installed `internetarchive` 5.10.1's own `ia upload
---retries` help text: *"Number of times to retry request if S3 returns a 503
-SlowDown error"*); 429 is not IA-upload-specific documentation, but
-`session.py`'s default urllib3 `Retry` `status_forcelist`
-(`[429, 500, 501, 502, 503, 504]`) shows the library's own authors also treat
-it as rate-limit-adjacent.
+`is_rate_limit_error()` looks **only** at a parsed status-code integer,
+never at `str(exc)` or any server-supplied text. The first version of this
+function scanned `str(exc)` for `"status 429"`/`"status 503"` substrings;
+review found that unsafe in both directions and it was replaced, not merely
+tightened:
 
-Deliberately **not** matched: `"SlowDown"`, `"Too Many Requests"`, or any
-other vendor-supplied text. Tracing `item.py`'s `upload_file()` — the method
-`upload_row()` actually reaches via `internetarchive.upload()` — shows that on
-a real failure it catches the resulting `HTTPError` and **re-raises it with a
-message rebuilt from the S3 XML body's `Message`/`Resource` elements only**
-(`get_s3_xml_text()` in `internetarchive/utils.py`); the numeric HTTP status
-and the S3 error `Code` (e.g. `SlowDown`) are explicitly discarded in that
-rewrite. So a live 429/503 surfacing through the real library may not contain
-either marker anywhere in `str(exc)`, and this detector would not catch it.
+- a 404 (or anything else) whose body happens to mention `"status 503"` — a
+  mirrored error, a proxied message, an echoed request — misclassified as a
+  rate limit and would have wrongly stopped the whole run.
+- a plain substring test also matches `"status 5031"` or `"status 42900"` —
+  digits that merely *contain* 503/429, not equal to them.
+
+A false positive here is worse than a miss: it halts a batch mid-flight, on
+a command that creates permanent items, for a reason that is not real. The
+replacement checks two structured sources, both verified by reading source
+rather than guessed:
+
+1. **`UploadFailed.status_code`** — a new exception (subclassing
+   `RuntimeError`, so the pre-existing `pytest.raises(RuntimeError, ...)`
+   caller keeps working) that `upload_row()` raises in place of a bare
+   `RuntimeError`, carrying the real, parsed `response.status_code` as a
+   structured attribute rather than only embedding it in the message text.
+2. **`exc.response.status_code`** —
+   `requests.exceptions.RequestException.__init__` (the base of
+   `HTTPError`) stores whatever `Response` it is given as `.response`
+   (`self.response = kwargs.pop("response", None)`, confirmed by reading
+   `requests`' own source, not assumed). Tracing the installed
+   `internetarchive` 5.10.1's `Item.upload_file()` — the method
+   `upload_row()` actually reaches via `internetarchive.upload()` — shows
+   that on a real S3 failure it catches the resulting `HTTPError` and
+   re-raises via
+   `raise type(exc)(error_msg, response=exc.response, request=exc.request)`.
+   The **message** there is rebuilt from the S3 XML body's `Message`/
+   `Resource` elements (`get_s3_xml_text()` in `internetarchive/utils.py`)
+   and loses the numeric status and the S3 error `Code` (e.g. `SlowDown`)
+   entirely — but `response=exc.response` is passed through **unchanged**,
+   so `.response.status_code` still holds the real, original status even
+   though the text does not.
+
+That second finding reverses what the first version of this decision said:
+a live rate limit surfacing through the real library's own exception *is*
+catchable, just not by reading its message — it has to be read from the
+structured `.response.status_code` the library itself preserves. There is
+no text-based fallback: neither exception this codebase's upload path can
+raise lacks a structured status (see both sources above), so the rate-limit
+decision never depends on server-supplied text at all.
+
+503 is Internet Archive's documented S3 overload signal (the installed
+`internetarchive` 5.10.1's own `ia upload --retries` help text: *"Number of
+times to retry request if S3 returns a 503 SlowDown error"*); 429 is not
+IA-upload-specific documentation, but `session.py`'s default urllib3 `Retry`
+`status_forcelist` (`[429, 500, 501, 502, 503, 504]`) shows the library's own
+authors also treat it as rate-limit-adjacent.
 
 No `--live` run has ever happened, so no real rate-limit response has ever
-been captured — this could not be verified against actual IA behavior, only
-against the installed library's source. A missed detection is the safe
-failure direction: the row is logged as one ordinary failure and the run
-continues, same as any other transient error, whereas a detector guessing at
-unconfirmed vendor text risks matching the wrong thing and aborting a run
-over an unrelated error. `--limit` (above) remains the operator-controlled
-fallback for whatever this detector cannot cover.
+been captured — both structured sources above are verified against the
+installed library's *source*, not against actual IA behavior. A missed
+detection (an exception with neither attribute, or a genuinely different
+status) is the safe failure direction: the row is logged as one ordinary
+failure and the run continues, same as any other transient error, whereas a
+false match aborts a run mid-flight over an unrelated error. `--limit`
+(above) remains the operator-controlled fallback either way.
 
 ## Still open
 
@@ -609,13 +643,19 @@ fallback for whatever this detector cannot cover.
   remains a third, unrelated value — see above.
 - Whether IA emits a distinguishable signal at its 5,000/day cap, as opposed to
   generic throttling, **remains open** — no `--live` run has ever happened, so
-  no real rate-limit response has ever been captured. **2026-08-22:**
-  `is_rate_limit_error()` now stops a run on a `429`/`503` upload failure (see
-  "Rate-limit detection matches a status code..." above), but that detector
-  is verified only against the installed library's source, not a live
-  response, and may not fire on however IA's real signal actually looks.
+  no real rate-limit response has ever been captured. **2026-08-22, revised
+  same day:** `is_rate_limit_error()` now stops a run on a `429`/`503` upload
+  failure, read from a PARSED status-code integer rather than message text
+  (see "Rate-limit detection uses a parsed status code..." above, which
+  replaced an earlier version of this same decision after review found the
+  text-scanning approach could false-positive). Tracing the installed
+  library's source shows the structured status survives even the path where
+  the *message* is rewritten and loses it, so this should catch a real 429/503
+  reaching this codebase's upload path either way it can arrive - but "should"
+  is still verified only against the installed library's source, not an
+  actual response from archive.org, since no `--live` run has happened.
   `--limit` (see "`--limit` counts planned targets..." above) remains the
-  operator-controlled fallback for whatever it does not cover.
+  operator-controlled fallback either way.
 - ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:
   reserve in the Sheet before uploading, and track completion in an
   `ia_uploaded` column so an interrupted run is recoverable.

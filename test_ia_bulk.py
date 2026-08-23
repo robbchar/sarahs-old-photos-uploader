@@ -10,6 +10,7 @@ from pathlib import Path
 
 import internetarchive
 import pytest
+import requests
 from googleapiclient.errors import HttpError
 
 from column_map import build_column_map
@@ -36,6 +37,7 @@ from ia_bulk import (
     CHUNK_SIZE,
     is_rate_limit_error,
     RateLimited,
+    UploadFailed,
 )
 from project_config import ProjectConfig
 
@@ -4635,22 +4637,64 @@ def test_cmd_upload_reports_a_sheets_write_failure_instead_of_a_traceback(
 
 
 @pytest.mark.parametrize(
-    "message,expected",
+    "make_exc,expected",
     [
-        ("failed with status 503: SlowDown", True),
-        ("failed with status 429: Too Many Requests", True),
-        ("failed with status 404: not found", False),
-        ("connection reset by peer", False),
+        (lambda: UploadFailed("failed with status 503: SlowDown", status_code=503), True),
+        (lambda: UploadFailed("failed with status 429: Too Many Requests", status_code=429), True),
+        (lambda: UploadFailed("failed with status 404: not found", status_code=404), False),
+        (lambda: RuntimeError("connection reset by peer"), False),
     ],
 )
-def test_is_rate_limit_error(message, expected):
-    """Matches only on the HTTP status number embedded in upload_row()'s own
-    `f"failed with status {response.status_code}: {response.text}"` message -
-    the one representation of an IA failure this codebase actually
-    constructs and can vouch for. See task-12-report.md for what could and
-    could not be verified about what a live rate-limit response looks like
-    once it has passed through the installed `internetarchive` library."""
-    assert is_rate_limit_error(RuntimeError(message)) is expected
+def test_is_rate_limit_error(make_exc, expected):
+    """Matches only the PARSED status_code attribute UploadFailed carries -
+    never str(exc) or any server-supplied text. See is_rate_limit_error()'s
+    own comment and docs/DECISIONS.md, "Rate-limit detection uses a parsed
+    status code, never message text" for what could and could not be
+    verified about what a live rate-limit response looks like once it has
+    passed through the installed `internetarchive` library."""
+    assert is_rate_limit_error(make_exc()) is expected
+
+
+def test_is_rate_limit_error_ignores_a_status_code_merely_mentioned_in_unrelated_response_text():
+    """The exact bug review found in the string-scanning version this
+    replaced: a 404 whose body happens to quote 'status 503' - a mirrored
+    error, a proxied message, an echoed request - must NOT be treated as a
+    rate limit. The real status_code (404) is what governs the decision;
+    the arbitrary text is never consulted at all."""
+    exc = UploadFailed(
+        "upload of 'x' failed with status 404: mirror of upstream failure (status 503: SlowDown)",
+        status_code=404,
+    )
+    assert is_rate_limit_error(exc) is False
+
+
+def test_is_rate_limit_error_does_not_match_status_codes_that_merely_contain_429_or_503():
+    """A pure substring scan over message text would also match 'status
+    5031' or 'status 42900' - digits adjacent to a coincidental match.
+    status_code is a parsed int, so 5031 and 503 are simply different
+    integers; there is no substring for either to accidentally contain."""
+    assert is_rate_limit_error(UploadFailed("boom", status_code=5031)) is False
+    assert is_rate_limit_error(UploadFailed("boom", status_code=42900)) is False
+
+
+def test_is_rate_limit_error_reads_the_structured_status_from_requests_httperror():
+    """Verified path from tracing the installed internetarchive 5.10.1's
+    Item.upload_file(): a real S3 failure surfaces as
+    `requests.exceptions.HTTPError` re-raised with `response=exc.response`
+    passed through unchanged, even though the message text has been rebuilt
+    from the S3 XML body and no longer contains the status code anywhere.
+    is_rate_limit_error() must still catch this via `.response.status_code`,
+    not just via ia_bulk's own UploadFailed.status_code. Uses a real
+    requests.Response (not the local FakeResponse shim) because
+    HTTPError.__init__ is typed to accept `response: Response | None`."""
+    response = requests.Response()
+    response.status_code = 503
+    exc = requests.exceptions.HTTPError(
+        " error uploading photo1.jpg to lcps-astoriaphotos-00001, Please reduce your request "
+        "rate. - some/resource",
+        response=response,
+    )
+    assert is_rate_limit_error(exc) is True
 
 
 def test_rate_limited_carries_the_original_message():
@@ -4722,7 +4766,10 @@ def test_cmd_upload_stops_the_run_on_a_rate_limit_instead_of_grinding_through_fa
     def fake_upload_row(row, target_identifier, collection, files_dir):
         recorder.events.append(("upload", target_identifier))
         if target_identifier.endswith("00003"):
-            raise RuntimeError("failed with status 503: SlowDown")
+            raise UploadFailed(
+                f"upload of '{target_identifier}' failed with status 503: SlowDown",
+                status_code=503,
+            )
 
     monkeypatch.setattr("ia_bulk.upload_row", fake_upload_row)
 
@@ -4763,7 +4810,10 @@ def test_cmd_upload_confirms_successes_that_happened_before_a_rate_limit_stopped
     def fake_upload_row(row, target_identifier, collection, files_dir):
         recorder.events.append(("upload", target_identifier))
         if target_identifier.endswith("00003"):
-            raise RuntimeError("failed with status 503: SlowDown")
+            raise UploadFailed(
+                f"upload of '{target_identifier}' failed with status 503: SlowDown",
+                status_code=503,
+            )
 
     monkeypatch.setattr("ia_bulk.upload_row", fake_upload_row)
 
@@ -4822,6 +4872,139 @@ def test_cmd_upload_limit_and_chunk_size_combine_as_total_then_batch_size(
     ]
     reserve_batch_sizes = [len(batch) for batch in recorder.writes[0::2]]
     assert reserve_batch_sizes == [3, 3, 3, 1]
+
+
+def test_cmd_upload_limit_counts_planned_targets_on_a_mixed_sheet(tmp_path, monkeypatch, capsys):
+    """The uniformly-ready grid in the test above cannot tell 'slices
+    plan_upload_targets()'s OUTPUT' apart from 'slices raw Sheet rows before
+    readiness-filtering' - both implementations upload the same first two
+    identifiers there. This Sheet interleaves not-ready rows (blank title)
+    among the ready ones so the two implementations predict DIFFERENT
+    uploads: a raw-row slice would see only rows 2-3 (Photo 1, then a
+    blank-title row that never gets planned at all) and upload just Photo 1;
+    slicing plan_upload_targets()'s own output - the four READY rows, in
+    order - uploads Photo 1 and Photo 3."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER] + [
+        ["Photo 1", "photo1.jpg", "", "", "", ""],
+        ["", "photo2.jpg", "", "", "", ""],  # not-ready: blank title
+        ["Photo 3", "photo3.jpg", "", "", "", ""],
+        ["", "photo4.jpg", "", "", "", ""],  # not-ready: blank title
+        ["Photo 5", "photo5.jpg", "", "", "", ""],
+        ["", "photo6.jpg", "", "", "", ""],  # not-ready: blank title
+        ["Photo 7", "photo7.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=tuple(f"photo{n}.jpg" for n in range(1, 8)),
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, limit=2)
+    )
+    capsys.readouterr()
+
+    # not_ready rows never affect the exit code (only blocked/failure/
+    # unconfirmed/not_attempted do), so a clean run with 3 not-yet-catalogued
+    # rows still exits 0.
+    assert exit_code == 0
+    assert recorder.uploads == [
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002",
+    ]
+    # Photo 5 (row 6) and Photo 7 (row 8) were never reserved.
+    assert client.grid[5] == ["Photo 5", "photo5.jpg", "", "", "", ""]
+    assert client.grid[7] == ["Photo 7", "photo7.jpg", "", "", "", ""]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_cmd_upload_rejects_a_non_positive_limit(tmp_path, monkeypatch, capsys, limit):
+    """0 or a negative --limit would slice plan_upload_targets()'s output
+    down to nothing (or, for the raw-Python-slicing sense of a negative
+    index, something else entirely) and let the run report success having
+    uploaded nothing - silently doing the wrong thing rather than failing
+    loudly. Checked before any Sheet I/O: recorder.kinds stays empty."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["Photo 1", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, limit=limit))
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert recorder.kinds == []
+    assert err.splitlines() == [
+        f"--limit must be a positive number of items, not {limit}. A run with nothing to "
+        "upload is what dropping --limit already means - drop it instead of passing zero "
+        "or a negative number."
+    ]
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_cmd_upload_rejects_a_non_positive_chunk_size(tmp_path, monkeypatch, capsys, chunk_size):
+    """0 raises ValueError inside chunk_rows() (range() forbids a zero
+    step) - a bare traceback in place of the run summary. -1 is worse:
+    chunk_rows()'s range(0, len(rows), -1) yields no chunks at all, so the
+    run silently uploads nothing and still reports success. Both are
+    rejected up front instead, before any Sheet I/O."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["Photo 1", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, chunk_size=chunk_size))
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert recorder.kinds == []
+    assert err.splitlines() == [
+        f"--chunk-size must be a positive number of items, not {chunk_size}. Zero raises "
+        "inside chunk_rows(); a negative value silently produces zero chunks, uploading "
+        "nothing while the run still reports success."
+    ]
+
+
+def test_cmd_upload_rejects_chunk_size_alone_on_the_csv_path(tmp_path, capsys):
+    """The existing --csv rejection test only sets --limit; --chunk-size on
+    its own must trip the same guard, not silently do nothing because the
+    check happens to short-circuit on `limit is not None` first."""
+    from ia_bulk import cmd_upload
+
+    csv_path = tmp_path / "items.csv"
+    write_csv(csv_path, ["identifier", "file", "mediatype", "title"], [])
+
+    args = Namespace(
+        csv=str(csv_path),
+        project="astoriaphotos",
+        registry="projects_registry.json",
+        files_dir=None,
+        collection=None,
+        live=False,
+        write_identifier=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        limit=None,
+        chunk_size=3,
+    )
+
+    exit_code = cmd_upload(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert err.splitlines() == [
+        "--limit and --chunk-size describe the Sheet path's batching and quota-stopping "
+        "behavior, so they apply to the Sheet path only. Drop --csv to run against the "
+        "Sheet."
+    ]
 
 
 def test_run_header_records_limit_and_chunk_size_when_set(tmp_path, monkeypatch, capsys):

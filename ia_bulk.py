@@ -853,46 +853,104 @@ def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
     return f"{TEST_IDENTIFIER_PREFIX}{stamp}-{identifier}"
 
 
-# What this matches, and why it does NOT match on "SlowDown" or "Too Many
-# Requests" text: upload_row() below raises its own RuntimeError, embedding
-# `response.status_code` verbatim, whenever internetarchive.upload() returns
-# a not-ok Response - that is the one representation of an IA failure this
-# codebase constructs itself and can vouch for. 503 is Internet Archive's
-# documented S3 overload signal (see the installed internetarchive 5.10.1's
-# own `ia upload --retries` help text: "Number of times to retry request if
-# S3 returns a 503 SlowDown error", and item.py's upload retry loop, which
-# checks for it by number). 429 is not IA-upload-specific documentation, but
-# session.py's own default urllib3 Retry status_forcelist
-# ([429, 500, 501, 502, 503, 504]) shows the library's authors also treat it
-# as a retryable/rate-limit-adjacent status from this API.
+# is_rate_limit_error() looks ONLY at parsed status-code INTEGERS, never at
+# str(exc) or any server-supplied text. An earlier version of this function
+# scanned str(exc) for "status 429"/"status 503" substrings; that is unsafe
+# in both directions and was fixed after review found the gap:
 #
-# What could NOT be verified (no --live run has ever happened, so no real
-# 429/503 response has been captured): tracing item.py's upload_file() shows
-# that on the actual path upload_row() takes (internetarchive.upload() ->
-# Item.upload() -> Item.upload_file()), a failing request raises HTTPError
-# rather than returning a not-ok Response, and the library catches that
-# HTTPError and RE-RAISES it with a message rebuilt from the S3 XML body's
-# <Message>/<Resource> text only (see get_s3_xml_text() in
-# internetarchive/utils.py) - the numeric status code and the S3 <Code>
-# (e.g. "SlowDown") are explicitly discarded in that rewrite. So a live rate
-# limit surfacing through the real library may not contain "429" or "503"
-# anywhere in str(exc), and this detector would not catch it. That is the
-# safe direction to be wrong in: a miss here just logs one more ordinary
-# failure and the run continues, where a false match would wrongly abort a
-# run mid-flight over an unrelated error. See task-12-report.md.
-RATE_LIMIT_STATUS_CODES = ("429", "503")
+# - a 404 (or anything else) whose body happens to mention "status 503" -
+#   a mirrored error, a proxied message, an echoed request - would
+#   misclassify as a rate limit and wrongly stop the whole run.
+# - a plain substring test also matches "status 5031" or "status 42900":
+#   digits that merely CONTAIN 503/429 as a substring, not equal to them.
+#
+# A false positive here is worse than a miss: it halts a batch mid-flight,
+# on a command that creates permanent items, for a reason that is not real.
+#
+# Two structured sources are checked instead, both verified by reading
+# source rather than guessed:
+#
+# 1. UploadFailed.status_code - set by upload_row() below, in this file,
+#    from the real, parsed `response.status_code` whenever
+#    internetarchive.upload() returns a not-ok Response. See UploadFailed's
+#    own docstring.
+#
+# 2. exc.response.status_code - requests.exceptions.RequestException (the
+#    base of HTTPError) stores whatever Response object it is given as
+#    `.response` in its own __init__ (`self.response = kwargs.pop
+#    ("response", None)` - verified by reading requests' source directly,
+#    not assumed). Tracing the installed internetarchive 5.10.1's
+#    Item.upload_file() - the method upload_row() actually reaches via
+#    internetarchive.upload() -> Item.upload() - shows that on a real S3
+#    failure it catches the resulting HTTPError and re-raises via
+#    `raise type(exc)(error_msg, response=exc.response, request=exc.request)`.
+#    The MESSAGE there is rebuilt from the S3 XML body's <Message>/
+#    <Resource> text (see get_s3_xml_text() in internetarchive/utils.py) and
+#    loses the numeric status and the S3 <Code> (e.g. "SlowDown") entirely -
+#    but `response=exc.response` is passed through UNCHANGED, so
+#    `.response.status_code` still holds the real, original status even
+#    though the text does not. This is what lets the check below catch a
+#    live rate limit surfacing through the real library's own exception,
+#    not only upload_row()'s own not-ok-Response branch.
+#
+# 503 is Internet Archive's documented S3 overload signal (the installed
+# internetarchive 5.10.1's own `ia upload --retries` help text: "Number of
+# times to retry request if S3 returns a 503 SlowDown error"). 429 is not
+# IA-upload-specific documentation, but session.py's default urllib3 Retry
+# status_forcelist ([429, 500, 501, 502, 503, 504]) shows the library's own
+# authors also treat it as rate-limit-adjacent.
+#
+# No --live run has ever happened, so no real rate-limit response has ever
+# been captured - both sources above are verified against the installed
+# library's SOURCE, not against actual IA behavior. Neither reachable
+# exception in this codebase's own upload path lacks a structured status
+# (see UploadFailed and the HTTPError tracing above), so there is no
+# text-based fallback: the rate-limit decision never depends on
+# server-supplied text, only on a parsed integer. A miss (an exception with
+# neither attribute, or a genuinely different status) just logs one more
+# ordinary failure and the run continues - --limit remains the
+# operator-controlled backstop either way. See docs/DECISIONS.md,
+# "Rate-limit detection uses a parsed status code, never message text".
+RATE_LIMIT_STATUS_CODES = (429, 503)
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
-    message = str(exc)
-    return any(f"status {code}" in message for code in RATE_LIMIT_STATUS_CODES)
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return status_code in RATE_LIMIT_STATUS_CODES
 
 
 class RateLimited(Exception):
-    """Raised (from the original exception) only once is_rate_limit_error()
-    has already matched it, so anything that catches RateLimited specifically
-    already knows why: this is the signal to stop the whole run, not to log
-    one more per-row failure and move on to the next target."""
+    """Marks an upload failure as Internet Archive's rate limit rather than
+    an ordinary per-row error. Nothing ever raises or catches this - despite
+    the name, it is never thrown. SheetUploadRun.execute() CONSTRUCTS one
+    (reassigning it to the local `exc`) once is_rate_limit_error() has
+    already matched the original exception, then checks `isinstance(exc,
+    RateLimited)` to decide whether to stop the whole run or log this row
+    and continue - a plain marker object checked by type, not a control-flow
+    signal raised up the stack."""
+
+
+class UploadFailed(RuntimeError):
+    """Raised by upload_row() below when internetarchive.upload() returns a
+    not-ok Response. Subclasses RuntimeError (rather than plain Exception)
+    so the pre-existing `pytest.raises(RuntimeError, match="503")` caller
+    keeps working unchanged.
+
+    Carries `status_code` as the PARSED INTEGER `response.status_code` -
+    never reconstructed from the message text later - specifically so
+    is_rate_limit_error() can look at the real, structured value Internet
+    Archive returned instead of scanning `response.text`, which is
+    arbitrary server-supplied prose that might itself contain a string like
+    "status 503" for an unrelated reason (a mirrored error, a proxy
+    message) even when the real status was something else entirely. See
+    is_rate_limit_error()'s own comment and docs/DECISIONS.md, "Rate-limit
+    detection uses a parsed status code, never message text"."""
+
+    def __init__(self, message: str, *, status_code: int | None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
@@ -939,8 +997,9 @@ def upload_row(row: dict, target_identifier: str, collection: str, files_dir: st
                 "a Response - this should be unreachable since debug is never passed"
             )
         if not response.ok:
-            raise RuntimeError(
-                f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}"
+            raise UploadFailed(
+                f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}",
+                status_code=response.status_code,
             )
 
 
@@ -2131,6 +2190,49 @@ def upload_from_sheet(args) -> int:
         )
         return 1
 
+    # Task 12: read and validate --limit/--chunk-size as early as possible -
+    # before any Sheet I/O, field-receipt printing, or validation work - so a
+    # typo'd flag fails fast instead of only surfacing after the run has
+    # already done everything short of uploading.
+    limit = getattr(args, "limit", None)
+    if limit is not None and limit <= 0:
+        # Silently doing nothing is the trap here, not a crash: a limit of
+        # zero (or negative) would slice plan_upload_targets()'s output down
+        # to nothing, upload zero items, and still report the run as clean -
+        # the operator would have no reason to suspect --limit was the cause.
+        print(
+            f"--limit must be a positive number of items, not {limit}. A run with nothing to "
+            "upload is what dropping --limit already means - drop it instead of passing zero "
+            "or a negative number.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # getattr's default is looked up fresh on every call (it is an ordinary
+    # function argument, not a class default evaluated once at import time),
+    # so falling back to the module-level CHUNK_SIZE here - rather than
+    # snapshotting it into make_upload_args()'s Namespace - is what keeps
+    # every existing `monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)` test
+    # working: those tests never set args.chunk_size at all, so this always
+    # sees whatever CHUNK_SIZE is right now.
+    chunk_size = getattr(args, "chunk_size", None)
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if chunk_size <= 0:
+        # Two different failure modes, both worse than a clean refusal:
+        # chunk_rows()'s range(0, len(rows), chunk_size) raises ValueError
+        # mid-run for 0 (a bare traceback in place of the run summary), and
+        # silently produces ZERO chunks for a negative value - the run
+        # uploads nothing and still reports success, exactly like the
+        # --limit <= 0 case above.
+        print(
+            f"--chunk-size must be a positive number of items, not {chunk_size}. Zero raises "
+            "inside chunk_rows(); a negative value silently produces zero chunks, uploading "
+            "nothing while the run still reports success.",
+            file=sys.stderr,
+        )
+        return 1
+
     if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
         print(
             f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
@@ -2262,28 +2364,20 @@ def upload_from_sheet(args) -> int:
 
     # Task 12: --limit counts PLANNED targets (valid AND ready AND not
     # already done), not Sheet rows scanned - plan_upload_targets has
-    # already done that filtering above, so slicing its output is what
-    # makes "--limit 100" mean "100 of the rows actually in scope", not
-    # "stop after the first 100 rows read". Numbers were minted for every
-    # pending row before this slice runs (plan_upload_targets mints for the
-    # whole run up front - see its own docstring), but minting is pure
-    # arithmetic with no side effect: a target dropped here is never
-    # reserved, so its number is never spent and next_identifiers() mints it
-    # again next run.
-    limit = getattr(args, "limit", None)
+    # already done that filtering above, so slicing ITS OUTPUT here (never
+    # `rows`/`row_results` before it runs - that would count raw Sheet rows
+    # instead, a materially different and wrong reading, see
+    # docs/DECISIONS.md) is what makes "--limit 100" mean "100 of the rows
+    # actually in scope", not "stop after the first 100 rows read". Numbers
+    # were minted for every pending row before this slice runs
+    # (plan_upload_targets mints for the whole run up front - see its own
+    # docstring), but minting is pure arithmetic with no side effect: a
+    # target dropped here is never reserved, so its number is never spent
+    # and next_identifiers() mints it again next run. `limit` and
+    # `chunk_size` were already read and validated at the top of this
+    # function.
     if limit is not None:
         targets = targets[:limit]
-
-    # getattr's default is looked up fresh on every call (it is an ordinary
-    # function argument, not a class default evaluated once at import time),
-    # so falling back to the module-level CHUNK_SIZE here - rather than
-    # snapshotting it into make_upload_args()'s Namespace - is what keeps
-    # every existing `monkeypatch.setattr("ia_bulk.CHUNK_SIZE", 1)` test
-    # working: those tests never set args.chunk_size at all, so this always
-    # sees whatever CHUNK_SIZE is right now.
-    chunk_size = getattr(args, "chunk_size", None)
-    if chunk_size is None:
-        chunk_size = CHUNK_SIZE
 
     collection = config.ia_collection if live else TEST_COLLECTION
 
@@ -2458,12 +2552,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Upload at most this many items this run (Sheet path only). Counts rows actually "
-            "in scope to upload - valid AND ready AND not already done - not every row scanned; "
-            "on a Sheet with 2,900 uncatalogued rows and 150 ready ones, --limit 100 uploads 100 "
-            "of the 150 ready rows, not the first 100 rows read. Combines with --chunk-size as "
-            "'this many total, batched this way': --limit 10 --chunk-size 3 uploads 10 items in "
-            "chunks of 3, not 10 chunks of 3."
+            "Upload at most this many items this run (Sheet path only; must be positive). "
+            "Counts rows actually in scope to upload - valid AND ready AND not already done - "
+            "not every row scanned; on a Sheet with 2,900 uncatalogued rows and 150 ready ones, "
+            "--limit 100 uploads 100 of the 150 ready rows, not the first 100 rows read. "
+            "Combines with --chunk-size as 'this many total, batched this way': --limit 10 "
+            "--chunk-size 3 uploads 10 items in chunks of 3, not 10 chunks of 3."
         ),
     )
     upload_parser.add_argument(
@@ -2471,9 +2565,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=CHUNK_SIZE,
         help=(
-            f"Items per reserve/upload/confirm batch (Sheet path only; default {CHUNK_SIZE}, "
-            "Internet Archive's own per-run item cap). Applied to whatever --limit leaves, not "
-            "instead of it - see --limit's help for the exact combination."
+            f"Items per reserve/upload/confirm batch (Sheet path only; must be positive; "
+            f"default {CHUNK_SIZE}, Internet Archive's own per-run item cap). Applied to "
+            "whatever --limit leaves, not instead of it - see --limit's help for the exact "
+            "combination."
         ),
     )
 
