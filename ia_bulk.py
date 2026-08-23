@@ -1395,6 +1395,183 @@ def check_required_for_upload(config: ProjectConfig, column_map: ColumnMap) -> l
     ]
 
 
+class SheetSetupFailed(Exception):
+    """A Sheet-path command could not get far enough to start its own work.
+
+    Carries no message of its own - the operator-facing one is already on
+    stderr by the time this is raised. Raising rather than returning a
+    sentinel is what lets read_sheet() and validate_sheet_content() have a
+    single return type, so a caller cannot forget to check one."""
+
+
+@dataclass(frozen=True)
+class SheetRead:
+    """A project's Sheet, read and far enough along that a command can start.
+
+    Holds the raw `grid` as well as `rows`: sheet_structure_validation needs
+    the grid to see a data row longer than the header, which grid_to_rows has
+    already truncated away by the time it produces rows. `client` is kept
+    because `upload` writes back through the same one it read with."""
+
+    registry: dict
+    config: ProjectConfig
+    live: bool
+    client: SheetClient
+    grid: list[list[str]]
+    column_map: ColumnMap
+    rows: list[dict[str, str]]
+    structure_results: list[RowValidation]
+
+
+def sheet_banner(config: ProjectConfig, live: bool) -> str:
+    """The line every Sheet-path command prints before anything else.
+
+    The run mode is this project's core safety design - a rehearsal must
+    never touch the real Sheet - so which spreadsheet and tab back it is
+    printed unconditionally, not just on success. A human staring at a report
+    has to be able to confirm at a glance that they are pointed where they
+    think they are."""
+    mode = "live" if live else "test"
+    return (
+        f"project '{config.project_id}': {mode} mode, "
+        f"spreadsheet '{config.sheet_id_for(live)}', tab '{config.sheet_tab}'"
+    )
+
+
+def read_sheet(args, registry: dict, config: ProjectConfig, live: bool, command: str) -> SheetRead:
+    """Everything all three Sheet-path commands do between printing their
+    banner and starting their own work.
+
+    Deliberately does NOT print the banner or run the per-command flag
+    checks. Those happen first and differ per command - `upload` rejects
+    --collection and validates --limit, `sync-metadata` rejects --from-log -
+    and moving the placeholder check ahead of them would change which
+    complaint an operator sees when both are wrong.
+
+    `command` appears in the placeholder message only ("before running
+    upload"), which is the sole text that differed between the three copies
+    this replaces."""
+    sheet_id = config.sheet_id_for(live)
+    mode = "live" if live else "test"
+
+    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
+        print(
+            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
+            f"placeholder '{sheet_id}' - edit it in {args.registry} to the real Google Sheet ID "
+            f"before running {command}.",
+            file=sys.stderr,
+        )
+        raise SheetSetupFailed
+
+    client = build_sheet_client(config, live)
+    try:
+        grid = client.read_grid()
+    except HttpError as exc:
+        print(
+            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
+            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
+            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
+            "been shared with the Google account you authorized as.",
+            file=sys.stderr,
+        )
+        raise SheetSetupFailed from exc
+
+    column_map, rows = grid_to_rows(grid)
+
+    # mediatype is a per-project constant, never a Sheet column - inject it
+    # before validating so every row satisfies the required-column check
+    # instead of failing on a column that was never meant to exist. Harmless
+    # for sync-metadata, which never sends it: sheet_metadata_fields()
+    # subtracts PIPELINE_OWNED_FIELDS, and Internet Archive will not change
+    # an item's mediatype after upload anyway.
+    for row in rows:
+        row["mediatype"] = config.mediatype
+
+    structure_results = sheet_structure_validation(column_map, grid)
+
+    if not rows:
+        # A dedicated branch, not just another row-1 structural error: an
+        # empty read is far more likely to mean a wrong tab name, an
+        # unpopulated copy of the Sheet, or a Sheet never actually shared
+        # with the account you authorized as than a real project with zero
+        # rows, and reporting that as success would defeat the purpose of
+        # running the command at all. Handled separately from the normal
+        # report (rather than folded into sheet_structure_validation's row-1
+        # entry) specifically so the summary line never has to say
+        # "0/1 rows passed" - that "1" would be a synthetic entry standing in
+        # for zero real rows, which reads as nonsense arithmetic.
+        if structure_results:
+            print("\n".join(_format_result_lines(structure_results)))
+            print()
+        print(
+            "the Sheet has no data rows (only a header, or nothing at all) - check that "
+            "'sheet_tab' in the project's registry entry names the right tab, and that "
+            "the Sheet has actually been populated and shared"
+        )
+        raise SheetSetupFailed
+
+    return SheetRead(
+        registry=registry,
+        config=config,
+        live=live,
+        client=client,
+        grid=grid,
+        column_map=column_map,
+        rows=rows,
+        structure_results=structure_results,
+    )
+
+
+def validate_sheet_content(
+    sheet: SheetRead, args
+) -> tuple[list[RowValidation], list[RowValidation]]:
+    """The registry-vs-Sheet checks and per-row validation `validate` and
+    `upload` share. Returns (header_results, row_results).
+
+    `sync-metadata` does not use this: it corrects rows that already
+    uploaded, so a file_template that no longer matches the Sheet is not its
+    problem, and re-resolving files would make a correction depend on the
+    drive being attached.
+
+    Callers that need row fingerprints (upload, for the mid-run-edit guard)
+    must take them BEFORE calling this - resolve_sheet_files rewrites
+    row['file'] to the resolved name, and the fingerprint has to be the raw
+    cell to compare against a fresh read."""
+    # A file_template naming a column the Sheet's header row doesn't have (a
+    # registry typo, or a Sheet whose columns changed) is checked once, here,
+    # rather than surfacing as the same resolution failure repeated on every
+    # row. Deliberately after read_sheet's no-rows branch: an empty or
+    # header-only Sheet already gets a more useful diagnostic.
+    try:
+        check_file_template(sheet.config.file_template, sheet.column_map)
+    except TemplateError as exc:
+        print(
+            f"project '{sheet.config.project_id}': {exc} - fix 'file_template' in "
+            f"{args.registry}",
+            file=sys.stderr,
+        )
+        raise SheetSetupFailed from exc
+
+    config_errors = check_required_for_upload(sheet.config, sheet.column_map)
+    if config_errors:
+        print("\n".join(config_errors), file=sys.stderr)
+        print(
+            f"fix required_for_upload in {args.registry} - as written, every row would "
+            "be reported as not yet catalogued and nothing would ever upload",
+            file=sys.stderr,
+        )
+        raise SheetSetupFailed
+
+    # See docs/decisions/FILES-AND-METADATA.md, "A file is found by
+    # resolution, not by constructing a path". Both commands run the
+    # identical two steps, so the value `upload` records in
+    # ia_identifier_bib is the one `validate` showed the operator.
+    file_outcomes = resolve_sheet_files(sheet.rows, sheet.config)
+    return validate_sheet_grid(
+        sheet.rows, sheet.registry, sheet.config, sheet.structure_results, file_outcomes
+    )
+
+
 def cmd_validate(args) -> int:
     # `is not None`, not truthiness: --csv "" must be an explicit (if
     # useless) request to read a CSV named "", and fail as such, rather than
@@ -1412,103 +1589,18 @@ def cmd_validate(args) -> int:
 
     registry = load_registry(args.registry)
     config = load_project_config(registry, args.project)
-    sheet_id = config.sheet_id_for(args.live)
-    mode = "live" if args.live else "test"
+    live = bool(args.live)
 
-    # The run mode is this project's core safety design (a rehearsal must
-    # never touch the real Sheet), so it - and exactly which spreadsheet and
-    # tab back it - is printed before anything else, unconditionally, not
-    # just on success. A human staring at a report has to be able to
-    # confirm at a glance they're pointed where they think they are.
-    print(f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', tab '{config.sheet_tab}'")
+    print(sheet_banner(config, live))
     print()
 
-    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
-        print(
-            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still "
-            f"the placeholder '{sheet_id}' - edit it in {args.registry} to the real Google "
-            "Sheet ID before running validate.",
-            file=sys.stderr,
-        )
-        return 1
-
-    client = build_sheet_client(config, args.live)
     try:
-        grid = client.read_grid()
-    except HttpError as exc:
-        print(
-            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
-            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
-            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
-            "been shared with the Google account you authorized as.",
-            file=sys.stderr,
-        )
+        sheet = read_sheet(args, registry, config, live, "validate")
+        header_results, row_results = validate_sheet_content(sheet, args)
+    except SheetSetupFailed:
         return 1
 
-    column_map, rows = grid_to_rows(grid)
-
-    # mediatype is a per-project constant, never a Sheet column - inject it
-    # before validating so every row satisfies the required-column check
-    # instead of failing on a column that was never meant to exist.
-    for row in rows:
-        row["mediatype"] = config.mediatype
-
-    structure_results = sheet_structure_validation(column_map, grid)
-
-    if not rows:
-        # A dedicated branch, not just another row-1 structural error: an
-        # empty read is far more likely to mean a wrong tab name, an
-        # unpopulated copy of the Sheet, or a Sheet never actually shared
-        # with the account you authorized as than a real project with zero rows, and
-        # reporting that as success would defeat the entire purpose of
-        # running `validate`. Handled separately from the normal report
-        # (rather than folded into sheet_structure_validation's row-1
-        # entry) specifically so the summary line never has to say
-        # "0/1 rows passed" - that "1" would be a synthetic entry standing
-        # in for zero real rows, which reads as nonsense arithmetic to
-        # whoever is staring at it.
-        if structure_results:
-            print("\n".join(_format_result_lines(structure_results)))
-            print()
-        print(
-            "the Sheet has no data rows (only a header, or nothing at all) - check that "
-            "'sheet_tab' in the project's registry entry names the right tab, and that "
-            "the Sheet has actually been populated and shared"
-        )
-        return 1
-
-    # A file_template naming a column the Sheet's header row doesn't have
-    # (a registry typo, or a Sheet whose columns changed) is checked once,
-    # here, rather than surfacing as the same resolution failure repeated
-    # on every one of the Sheet's rows. Deliberately after the no-rows
-    # branch above: an empty or header-only Sheet already gets a more
-    # useful diagnostic ("no data rows") than a template complaint would be.
-    try:
-        check_file_template(config.file_template, column_map)
-    except TemplateError as exc:
-        print(
-            f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
-            file=sys.stderr,
-        )
-        return 1
-
-    config_errors = check_required_for_upload(config, column_map)
-    if config_errors:
-        print("\n".join(config_errors), file=sys.stderr)
-        print(
-            f"fix required_for_upload in {args.registry} - as written, every row would "
-            "be reported as not yet catalogued and nothing would ever upload",
-            file=sys.stderr,
-        )
-        return 1
-
-    # See docs/DECISIONS.md, "A file is found by resolution, not by
-    # constructing a path". `upload` runs the identical two steps, so the
-    # value it records in ia_identifier_bib is the one shown here.
-    file_outcomes = resolve_sheet_files(rows, config)
-    header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_outcomes
-    )
+    column_map, rows = sheet.column_map, sheet.rows
 
     results = header_results + row_results
     print(format_report(results))
@@ -2551,17 +2643,11 @@ def upload_from_sheet(args) -> int:
     # reserve-first ordering exists to prevent, so there is no live-without-
     # write-back mode to opt into.
     write_back = live or bool(getattr(args, "write_identifier", False))
-    sheet_id = config.sheet_id_for(live)
-    mode = "live" if live else "test"
-
-    print(
-        f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', "
-        f"tab '{config.sheet_tab}'"
-    )
+    print(sheet_banner(config, live))
     if dry_run:
         print("--dry-run: nothing is uploaded, and nothing is written to the Sheet")
     elif write_back:
-        print(f"results WILL be written back to spreadsheet '{sheet_id}'")
+        print(f"results WILL be written back to spreadsheet '{config.sheet_id_for(live)}'")
     else:
         print(
             "nothing will be written back to the Sheet - pass --write-identifier to record "
@@ -2637,63 +2723,12 @@ def upload_from_sheet(args) -> int:
         )
         return 1
 
-    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
-        print(
-            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
-            f"placeholder '{sheet_id}' - edit it in {args.registry} to the real Google Sheet ID "
-            "before running upload.",
-            file=sys.stderr,
-        )
-        return 1
-
-    client = build_sheet_client(config, live)
     try:
-        grid = client.read_grid()
-    except HttpError as exc:
-        print(
-            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
-            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
-            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
-            "been shared with the Google account you authorized as.",
-            file=sys.stderr,
-        )
+        sheet = read_sheet(args, registry, config, live, "upload")
+    except SheetSetupFailed:
         return 1
 
-    column_map, rows = grid_to_rows(grid)
-    for row in rows:
-        row["mediatype"] = config.mediatype
-
-    structure_results = sheet_structure_validation(column_map, grid)
-
-    if not rows:
-        if structure_results:
-            print("\n".join(_format_result_lines(structure_results)))
-            print()
-        print(
-            "the Sheet has no data rows (only a header, or nothing at all) - check that "
-            "'sheet_tab' in the project's registry entry names the right tab, and that "
-            "the Sheet has actually been populated and shared"
-        )
-        return 1
-
-    try:
-        check_file_template(config.file_template, column_map)
-    except TemplateError as exc:
-        print(
-            f"project '{config.project_id}': {exc} - fix 'file_template' in {args.registry}",
-            file=sys.stderr,
-        )
-        return 1
-
-    config_errors = check_required_for_upload(config, column_map)
-    if config_errors:
-        print("\n".join(config_errors), file=sys.stderr)
-        print(
-            f"fix required_for_upload in {args.registry} - as written, every row would "
-            "be reported as not yet catalogued and nothing would ever upload",
-            file=sys.stderr,
-        )
-        return 1
+    client, column_map, rows = sheet.client, sheet.column_map, sheet.rows
 
     try:
         columns = locate_write_back_columns(column_map)
@@ -2706,10 +2741,10 @@ def upload_from_sheet(args) -> int:
     # what every later mid-run-edit check compares against.
     source_fingerprints = sheet_row_fingerprints(rows, config.file_template)
 
-    file_outcomes = resolve_sheet_files(rows, config)
-    header_results, row_results = validate_sheet_grid(
-        rows, registry, config, structure_results, file_outcomes
-    )
+    try:
+        header_results, row_results = validate_sheet_content(sheet, args)
+    except SheetSetupFailed:
+        return 1
 
     if header_results:
         # A header defect (two columns normalizing to the same IA field name,
@@ -3055,13 +3090,7 @@ def sync_from_sheet(args) -> int:
 
     live = bool(args.live)
     dry_run = bool(getattr(args, "dry_run", False))
-    sheet_id = config.sheet_id_for(live)
-    mode = "live" if live else "test"
-
-    print(
-        f"project '{config.project_id}': {mode} mode, spreadsheet '{sheet_id}', "
-        f"tab '{config.sheet_tab}'"
-    )
+    print(sheet_banner(config, live))
     if dry_run:
         print("--dry-run: nothing is sent to Internet Archive")
     print()
@@ -3080,36 +3109,12 @@ def sync_from_sheet(args) -> int:
             )
             return 1
 
-    if sheet_id.startswith(PLACEHOLDER_SHEET_ID_PREFIX):
-        print(
-            f"the {mode}-mode spreadsheet ID for project '{config.project_id}' is still the "
-            f"placeholder '{sheet_id}' - edit it in {args.registry} to the real Google Sheet "
-            "ID before running sync-metadata.",
-            file=sys.stderr,
-        )
-        return 1
-
-    client = build_sheet_client(config, live)
     try:
-        grid = client.read_grid()
-    except HttpError as exc:
-        print(
-            f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
-            f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
-            "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
-            "been shared with the Google account you authorized as.",
-            file=sys.stderr,
-        )
+        sheet = read_sheet(args, registry, config, live, "sync-metadata")
+    except SheetSetupFailed:
         return 1
 
-    column_map, rows = grid_to_rows(grid)
-    if not rows:
-        print(
-            "the Sheet has no data rows (only a header, or nothing at all) - check that "
-            "'sheet_tab' in the project's registry entry names the right tab, and that "
-            "the Sheet has actually been populated and shared"
-        )
-        return 1
+    column_map, rows = sheet.column_map, sheet.rows
 
     # A header defect corrupts every row's field names identically, and unlike
     # upload there is no per-row way around it.
