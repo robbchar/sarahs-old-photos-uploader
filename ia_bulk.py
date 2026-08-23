@@ -38,7 +38,7 @@ from column_map import (
 from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers, parse_identifier
 from project_config import ProjectConfig, load_project_config
-from reconcile import Proposal
+from reconcile import AmbiguousMatch, Proposal, propose_match
 from sheet_client import CellUpdate, SheetClient, column_letter
 
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
@@ -3365,6 +3365,138 @@ def sync_from_csv(args) -> int:
     return 1 if counts["failure"] else 0
 
 
+RECONCILE_FLUSH_EVERY = 25
+
+
+def log_decision(log_path, row_number: int, folder: str, wanted: str, status: str,
+                 chosen: str = "", reason: str = "") -> None:
+    """One line per row considered. Prompt-per-proposal leaves no record of
+    what was decided; this is that record."""
+    entry = {
+        "row": row_number, "folder": folder, "wanted": wanted,
+        "status": status, "chosen": chosen, "reason": reason,
+        "timestamp": utc_timestamp(),
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def cmd_reconcile_files(args) -> int:
+    registry = load_registry(args.registry)
+    config = load_project_config(registry, args.project)
+    live = bool(args.live)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    print(sheet_banner(config, live))
+    if dry_run:
+        print("--dry-run: nothing is written to the Sheet")
+    print()
+
+    try:
+        sheet = read_sheet(args, registry, config, live, "reconcile-files")
+    except SheetSetupFailed:
+        return 1
+
+    name_field = template_fields(config.file_template)[-1]
+    try:
+        name_column = next(
+            index for index, header in enumerate(sheet.column_map.headers)
+            if sheet.column_map.field_names[header] == name_field
+        )
+    except StopIteration:
+        print(
+            f"the Sheet has no '{name_field}' column, which file_template names - "
+            f"fix 'file_template' in {args.registry} or add the column.",
+            file=sys.stderr,
+        )
+        return 1
+
+    survey = survey_files(sheet.rows, config)
+    if not survey.unresolved:
+        print("nothing to reconcile - every row's filename resolves against the drive")
+        return 0
+
+    print(f"{_pluralize(len(survey.unresolved), 'row')} did not resolve")
+    print()
+
+    log_path = None if dry_run else open_log(args.log_dir, "reconcile-files")
+    pending: list[CellUpdate] = []
+    accepted = stopped = 0
+
+    def flush() -> bool:
+        nonlocal pending
+        if not pending:
+            return True
+        try:
+            sheet.client.write_cells(pending)
+        except Exception as exc:
+            print(f"the Sheet write failed: {exc}. Stopping here.", file=sys.stderr)
+            return False
+        pending = []
+        return True
+
+    for row_number in sorted(survey.unresolved):
+        folder = survey.unresolved[row_number]
+        wanted = survey.wanted[row_number]
+        candidates = survey.unclaimed.get(folder, [])
+        try:
+            proposal = propose_match(wanted, candidates) if wanted else None
+            reason = proposal.reason if proposal else ""
+        except AmbiguousMatch as exc:
+            print(f"row {row_number}  '{wanted}'  matches {len(exc.matches)} files - "
+                  f"leaving it alone: {', '.join(exc.matches)}")
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted, "ambiguous")
+            continue
+
+        if dry_run:
+            if proposal:
+                print(f"row {row_number}  '{wanted}' -> '{proposal.filename}'  ({reason})")
+            else:
+                print(f"row {row_number}  '{wanted}'  no candidate in '{folder}'")
+            continue
+
+        decision = prompt_for_decision(
+            row_number, folder, wanted, proposal, candidates, config, survey.claimed
+        )
+        if decision.action == "stop":
+            stopped = 1
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted, "stopped")
+            break
+        if decision.action == "reject":
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted,
+                             "rejected" if proposal else "no_candidate", reason=reason)
+            continue
+
+        accepted += 1
+        survey.claimed.add(f"{folder}/{decision.filename}")
+        pending.append(
+            CellUpdate(f"{column_letter(name_column)}{row_number}", decision.filename)
+        )
+        if log_path:
+            status = "accepted" if proposal and decision.filename == proposal.filename else "typed"
+            log_decision(log_path, row_number, folder, wanted, status,
+                         chosen=decision.filename, reason=reason)
+        if len(pending) >= RECONCILE_FLUSH_EVERY and not flush():
+            return 1
+
+    if not flush():
+        return 1
+
+    print()
+    print(f"{accepted} filename(s) corrected")
+    remaining = len(survey.unresolved) - accepted
+    if remaining:
+        print(f"{_pluralize(remaining, 'row')} still unresolved")
+    if stopped:
+        print("stopped early - rerun to pick up where this left off")
+    if log_path:
+        print(f"log written to {log_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ia_bulk",
@@ -3497,6 +3629,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    reconcile_parser = subparsers.add_parser(
+        "reconcile-files",
+        help="Find rows whose filename does not resolve against the drive and correct them",
+    )
+    reconcile_parser.add_argument("--project", required=True, help="Project ID from the registry")
+    reconcile_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    reconcile_parser.add_argument("--live", action="store_true", help="Read and write the project's real Sheet instead of its test Sheet")
+    reconcile_parser.add_argument("--dry-run", action="store_true", help="Print what would be proposed; prompt for nothing and write nothing")
+    reconcile_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
+
     return parser
 
 
@@ -3510,6 +3652,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_upload(args)
     if args.command == "sync-metadata":
         return cmd_sync_metadata(args)
+    if args.command == "reconcile-files":
+        return cmd_reconcile_files(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2

@@ -7346,3 +7346,205 @@ def test_prompt_stops_the_run():
         read_line=lambda _: "q",
     )
     assert decision == Decision(action="stop", filename="")
+
+
+# --- Task 6: the reconcile-files command ---
+
+RECONCILE_HEADER = ["Folder on LaCie Drive", "File Name", "Title"]
+
+
+def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions):
+    """A reconcile world: files on disk, a registry, a client that records
+    every write, and a canned answer per prompt."""
+    for folder, names in disk.items():
+        (tmp_path / folder).mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (tmp_path / folder / name).write_bytes(b"x")
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(
+                files_dir=str(tmp_path),
+                file_template="{folder_on_lacie_drive}/{file_name}",
+                required_for_upload=["title"],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    written = []
+
+    class RecordingClient:
+        def __init__(self, grid):
+            self._grid = grid
+
+        def read_grid(self):
+            return self._grid
+
+        def write_cells(self, updates):
+            written.extend(updates)
+
+    grid = [RECONCILE_HEADER] + sheet_rows
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: RecordingClient(grid))
+
+    answers = iter(decisions)
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", lambda *a, **k: next(answers))
+    return registry_path, written
+
+
+def _reconcile_args(tmp_path, registry_path, **overrides):
+    args = Namespace(
+        project="astoriaphotos",
+        registry=str(registry_path),
+        live=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def test_cmd_reconcile_files_writes_only_the_file_name_column(tmp_path, monkeypatch):
+    """The acceptance criterion made mechanical: whatever else changes, the
+    write batch must never contain another column letter. File Name is the
+    second header, so column B."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+    )
+
+    assert cmd_reconcile_files(_reconcile_args(tmp_path, registry_path)) == 0
+    assert {update.a1[0] for update in written} == {"B"}
+
+
+def test_cmd_reconcile_files_applies_an_accepted_correction(tmp_path, monkeypatch):
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+
+
+def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch):
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="reject", filename="")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+
+
+def test_cmd_reconcile_files_dry_run_neither_prompts_nor_writes(tmp_path, monkeypatch, capsys):
+    """--dry-run writes no log either, matching upload --dry-run, which
+    returns before open_log()."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("--dry-run must not prompt")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert written == []
+    assert not (tmp_path / "logs").exists()
+    assert "Finnish Meat Market.jpg" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_on_a_clean_sheet_proposes_nothing(tmp_path, monkeypatch, capsys):
+    """Safe to re-run: no drive changes, no mismatches, nothing proposed and
+    nothing written."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("a resolvable row must not be prompted about")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+    assert "nothing to reconcile" in capsys.readouterr().out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_flushes_before_stopping_on_q(tmp_path, monkeypatch):
+    """[q] is a clean stop: corrections accepted before it reach the Sheet.
+    Only an abrupt kill can lose a partial batch."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"]},
+        [
+            Decision(action="accept", filename="Finnish Meat Market.jpg"),
+            Decision(action="stop", filename=""),
+        ],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+
+
+def test_cmd_reconcile_files_exits_zero_with_rows_still_unresolved(tmp_path, monkeypatch, capsys):
+    """Non-zero while work remains would return non-zero for months and teach
+    the operator to ignore it - the trap upload's readiness split avoids."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Nothing Like This.jpg", "A title"]],
+        {"SOP CD 1": ["Completely Different.jpg"]},
+        [Decision(action="reject", filename="")],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+    assert "1 row still unresolved" in capsys.readouterr().out
+    assert exit_code == 0
