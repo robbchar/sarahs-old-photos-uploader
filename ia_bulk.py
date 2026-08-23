@@ -3564,7 +3564,14 @@ def cmd_reconcile_files(args) -> int:
         print(f"{_pluralize(len(survey.not_ready), 'row')} not yet catalogued - "
               "no filename to reconcile, skipped")
     if not to_review:
-        print("nothing to reconcile - every row with a filename resolves against the drive")
+        if survey.unresolved:
+            # Every row that failed resolution was skipped above, so there is
+            # nothing left to ask about - but saying "every row resolves"
+            # here would be untrue.
+            print("nothing left to reconcile - every row that named a file either "
+                  "resolves or was skipped above")
+        else:
+            print("nothing to reconcile - every row with a filename resolves against the drive")
         return 0
 
     print(f"{_pluralize(len(to_review), 'row')} named a file that does not resolve")
