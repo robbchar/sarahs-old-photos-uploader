@@ -7,7 +7,7 @@ below (an unquoted comma splitting a header, stray whitespace, a `Date`/`date`
 mismatch) are artifacts of CSV *parsing*, not of the data: the Sheets API
 returns cells as a grid, so a header containing a comma is just a header
 containing a comma there. See
-[`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+[`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
 Read this document only if you are deliberately validating or uploading from
 a hand-prepared CSV export instead of the live Sheet — offline work, or a
 dry run.
@@ -124,6 +124,6 @@ step itself was raised early on and was superseded, not merely deferred:
 `validate`/`upload` now read the Sheet directly by default (the note at the
 top of this document), which is what actually removed the export step for the
 normal path — see
-[`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+[`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
 This document, and the manual transform it describes, still applies whenever
 you deliberately choose the offline `--csv` path.

@@ -189,7 +189,7 @@ has caught two real Sheet typos before they shipped as permanent IA fields.
 
 **What `validate` does not check** — the values inside your columns. A Sheet
 with every metadata column shifted into the wrong field still passes. See
-[`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1).
+[`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1-noindex-cannot-be-changed-by-sync-metadata).
 
 ### Why this is a hard rule
 
@@ -325,7 +325,7 @@ python ia_bulk.py sync-metadata data/update-metadata.csv --project sarasoldphoto
 Decoupled from upload and safe to re-run. Needs only `identifier` plus the
 columns that changed. Blank cell = leave alone; literal `REMOVE_TAG` = delete
 that field. `noindex` cannot be changed this way —
-see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3).
+see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3-no-retry-on-transient-network-failures).
 
 Both of the above are the `--csv` fallback. Normally the Sheet **is** the
 correction — edit the cell, then:

@@ -350,7 +350,7 @@ Instead, `upload` and `sync-metadata` automatically prepend
 `zztest-20260819t144907-lcps-astoriaphotos-00001`) unless `--live` is
 passed. The stamp is unique per invocation, so a rehearsal never collides
 with a previous rehearsal's items — see
-[`docs/DECISIONS.md`](docs/DECISIONS.md#test-identifiers-carry-a-per-run-stamp).
+[`docs/DECISIONS.md`](docs/decisions/IDENTIFIERS.md#test-identifiers-carry-a-per-run-stamp).
 Pass `--live` to target the real collection with the real identifier as-is,
 with no stamp — do this deliberately, never as a default.
 
@@ -375,7 +375,7 @@ identifier it would mint and every cell it would write, and touches nothing.
 
 By default `validate`/`upload` read the project's Sheet directly, live, over
 the Google Sheets API — see "Commands" above and
-[`docs/DECISIONS.md`](docs/DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+[`docs/DECISIONS.md`](docs/decisions/SHEET-PROTOCOL.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
 Nothing needs preparing on that path; there is no export step and nothing
 local to go stale.
 
