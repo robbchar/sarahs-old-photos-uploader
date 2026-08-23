@@ -450,6 +450,21 @@ def test_resolve_file_refuses_to_escape_files_dir_via_dot_dot(tmp_path):
         resolve_file(files_dir, "../Secret", {})
 
 
+def test_resolve_file_allows_a_dot_dot_that_lands_back_inside_files_dir(tmp_path):
+    """The containment test is on the RESOLVED directory, not on the text of
+    the candidate. A '..' that climbs out and back in never actually left, so
+    refusing it would reject a real file over a cosmetic property of the
+    path - and the neighbouring test above proves the escaping case is still
+    caught. Pinned because DECISIONS.md now states this distinction, and an
+    undocumented nuance is how that file drifted out of step with the code in
+    the first place."""
+    files_dir = tmp_path / "files"
+    (files_dir / "SOP").mkdir(parents=True)
+    (files_dir / "SOP" / "Liberty.jpg").write_bytes(b"x")
+
+    assert resolve_file(files_dir, "SOP/../SOP/Liberty", {}) == "SOP/../SOP/Liberty.jpg"
+
+
 def test_resolve_file_refuses_a_blank_folder_segment_rather_than_searching_files_dirs_root(
     tmp_path,
 ):

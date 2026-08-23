@@ -80,13 +80,28 @@ before real uploads can pass.
 **Possible fix:** cross-check `--collection` against the registry's
 `collection_key` and refuse to run `--live` when they disagree.
 
-## 5. `--files-dir` does not constrain path resolution
+## 5. `--files-dir` does not constrain path resolution — **`--csv` path only**
 
-**Severity: low — trusted-input tool.**
+**Severity: low — trusted-input tool. Narrowed 2026-08-23: no longer true of
+the Sheet path.**
 
-`Path(files_dir) / row["file"]` will happily resolve `../` or an absolute path
-outside the intended directory. Accepted during review: the CSV is authored by
-the same person running the tool.
+On the **`--csv` path** this still holds: `Path(files_dir) / row["file"]` will
+happily resolve `../` or an absolute path outside the intended directory.
+Accepted during review — the CSV is authored by the same person running the
+tool.
+
+On the **Sheet path it is false**, and reading this section as a general
+statement about the tool gives the wrong answer. `resolve_file()` treats
+`files_dir` as a hard boundary rather than a starting point: the folder part is
+resolved and then checked to still be underneath it, so anything that *resolves
+outside* it — an absolute path, or a `..` that climbs past it — is refused with
+a message naming both paths. (A `..` that lands back inside is fine; it never
+left.) `Path(files_dir) / part` would otherwise discard `files_dir` entirely
+whenever `part` is itself absolute.
+
+It also refuses a candidate whose folder segment is empty (a blank folder cell,
+which would otherwise turn a missing required cell into a search of
+`files_dir`'s own root) rather than treating that as "look in the top level".
 
 ## 6. `check_file_exists`'s `is_file()` catch has no test for the case it exists for
 
