@@ -4097,6 +4097,136 @@ def test_cmd_upload_live_writes_back_even_without_write_identifier(tmp_path, mon
     ]
 
 
+def _target(identifier, newly_minted=True, row_number=2):
+    """An UploadTarget carrying only what check_claimed_identifiers reads."""
+    from ia_bulk import UploadTarget
+
+    return UploadTarget(
+        row={"file": "photo1.jpg"},
+        row_number=row_number,
+        identifier=identifier,
+        uploaded_as=identifier,
+        identifier_bib="photo1.jpg",
+        newly_minted=newly_minted,
+        source_fingerprint="photo1.jpg",
+    )
+
+
+def _snapshot(claimed):
+    from ia_bulk import SheetColumns, SheetSnapshot
+
+    return SheetSnapshot(
+        columns=SheetColumns(ia_identifier=2, ia_uploaded=3, ia_url=4, ia_identifier_bib=5),
+        grid=[],
+        fingerprints={},
+        claimed_identifiers=frozenset(claimed),
+    )
+
+
+def test_check_claimed_identifiers_stops_when_a_minted_number_was_taken_elsewhere():
+    """plan_upload_targets mints the whole run's numbers up front as max+1,
+    max+2, ... from one read that can be hours old by the last chunk.
+    split_moved_targets only inspects a target's OWN row, so a number written
+    to a row this run is not targeting is invisible to it - and that is the
+    case that mints a duplicate."""
+    from ia_bulk import check_claimed_identifiers
+
+    targets = [_target("lcps-astoriaphotos-00001"), _target("lcps-astoriaphotos-00002")]
+
+    reason = check_claimed_identifiers(targets, _snapshot({"lcps-astoriaphotos-00002"}))
+
+    assert reason is not None
+    assert "lcps-astoriaphotos-00002" in reason
+    assert "Nothing has been reserved or uploaded" in reason
+
+
+def test_check_claimed_identifiers_passes_when_nothing_was_taken():
+    from ia_bulk import check_claimed_identifiers
+
+    targets = [_target("lcps-astoriaphotos-00001")]
+
+    assert check_claimed_identifiers(targets, _snapshot({"lcps-astoriaphotos-00099"})) is None
+
+
+def test_check_claimed_identifiers_ignores_a_reserved_rows_own_identifier():
+    """A RESERVED row's identifier is already in the Sheet by definition -
+    that is what RESERVED means. Checking it would stop every retry run on
+    its own reservation."""
+    from ia_bulk import check_claimed_identifiers
+
+    targets = [_target("lcps-astoriaphotos-00007", newly_minted=False)]
+
+    assert check_claimed_identifiers(targets, _snapshot({"lcps-astoriaphotos-00007"})) is None
+
+
+def test_cmd_upload_stops_when_a_minted_identifier_is_claimed_before_reserve(
+    tmp_path, monkeypatch, capsys
+):
+    """The whole run stops, not just the colliding row: every number it holds
+    came out of the same max+1 arithmetic over the same stale read, so one
+    collision means the max was wrong and the rest are suspect too."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+        # Not ready (no title), so never a target of this run - which is
+        # exactly why split_moved_targets cannot see a number landing here.
+        ["", "photo3.jpg", "", "", "", ""],
+    ]
+
+    def claim_a_number_elsewhere(live_grid, read_count):
+        # Read 1 is the initial grid read, read 2 the pre-reserve guard.
+        if read_count == 2:
+            live_grid[3][2] = "lcps-astoriaphotos-00002"
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+        before_read=claim_a_number_elsewhere,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    # Nothing permanent happened: no upload, and no cell written.
+    assert recorder.uploads == []
+    assert recorder.writes == []
+    assert "were claimed in the Sheet after this run read it" in captured.err
+    assert "lcps-astoriaphotos-00002" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_upload_confirm_leg_does_not_trip_the_claimed_identifier_guard(
+    tmp_path, monkeypatch, capsys
+):
+    """After reserve, this run's own numbers ARE in the Sheet. Running the
+    check on the confirm leg would flag every one of them and stop every
+    ordinary run."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+    ]
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg",)
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
+    # reserve wrote the identifier, confirm wrote the other three cells
+    assert len(recorder.writes) == 2
+    assert "were claimed in the Sheet" not in captured.err
+    assert exit_code == 0
+
+
 def test_cmd_upload_confirm_skips_a_row_whose_identifier_changed_underneath_it(
     tmp_path, monkeypatch, capsys
 ):

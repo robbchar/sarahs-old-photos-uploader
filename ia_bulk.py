@@ -1684,11 +1684,18 @@ def sheet_row_fingerprints(
 class SheetSnapshot:
     """A fresh read of the Sheet, reduced to what the mid-run-edit guard needs:
     where the write-back columns are now, what each row's fingerprint is now,
-    and the grid itself for reading `ia_identifier` back."""
+    the grid itself for reading `ia_identifier` back, and every identifier the
+    Sheet currently holds ANYWHERE - see claimed_identifiers."""
 
     columns: SheetColumns
     grid: list[list[str]]
     fingerprints: dict[int, str]
+    # Every non-blank `ia_identifier` in the Sheet right now, whatever row it
+    # is on. split_moved_targets only inspects a target's OWN row, which
+    # cannot see a number claimed on a DIFFERENT row since this run read the
+    # Sheet - and that is the case that mints a duplicate. See
+    # check_claimed_identifiers().
+    claimed_identifiers: frozenset[str]
 
 
 def read_sheet_snapshot(client: SheetClient, file_template: str) -> SheetSnapshot:
@@ -1698,6 +1705,51 @@ def read_sheet_snapshot(client: SheetClient, file_template: str) -> SheetSnapsho
         columns=locate_write_back_columns(column_map),
         grid=grid,
         fingerprints=sheet_row_fingerprints(rows, file_template),
+        claimed_identifiers=frozenset(
+            identifier
+            for row in rows
+            if (identifier := (row.get(IA_IDENTIFIER_COLUMN) or "").strip())
+        ),
+    )
+
+
+def check_claimed_identifiers(
+    targets: list[UploadTarget], snapshot: SheetSnapshot
+) -> str | None:
+    """Returns a stop reason if any number this run minted has been claimed in
+    the Sheet since the run read it, or None.
+
+    plan_upload_targets mints the whole run's numbers up front from a single
+    read, as max+1, max+2, ... That read can be hours old by the time the last
+    chunk reserves. split_moved_targets checks each target's own row, so it
+    catches "someone else took THIS row" - but a number written to a row this
+    run is not targeting is invisible to it, and that is precisely the case
+    that mints a duplicate: two Sheet rows carrying one permanent identifier,
+    with internetarchive.upload() APPENDING files to the existing item rather
+    than refusing, so two photographs end up in one unrenameable item.
+
+    Stops the whole run rather than dropping the offending target. Every
+    number this run holds came out of the same max+1 arithmetic over the same
+    stale read, so one collision means the max was wrong and the rest are
+    suspect too - dropping one and proceeding with its neighbours would be
+    reserving numbers that are wrong for the same reason. Nothing has been
+    reserved or uploaded at that point, so a rerun re-reads, re-mints from the
+    real maximum, and proceeds.
+
+    Only newly-minted targets are checked. A RESERVED row's identifier is
+    already in the Sheet by definition - that is what RESERVED means - so
+    including it here would stop every retry run on its own reservation."""
+    collisions = sorted(
+        target.identifier
+        for target in targets
+        if target.newly_minted and target.identifier in snapshot.claimed_identifiers
+    )
+    if not collisions:
+        return None
+    return (
+        f"identifier(s) {', '.join(collisions)} were claimed in the Sheet after this run read "
+        "it, so the numbers this run minted are no longer free. Nothing has been reserved or "
+        "uploaded. Rerun to mint from the Sheet's current state"
     )
 
 
@@ -2026,6 +2078,13 @@ class SheetUploadRun:
                 "the Sheet's columns moved while this run was in progress, so every cell it "
                 "would write now lands in the wrong column",
             )
+
+        if not reserved_already:
+            # Only on the reserve leg. After reserve, this run's own numbers
+            # ARE in the Sheet - checking then would flag every one of them.
+            collision = check_claimed_identifiers(targets, snapshot)
+            if collision is not None:
+                return VerifyOutcome([], list(targets), collision)
 
         ok, moved = split_moved_targets(targets, snapshot, reserved_already)
         return VerifyOutcome(ok, moved, None)
