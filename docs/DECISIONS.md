@@ -290,8 +290,24 @@ configured extension — fails on this data twice over. Nine rows already carry
 the remaining files are all `.jpg` rather than `.jpeg` or a TIFF master.
 
 So the tool resolves rather than constructs. Within the directory named by the
-folder column it looks for an exact filename match first, then for a file whose
-stem matches ignoring extension. What it finds is what gets used.
+folder column it makes **three** passes, each tried only if the previous found
+nothing. What it finds is what gets used.
+
+1. **Exact, case-sensitive filename match.** Handles the nine real rows that
+   already carry an extension.
+2. **A file whose extension-stripped stem equals the FULL name part**,
+   case-insensitively, without touching the name part itself.
+3. **The same comparison with the name part's own trailing segment also
+   chopped** as if it were an extension. This is what handles a cell carrying
+   a real extension in a different case than disk — `.jpg` in the Sheet,
+   `.JPEG` on the drive.
+
+**Pass 2 is not a refinement of pass 3; it exists to prevent a silent wrong
+match.** An archival reference like `Report.1958` has a dot that is not an
+extension. Chopping it first — which is all pass 3 does — reduces it to
+`Report` and would happily match an unrelated `Report.jpg`. Comparing against
+the full name part first means `Report.1958` finds `Report.1958.tif` and
+nothing else.
 
 Two rules keep this from guessing:
 
@@ -308,6 +324,22 @@ ambiguity error above rather than a silent wrong pick.
 Directory listings are cached per folder. The real Sheet has 234 rows across 5
 folders, and the full collection is ~10,000 rows across a similar handful — one
 scan per folder rather than one per row.
+
+**`files_dir` is a boundary, not a starting point.** The folder part is
+resolved and checked to still be underneath it, so a candidate that *resolves
+outside* it — an absolute path, or a `..` climbing past it — is refused rather
+than followed. The test is on the resolved directory, not on the text: a `..`
+that lands back inside `files_dir` never left, and is allowed. A candidate whose folder
+segment is empty is refused too — searching `files_dir`'s own root would turn
+a blank required cell into a search of the wrong place instead of a failure.
+`KNOWN-ISSUES.md` §5 describes the `--csv` path, which has neither guard.
+
+**Cell values are stripped before templating.** A folder cell with a stray
+trailing space is otherwise a landmine on Windows: `Path.is_dir()` normalizes
+the space away when it stats the path, while `Path.iterdir()` on the identical
+path can still raise `FileNotFoundError` — two checks disagreeing about
+whether the same folder exists. Stripping removes the space before either
+check sees it, rather than working around the disagreement afterwards.
 
 Because the resolved name is the real one, `ia_identifier_bib` records
 `folder/resolved-filename`, which can differ from what the Sheet says. That is

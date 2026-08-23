@@ -99,9 +99,11 @@ the reserve/upload/confirm protocol and registry fields in full see
 
 Sheet path: checks the header for colliding or empty field names and any data
 row longer than the header, injects `mediatype` from the registry, resolves
-each row's file against `files_dir` using `file_template` (an exact filename
-match first, then a case-insensitive match ignoring extension — two matching
-candidates is a failure naming both, never a silent pick), then prints a
+each row's file against `files_dir` using `file_template` (three passes: an
+exact filename match, then a case-insensitive match against the full name, then
+the same ignoring a trailing extension — two matching candidates is a failure
+naming both, never a silent pick; `files_dir` is a hard boundary, so a cell that
+resolves outside it is refused, as is a blank folder cell), then prints a
 pass/fail report per row, a receipt of which fields will upload, a lifecycle
 summary (rows ready to upload / already uploaded / reserved but unconfirmed),
 and advisory suggestions for renaming a column to a standard IA field name.
