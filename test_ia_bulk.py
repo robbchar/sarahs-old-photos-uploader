@@ -6703,20 +6703,123 @@ def test_sync_from_sheet_counts_an_unchanged_item_as_unchanged_not_a_failure(
     assert exit_code == 0
 
 
-def test_sync_from_sheet_dry_run_sends_nothing(tmp_path, monkeypatch, capsys):
+def test_sync_from_sheet_dry_run_shows_what_would_change_not_just_field_names(
+    tmp_path, monkeypatch, capsys
+):
+    """Listing field names alone made the dry run unable to answer the one
+    question it is run to answer - "did my edit get picked up?" - because
+    editing a description on a row that already had one produced byte-
+    identical output."""
     from ia_bulk import cmd_sync_metadata
 
     sent = []
     registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+    monkeypatch.setattr(
+        "ia_bulk.fetch_current_metadata",
+        lambda identifier: {"title": "Stone Customshuose"},
+    )
 
     exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, dry_run=True))
     out = capsys.readouterr().out
 
     assert sent == []
-    assert "would update metadata on 1 item" in out
     assert f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001" in out
+    # the typo and its correction are both visible, in place
+    assert "now: Stone Customshuose" in out
+    assert "new: Stone Customshouse" in out
+    assert "1 of 1 item would change" in out
     assert not (tmp_path / "logs").exists()
     assert exit_code == 0
+
+
+def test_sync_from_sheet_dry_run_reports_an_item_that_already_matches(
+    tmp_path, monkeypatch, capsys
+):
+    """The run's `unchanged` count, visible BEFORE anything is sent."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+    monkeypatch.setattr(
+        "ia_bulk.fetch_current_metadata",
+        lambda identifier: {"title": "Stone Customshouse"},
+    )
+
+    cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "0 of 1 item would change" in out
+    assert "1 already match" in out
+    assert "now:" not in out
+
+
+def test_sync_from_sheet_dry_run_survives_an_item_it_cannot_read(
+    tmp_path, monkeypatch, capsys
+):
+    """A dry run that cannot reach one item should still report the rest."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _synced_grid(), sent)
+    monkeypatch.setattr("ia_bulk.fetch_current_metadata", lambda identifier: None)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "could not read its current metadata" in out
+    assert "1 item could not be read" in out
+    assert exit_code == 0
+
+
+def test_metadata_changes_treats_a_blank_cell_as_leave_alone():
+    """update_metadata_row drops blanks, so a dry run that called one a change
+    would predict something the real run does not do."""
+    from ia_bulk import metadata_changes
+
+    assert metadata_changes({"title": "", "date": "   "}, {"title": "On IA"}) == []
+
+
+def test_metadata_changes_shows_remove_tag_as_a_deletion():
+    from ia_bulk import metadata_changes
+
+    assert metadata_changes({"rights": "REMOVE_TAG"}, {"rights": "CC0"}) == [
+        ("rights", "CC0", "(deleted)")
+    ]
+
+
+def test_metadata_changes_ignores_remove_tag_for_a_field_that_is_not_there():
+    """Removing what is not present changes nothing."""
+    from ia_bulk import metadata_changes
+
+    assert metadata_changes({"rights": "REMOVE_TAG"}, {"title": "T"}) == []
+
+
+def test_metadata_changes_reports_a_field_internet_archive_does_not_have_yet():
+    from ia_bulk import metadata_changes
+
+    assert metadata_changes({"description": "New"}, {}) == [
+        ("description", "(not set)", "New")
+    ]
+
+
+def test_metadata_changes_joins_a_repeated_ia_field_before_comparing():
+    """Internet Archive returns a list for a field that occurs more than once;
+    comparing that to a string would report every such field as changed."""
+    from ia_bulk import metadata_changes
+
+    assert metadata_changes({"subject": "a; b"}, {"subject": ["a", "b"]}) == []
+
+
+def test_metadata_changes_elides_a_very_long_value():
+    from ia_bulk import DRY_RUN_VALUE_WIDTH, metadata_changes
+
+    (_, current, new) = metadata_changes({"description": "x" * 500}, {"description": "y"})[0]
+    assert current == "y"
+    assert len(new) == DRY_RUN_VALUE_WIDTH
+    # ASCII: a Windows console codepage that cannot encode U+2026 raises
+    # UnicodeEncodeError and truncates the report mid-run.
+    assert new.endswith("...")
+    assert new.isascii()
 
 
 def test_sync_from_sheet_rejects_csv_only_log_flags(tmp_path, monkeypatch, capsys):

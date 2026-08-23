@@ -2251,6 +2251,119 @@ class SheetUploadRun:
         )
 
 
+REMOVE_TAG_SENTINEL = "REMOVE_TAG"
+# How much of a field value a dry run prints before eliding. Long enough for a
+# typo to be visible in place, short enough that one changed field stays one
+# readable pair of lines.
+DRY_RUN_VALUE_WIDTH = 96
+
+
+def fetch_current_metadata(identifier: str) -> dict | None:
+    """The metadata Internet Archive currently holds for an item, or None if
+    it could not be read.
+
+    Its own function so a test can pin it, and so the dry run's one network
+    dependency is in a single place. Returns None rather than raising: a dry
+    run that cannot reach one item should still report the other 9,999.
+    """
+    try:
+        return dict(internetarchive.get_item(identifier).metadata)
+    except Exception:
+        return None
+
+
+def _render(value: object) -> str:
+    """IA returns a list for a field that occurs more than once."""
+    if isinstance(value, list):
+        value = "; ".join(str(part) for part in value)
+    text = str(value)
+    if len(text) > DRY_RUN_VALUE_WIDTH:
+        # ASCII, deliberately: this report is read on a Windows console whose
+        # codepage cannot encode U+2026, where one non-ASCII character raises
+        # UnicodeEncodeError and truncates the whole report mid-run.
+        text = text[:DRY_RUN_VALUE_WIDTH - 3] + "..."
+    return text
+
+
+def metadata_changes(
+    sheet_metadata: dict[str, str], remote: dict
+) -> list[tuple[str, str, str]]:
+    """(field, what IA holds now, what the Sheet would make it), for the
+    fields a sync would actually alter.
+
+    Mirrors update_metadata_row's rules exactly, because a dry run that
+    predicts something other than what the real run does is worse than no dry
+    run. A blank cell is dropped there, so it means "leave this field alone"
+    and is not a change here. REMOVE_TAG deletes there, so it shows as a
+    deletion here - and only when the field actually exists on the item, since
+    removing what is not present changes nothing."""
+    changes: list[tuple[str, str, str]] = []
+    for field_name, raw in sorted(sheet_metadata.items()):
+        value = (raw or "").strip()
+        if not value:
+            continue
+        current = remote.get(field_name)
+        if value == REMOVE_TAG_SENTINEL:
+            if current is not None:
+                changes.append((field_name, _render(current), "(deleted)"))
+            continue
+        if current is None:
+            changes.append((field_name, "(not set)", _render(value)))
+        elif _render(current) != _render(value):
+            changes.append((field_name, _render(current), _render(value)))
+    return changes
+
+
+def print_sync_dry_run(targets: list[SyncTarget], problems: list[RowValidation]) -> int:
+    """Shows what a sync would CHANGE, not merely which fields it would send.
+
+    Listing field names alone made the dry run unable to answer the one
+    question it is run to answer - "did my edit get picked up?" - because
+    editing a description on a row that already had one produced byte-
+    identical output. So each item's current metadata is read back from
+    Internet Archive and diffed against the Sheet.
+
+    That costs one read per item. It is the right trade for a command whose
+    other mode writes to permanent public items, and it makes the run's
+    `unchanged` count visible BEFORE anything is sent rather than after."""
+    print(f"reading current metadata for {_pluralize(len(targets), 'item')}...")
+    print()
+
+    changed = 0
+    unreadable = 0
+    for target in targets:
+        remote = fetch_current_metadata(target.uploaded_as)
+        if remote is None:
+            unreadable += 1
+            print(
+                f"  row {target.row_number}: {target.uploaded_as} - could not read its "
+                "current metadata, so what would change is unknown"
+            )
+            continue
+
+        changes = metadata_changes(target.metadata, remote)
+        if not changes:
+            continue
+
+        changed += 1
+        print(f"  row {target.row_number}: {target.uploaded_as}")
+        for field_name, current, new in changes:
+            print(f"      {field_name}")
+            print(f"          now: {current}")
+            print(f"          new: {new}")
+
+    if changed or unreadable:
+        print()
+    unchanged = len(targets) - changed - unreadable
+    print(
+        f"{changed} of {_pluralize(len(targets), 'item')} would change; "
+        f"{unchanged} already match and would be reported as unchanged"
+    )
+    if unreadable:
+        print(f"{_pluralize(unreadable, 'item')} could not be read")
+    return 1 if problems else 0
+
+
 def print_dry_run(
     targets: list[UploadTarget], columns: SheetColumns, write_back: bool, uploaded_at: str
 ) -> None:
@@ -3003,13 +3116,7 @@ def sync_from_sheet(args) -> int:
         return 1 if problems else 0
 
     if dry_run:
-        print(f"would update metadata on {_pluralize(len(targets), 'item')}:")
-        for target in targets:
-            fields = ", ".join(
-                name for name, value in sorted(target.metadata.items()) if value.strip()
-            )
-            print(f"  row {target.row_number}: {target.uploaded_as} <- {fields or '(nothing)'}")
-        return 1 if problems else 0
+        return print_sync_dry_run(targets, problems)
 
     log_path = open_log(args.log_dir, "sync-metadata")
     try:
