@@ -34,7 +34,7 @@ from column_map import (
     resolve_file,
     template_fields,
 )
-from ia_fields import suggest_standard_fields
+from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers
 from project_config import ProjectConfig, load_project_config
 from sheet_client import CellUpdate, SheetClient, column_letter
@@ -487,21 +487,51 @@ def format_field_receipt(column_map: ColumnMap) -> str:
     """Printed before anything permanent happens, so the transformation from
     Sheet header to IA field name is reviewable by a human.
 
-    The "not uploaded" section is not decoration. A Sheet column named
+    The "not uploaded" sections are not decoration. A Sheet column named
     `Identifier` (the real one has one, holding the donor's archival reference)
     normalizes to `identifier`, which upload_row strips because that name is
     Internet Archive's own item identifier. The receipt used to list it among
     the fields that would upload, which was simply untrue - and a receipt an
-    operator learns to disbelieve is worse than no receipt."""
+    operator learns to disbelieve is worse than no receipt.
+
+    There are two different reasons a column does not ship, and collapsing
+    them into one list would recreate that same untruth in a quieter form:
+
+    - `identifier` and `file` are dropped outright (DROPPED_BY_UPLOAD_ROW):
+      one is Internet Archive's own item identifier, the other a local path.
+    - `mediatype` and `collection` ARE sent, but with a value this tool
+      generates - upload_from_sheet overwrites row['mediatype'] from the
+      registry and upload_row sets metadata['collection'] unconditionally, so
+      a Sheet column of either name has its own value silently discarded.
+      ia_fields.PIPELINE_OWNED_FIELDS is the existing definition of that set,
+      reused here rather than restated, so the receipt and the
+      rename-suggestion logic cannot disagree about which names are the
+      tool's."""
     all_fields = column_map.uploadable_fields()
-    fields = [name for name in all_fields if name not in DROPPED_BY_UPLOAD_ROW]
+    fields = [
+        name
+        for name in all_fields
+        if name not in DROPPED_BY_UPLOAD_ROW and name not in PIPELINE_OWNED_FIELDS
+    ]
     dropped = [name for name in all_fields if name in DROPPED_BY_UPLOAD_ROW]
+    # `identifier` is in both sets; it is listed under "reserves these names"
+    # only, which is the more precise reason of the two.
+    generated = [
+        name
+        for name in all_fields
+        if name in PIPELINE_OWNED_FIELDS and name not in DROPPED_BY_UPLOAD_ROW
+    ]
 
     lines = ["will upload these metadata fields:"]
     lines.append("  " + ", ".join(fields) if fields else "  (none)")
     if dropped:
         lines.append("NOT uploaded - Internet Archive reserves these names:")
         lines.append(f"  {', '.join(dropped)}")
+    if generated:
+        lines.append(
+            "uploaded with a value this tool generates - the column's own value is IGNORED:"
+        )
+        lines.append(f"  {', '.join(generated)}")
     if column_map.held_back:
         lines.append("held back (LCPS Internal):")
         lines.append("  " + ", ".join(column_map.held_back))
@@ -703,10 +733,29 @@ def format_report(results: list[RowValidation]) -> str:
     return "\n".join(lines)
 
 
+def utc_timestamp() -> str:
+    """Every timestamp this tool records, in ISO-8601 UTC with an explicit Z.
+
+    UTC for the same reason run_stamp() uses it, applied to the values that
+    outlive the run: local time repeats an hour during the DST fall-back
+    transition, so a run spanning it stamps a later chunk with an earlier
+    wall-clock time than an earlier one. `ia_uploaded` is the permanent record
+    of when an archival item was published, and the log is what --resume-from
+    and any later audit read - both were naive local time, with no offset to
+    reconstruct the real instant from afterwards.
+
+    The trailing Z is not decoration: without it the string is ambiguous, and
+    the ambiguity is only discoverable by knowing which machine wrote it and
+    what its clock was set to that day."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def open_log(log_dir: str | Path, command_name: str) -> Path:
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    # UTC here too, so a directory listing sorts in the order the runs
+    # actually happened - see utc_timestamp().
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     return log_dir / f"{command_name}-{timestamp}.jsonl"
 
 
@@ -749,7 +798,7 @@ def log_run_header(
     appears in this command's ordinary console output."""
     entry = {
         "record": "run_header",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": utc_timestamp(),
         "project": config.project_id,
         "live": live,
         "dry_run": dry_run,
@@ -783,7 +832,7 @@ def log_result(
         "error": error,
         "uploaded_as": uploaded_as,
         "live": live,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": utc_timestamp(),
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -799,18 +848,53 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
     (see log_run_header) is skipped explicitly rather than relying on it
     merely lacking a "status" key - the header schema is free to grow a
     "status"-named field of its own later without silently turning this into
-    a bug."""
+    a bug.
+
+    A line that will not parse is SKIPPED, not raised on. log_result appends
+    one line per row with no atomic write, so a run killed mid-write - Ctrl-C,
+    a full disk, a closed laptop - leaves a truncated final line. Raising
+    there made the log permanently unusable as a resume source, which disables
+    the only recovery mechanism the CSV path has using the exact crash it
+    exists to recover from. Every intact line before the damaged one is still
+    a real record and is still honored.
+
+    Damaged lines are counted and reported on stderr rather than skipped in
+    silence: a lost line means an identifier that DID upload is no longer
+    known to have, so the resumed run will attempt it again. That is safe -
+    Internet Archive matches on MD5 and will not duplicate the file - but the
+    operator should know why the run is longer than they expected."""
     successes: set[str] = set()
+    damaged = 0
     with open(log_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            entry = json.loads(line)
-            if entry.get("record") == "run_header":
-                continue
-            if entry.get("status") in ("success", "unchanged") and entry.get("live") == live:
-                successes.add(entry["identifier"])
+            try:
+                entry = json.loads(line)
+                if entry.get("record") == "run_header":
+                    continue
+                if entry.get("status") in ("success", "unchanged") and entry.get("live") == live:
+                    # A record with no identifier cannot skip anything, and is
+                    # damage of the same kind as a line that will not parse.
+                    identifier = entry.get("identifier")
+                    if not identifier:
+                        damaged += 1
+                        continue
+                    successes.add(identifier)
+            except (json.JSONDecodeError, AttributeError):
+                # AttributeError covers a line that parses as valid JSON of the
+                # wrong shape entirely - a bare list or string has no .get().
+                damaged += 1
+
+    if damaged:
+        print(
+            f"{_pluralize(damaged, 'line')} in {log_path} could not be read and were skipped - "
+            "the log is damaged, most likely truncated by a run that was killed mid-write. Any "
+            "row recorded on those lines will be attempted again; Internet Archive matches on "
+            "MD5, so an already-uploaded file is not duplicated.",
+            file=sys.stderr,
+        )
     return successes
 
 
@@ -1509,8 +1593,12 @@ def item_url(uploaded_as: str) -> str:
 
 def upload_timestamp() -> str:
     """Its own function so a test can pin it and assert a confirm batch as an
-    exact ordered sequence rather than "a cell holding some string"."""
-    return time.strftime("%Y-%m-%dT%H:%M:%S")
+    exact ordered sequence rather than "a cell holding some string".
+
+    Delegates to utc_timestamp() rather than formatting its own: this value
+    lands in the Sheet's `ia_uploaded` column, which is the permanent record
+    of when the item was published."""
+    return utc_timestamp()
 
 
 def reserve_updates(targets: list[UploadTarget], columns: SheetColumns) -> list[CellUpdate]:

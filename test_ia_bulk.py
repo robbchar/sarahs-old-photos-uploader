@@ -817,6 +817,50 @@ def test_field_receipt_lists_uploadable_fields_and_held_back_ones():
     assert "identifier," not in receipt
 
 
+def test_field_receipt_says_a_mediatype_or_collection_column_has_its_value_ignored():
+    """upload_from_sheet overwrites row['mediatype'] from the registry and
+    upload_row sets metadata['collection'] unconditionally, so a Sheet column
+    of either name never ships its own value. Listing them under "will upload
+    these metadata fields" told the operator the opposite, on the receipt
+    printed immediately before something permanent happens."""
+    column_map = build_column_map(["Title", "Mediatype", "Collection"])
+
+    receipt = format_field_receipt(column_map)
+
+    will_upload, _, rest = receipt.partition("uploaded with a value this tool generates")
+    assert "title" in will_upload
+    # the whole point: neither may read as a field whose value is sent
+    assert "mediatype" not in will_upload
+    assert "collection" not in will_upload
+    assert "mediatype" in rest
+    assert "collection" in rest
+    assert "IGNORED" in receipt
+
+
+def test_field_receipt_omits_the_generated_section_when_no_column_collides():
+    """The section is a collision warning, not a standing disclaimer - a Sheet
+    with no mediatype/collection column of its own has nothing to be warned
+    about, and an always-on section is what teaches an operator to skip it."""
+    column_map = build_column_map(["Title", "Genre / Form"])
+
+    receipt = format_field_receipt(column_map)
+
+    assert "uploaded with a value this tool generates" not in receipt
+
+
+def test_field_receipt_lists_identifier_as_reserved_not_as_generated():
+    """`identifier` is in both DROPPED_BY_UPLOAD_ROW and
+    PIPELINE_OWNED_FIELDS. Listing it twice, under two different headings,
+    reads as two different columns."""
+    column_map = build_column_map(["Title", "identifier"])
+
+    receipt = format_field_receipt(column_map)
+
+    assert receipt.count("identifier") == 1
+    assert "Internet Archive reserves these names" in receipt
+    assert "uploaded with a value this tool generates" not in receipt
+
+
 def test_sheet_structure_validation_files_a_grid_shape_error_under_its_own_row_not_row_1():
     """check_grid_shape's message already names the real row number (e.g.
     "row 3 has..."); filing it under row 1 regardless - which an earlier
@@ -1174,7 +1218,7 @@ def test_build_sheet_client_reads_the_real_sheet_id_when_live(monkeypatch):
     client = build_sheet_client(config, live=True)
     client.read_grid()
 
-    assert fake_service.values_api.get_calls == [("REAL_SHEET_ID", "Donor Photos")]
+    assert fake_service.values_api.get_calls == [("REAL_SHEET_ID", "'Donor Photos'")]
 
 
 def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
@@ -1197,7 +1241,7 @@ def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
     client = build_sheet_client(config, live=False)
     client.read_grid()
 
-    assert fake_service.values_api.get_calls == [("TEST_SHEET_ID", "Donor Photos")]
+    assert fake_service.values_api.get_calls == [("TEST_SHEET_ID", "'Donor Photos'")]
 
 
 def test_build_sheet_client_passes_credentials_through_to_discovery_build(monkeypatch):
@@ -2253,6 +2297,134 @@ def test_load_prior_successes_ignores_pre_migration_entries_with_no_live_field(t
 
     assert load_prior_successes(log_path, live=False) == set()
     assert load_prior_successes(log_path, live=True) == set()
+
+
+def test_load_prior_successes_skips_a_truncated_final_line_instead_of_raising(
+    tmp_path, capsys
+):
+    """log_result appends one line per row with no atomic write, so a run
+    killed mid-write leaves a truncated last line. Raising on it made the log
+    permanently unusable as a resume source - disabling the only recovery
+    mechanism the CSV path has, using the exact crash it exists to recover
+    from."""
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_path.write_text(
+        json.dumps(
+            {"identifier": "lcps-astoriaphotos-00001", "status": "success", "live": True}
+        )
+        + "\n"
+        + json.dumps(
+            {"identifier": "lcps-astoriaphotos-00002", "status": "success", "live": True}
+        )
+        + "\n"
+        + '{"identifier": "lcps-astoriaphotos-00003", "status": "succ',
+        encoding="utf-8",
+    )
+
+    successes = load_prior_successes(log_path, live=True)
+
+    # every intact line before the damage is still a real record
+    assert successes == {"lcps-astoriaphotos-00001", "lcps-astoriaphotos-00002"}
+    # and the operator is told, because a lost line means a row will be
+    # attempted again and the run will be longer than they expect
+    assert "1 line" in capsys.readouterr().err
+
+
+def test_load_prior_successes_skips_a_line_of_valid_json_of_the_wrong_shape(tmp_path, capsys):
+    """A bare list or string parses cleanly and then has no .get()."""
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_path.write_text(
+        '["lcps-astoriaphotos-00001", "success"]\n'
+        + '"a stray string"\n'
+        + json.dumps(
+            {"identifier": "lcps-astoriaphotos-00002", "status": "success", "live": True}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00002"}
+    assert "2 lines" in capsys.readouterr().err
+
+
+def test_load_prior_successes_skips_a_success_record_with_no_identifier(tmp_path, capsys):
+    """A success record naming no identifier cannot skip anything, and is
+    damage of the same kind as a line that will not parse - it must not
+    raise KeyError partway through reading the log."""
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_path.write_text(
+        json.dumps({"status": "success", "live": True}) + "\n"
+        + json.dumps(
+            {"identifier": "lcps-astoriaphotos-00002", "status": "success", "live": True}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00002"}
+    assert "1 line" in capsys.readouterr().err
+
+
+def test_load_prior_successes_says_nothing_when_the_log_is_intact(tmp_path, capsys):
+    """The damage warning is a signal, not a banner - an undamaged log must
+    not print it."""
+    from ia_bulk import load_prior_successes
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_path.write_text(
+        json.dumps(
+            {"identifier": "lcps-astoriaphotos-00001", "status": "success", "live": True}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_prior_successes(log_path, live=True) == {"lcps-astoriaphotos-00001"}
+    assert capsys.readouterr().err == ""
+
+
+def test_recorded_timestamps_are_utc_with_an_explicit_offset(tmp_path, monkeypatch):
+    """`ia_uploaded` is the permanent record of when an item was published
+    and the log is what --resume-from and any later audit read. Both were
+    naive local time, which repeats an hour during the DST fall-back
+    transition - so a run spanning it stamped a later chunk with an earlier
+    wall-clock time, unrecoverably. run_stamp() already used UTC for exactly
+    this reason; these did not."""
+    import time as time_module
+
+    from ia_bulk import log_result, upload_timestamp, utc_timestamp
+
+    # A timezone whose local time differs from UTC, so "did it use gmtime"
+    # is answerable rather than coincidental.
+    monkeypatch.setattr(time_module, "localtime", time_module.gmtime)
+    fixed = time_module.gmtime(0)
+    monkeypatch.setattr(time_module, "gmtime", lambda *a: fixed)
+
+    assert utc_timestamp() == "1970-01-01T00:00:00Z"
+    assert upload_timestamp() == "1970-01-01T00:00:00Z"
+
+    log_path = tmp_path / "upload-test.jsonl"
+    log_result(log_path, "lcps-astoriaphotos-00001", "a.jpg", "success", live=True)
+    entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert entry["timestamp"] == "1970-01-01T00:00:00Z"
+
+
+def test_open_log_names_the_file_in_utc(tmp_path, monkeypatch):
+    """So a directory listing sorts in the order the runs actually happened."""
+    import time as time_module
+
+    from ia_bulk import open_log
+
+    epoch = time_module.gmtime(0)
+    monkeypatch.setattr(time_module, "gmtime", lambda *a: epoch)
+
+    assert open_log(tmp_path, "upload").name == "upload-19700101T000000Z.jsonl"
 
 
 def test_run_header_is_the_first_line_of_the_log(tmp_path):
