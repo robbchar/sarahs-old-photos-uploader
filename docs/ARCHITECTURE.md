@@ -9,7 +9,7 @@ This is the design reference. For running a batch see
 ## Purpose
 Single-script CLI (`ia_bulk.py`) for validating, uploading, and syncing
 metadata for Internet Archive items from a project's Google Sheet, read live
-over the Sheets API — see [`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+over the Sheets API — see [`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
 A hand-prepared CSV (`--csv`) remains a deliberate offline/dry-run fallback
 for `validate` and `upload`; `sync-metadata` always takes a CSV. Generic to "a
 project" so a second LCPS project can reuse this pipeline — see
@@ -29,7 +29,7 @@ strip surrounding whitespace, drop punctuation (hyphens and underscores kept,
 since IA field names like `identifier-bib` use them), collapse whitespace and
 repeated underscores to single underscores. It does not correct typos — a
 misspelled header ships as-is — see
-[`DECISIONS.md`](DECISIONS.md#a-malformed-header-is-rejected-never-auto-corrected).
+[`DECISIONS.md`](decisions/READINESS.md#a-malformed-header-is-rejected-never-auto-corrected).
 `ColumnMap.field_names` is the resulting `{raw header: normalized name}` map
 for every header the Sheet had that run; `check_column_map()` rejects two
 headers that normalize to the same field name (a silent per-row overwrite)
@@ -51,10 +51,10 @@ also excludes these (`RESERVED_FIELDS`) alongside `file`, so the tool's own
 bookkeeping never ships as IA metadata. The Sheet's own `identifier` column, if
 it has one, is ordinary donor metadata (the archival reference the donor
 supplied), never the minted IA identifier — see
-[`DECISIONS.md`](DECISIONS.md#tool-owned-sheet-columns-are-all-ia_-prefixed). All four
+[`DECISIONS.md`](decisions/IDENTIFIERS.md#tool-owned-sheet-columns-are-all-ia_-prefixed). All four
 `ia_` columns must already exist as Sheet headers before `upload` will run, in
 every mode including the default rehearsal — see
-[`DECISIONS.md`](DECISIONS.md#the-four-ia_-columns-are-required-in-every-mode-including-the-safe-one).
+[`DECISIONS.md`](decisions/IDENTIFIERS.md#the-four-ia_-columns-are-required-in-every-mode-including-the-safe-one).
 
 `format_field_receipt()` prints, before anything permanent happens, exactly
 which normalized fields will upload and which are held back. `file` and the
@@ -72,14 +72,14 @@ from the registry and `upload_row` sets `metadata['collection']`
 unconditionally, so a Sheet column of either name has its own value
 discarded. That section prints only when such a column actually exists —
 it is a collision warning, not a standing disclaimer. See
-[`DECISIONS.md`](DECISIONS.md#sheet-metadata-is-filtered-at-the-upload-boundary-not-in-upload_row).
+[`DECISIONS.md`](decisions/FILES-AND-METADATA.md#sheet-metadata-is-filtered-at-the-upload-boundary-not-in-upload_row).
 
 **File resolution.** A row's file is *resolved*, not constructed from a
 path template: `resolve_file()` looks in the folder named by `file_template`'s
 substituted columns for an exact filename match, then a case-insensitive
 stem match, and raises rather than picks between two candidates that share a
 stem — see
-[`DECISIONS.md`](DECISIONS.md#a-file-is-found-by-resolution-not-by-constructing-a-path).
+[`DECISIONS.md`](decisions/FILES-AND-METADATA.md#a-file-is-found-by-resolution-not-by-constructing-a-path).
 The resolved name (which can differ from what the Sheet cell says) becomes
 both `row["file"]` and `ia_identifier_bib`.
 
@@ -125,7 +125,7 @@ calls `load_registry()` directly and builds no `ColumnMap`, unlike `validate`/
 `upload`. `--project` is required on the command line (for consistency with
 the other two commands) but the CSV's own columns are what gets sent; there is
 no per-project Sheet, `file_template`, or `required_for_upload` rule in play
-here. See [`DECISIONS.md`](DECISIONS.md#blank-cell-means-leave-alone-not-clear).
+here. See [`DECISIONS.md`](decisions/FILES-AND-METADATA.md#blank-cell-means-leave-alone-not-clear).
 
 Only requires an `identifier` column plus whichever metadata columns changed.
 Does not require `file`, `mediatype`, `title`, or `date`.
@@ -150,7 +150,7 @@ There is no separate "test" identifier form in the CSV or the Sheet; see
 "Safety rail" below for how test runs are kept safe instead. On the Sheet
 path the permanent identifier is minted by `upload` and written to
 `ia_identifier` (see "Sheet source and column mapping" above and
-[`DECISIONS.md`](DECISIONS.md#identifiers-are-minted-by-upload-and-written-back-to-the-sheet));
+[`DECISIONS.md`](decisions/IDENTIFIERS.md#identifiers-are-minted-by-upload-and-written-back-to-the-sheet));
 on the CSV path it is pre-assigned and simply named `identifier`.
 
 ## Readiness
@@ -162,7 +162,7 @@ validity, unchanged in meaning, and a new `missing_fields` list whose
 it, never stored separately. The reasoning — why blank and wrong are different
 kinds of failure, why this isn't a fourth `RowState`, and why `validate` and
 `upload` report the backlog differently — lives entirely in
-[`DECISIONS.md`, "A blank cell is not an error"](DECISIONS.md#a-blank-cell-is-not-an-error);
+[`DECISIONS.md`, "A blank cell is not an error"](decisions/READINESS.md#a-blank-cell-is-not-an-error);
 this section only covers the mechanism.
 
 **Two sources feed `missing_fields`, always in this order:** the project's
@@ -198,7 +198,7 @@ Per chunk, `SheetUploadRun.execute()` does four things in this order:
 1. **verify** — re-reads the Sheet and checks, per target, that its
    `file_template` columns still fingerprint the same photograph and that
    `ia_identifier` is still blank or already ours (see
-   [`DECISIONS.md`](DECISIONS.md#a-rows-identity-is-its-file_template-columns-not-its-ia_identifier)
+   [`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#a-rows-identity-is-its-file_template-columns-not-its-ia_identifier)
    for why the fingerprint, not `ia_identifier`, is what makes this check
    meaningful). Targets that moved are reported and skipped, never written to.
    Before the reserve write only, `check_claimed_identifiers()` additionally
@@ -223,7 +223,7 @@ Reserving before uploading is deliberate: uploading first would let a crash
 strand an item on Internet Archive that the Sheet has no record of, and the
 next run's minting would then reuse that same number for a different
 photograph, permanently — see
-[`DECISIONS.md`](DECISIONS.md#identifiers-are-minted-by-upload-and-written-back-to-the-sheet).
+[`DECISIONS.md`](decisions/IDENTIFIERS.md#identifiers-are-minted-by-upload-and-written-back-to-the-sheet).
 A `write` that fails mid-protocol (`SheetUploadRun._write()`) prints a clean
 message and stops the run rather than raising, and a rate-limited row
 (`is_rate_limit_error()`) stops the run after finishing the current chunk's
@@ -399,7 +399,7 @@ contain test-prefixed identifiers. Neither the CSV nor the Sheet's
 The stamp (`run_stamp()`) is computed once per invocation and shared by
 every row that run touches, so a rehearsal's items group together and never
 collide with a previous rehearsal's — see
-[`docs/DECISIONS.md`](DECISIONS.md#test-identifiers-carry-a-per-run-stamp)
+[`docs/DECISIONS.md`](decisions/IDENTIFIERS.md#test-identifiers-carry-a-per-run-stamp)
 for why a bare `zztest-` prefix made every fresh-Sheet rehearsal collide
 with the last one. (A *resumed* run is its own invocation with its own
 stamp, so its items land under a second stamp, not the original run's —
@@ -443,7 +443,7 @@ procedure and the failure modes it guards against. It does not apply to the
 default Sheet path, where header problems are structurally impossible in
 the same way (a header containing a comma is just a header containing a
 comma, never a CSV-parsing artifact) — see
-[`DECISIONS.md`](DECISIONS.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
+[`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#the-sheet-is-read-live-the-csv-becomes-the-offline-path).
 
 `validate` backstops the structural half of the CSV transformation:
 `check_header()` rejects headers with surrounding whitespace, duplicates, or a
