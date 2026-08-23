@@ -6837,3 +6837,144 @@ def test_sync_from_sheet_rejects_csv_only_log_flags(tmp_path, monkeypatch, capsy
         assert exit_code == 1
         assert "is a --csv-path flag" in capsys.readouterr().err
     assert sent == []
+
+
+# --- issue #4: a failing row's error reaches the console, not only the log ---
+
+
+def test_format_row_error_collapses_a_multi_line_message_to_one_line():
+    """Internet Archive's S3 failures carry a multi-line XML body. Dumped raw
+    under a progress line it swamps the [N/M] rhythm the operator reads."""
+    from ia_bulk import format_row_error
+
+    exc = RuntimeError("failed with status 503:\n  <Error>\n    <Code>SlowDown</Code>\n  </Error>")
+
+    line = format_row_error(exc)
+
+    assert "\n" not in line
+    assert line == "failed with status 503: <Error> <Code>SlowDown</Code> </Error>"
+
+
+def test_format_row_error_truncates_a_very_long_message():
+    """The log keeps the complete text; the console keeps the rhythm."""
+    from ia_bulk import CONSOLE_ERROR_WIDTH, format_row_error
+
+    line = format_row_error(RuntimeError("x" * 5000))
+
+    assert len(line) == CONSOLE_ERROR_WIDTH
+    assert line.endswith("...")
+    assert line.isascii()
+
+
+def test_format_row_error_leaves_a_short_message_alone():
+    from ia_bulk import format_row_error
+
+    message = "Error retrieving metadata: ReadTimeoutError, read timeout=12"
+    assert format_row_error(RuntimeError(message)) == message
+
+
+def test_cmd_upload_prints_why_a_row_failed_not_only_the_count(
+    tmp_path, monkeypatch, capsys
+):
+    """Before this, the entire console output for a failed row was
+    "0 file(s) uploaded successfully, 1 error(s)" plus a path to a JSONL log
+    - a dead end for a volunteer comfortable with spreadsheets and not with
+    code. The information already existed in the log's `error` field; it just
+    never reached the screen."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg",)
+    )
+
+    def timing_out(row, target_identifier, collection, files_dir):
+        raise RuntimeError(
+            "Error retrieving metadata from https://archive.org/metadata/"
+            f"{target_identifier}\nReadTimeoutError: read timeout=12"
+        )
+
+    monkeypatch.setattr("ia_bulk.upload_row", timing_out)
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert "ReadTimeoutError: read timeout=12" in out
+    # under the failing row, in validate's per-row error style
+    assert "    - Error retrieving metadata" in out
+    assert "0 file(s) uploaded successfully, 1 error(s)" in out
+    assert exit_code == 1
+
+
+def test_cmd_upload_csv_path_prints_why_a_row_failed(tmp_path, monkeypatch, capsys):
+    """run_rows is shared by the --csv upload and sync-metadata paths."""
+    from ia_bulk import cmd_upload
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title"],
+        [{
+            "identifier": "lcps-astoriaphotos-00001",
+            "file": "photo1.jpg",
+            "mediatype": "image",
+            "title": "First photo",
+        }],
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    def refused(*args, **kwargs):
+        raise RuntimeError("Access Denied - This item has been taken offline")
+
+    monkeypatch.setattr("ia_bulk.upload_row", refused)
+
+    exit_code = cmd_upload(
+        make_upload_args(
+            tmp_path, registry_path, csv=str(csv_path), files_dir=str(tmp_path)
+        )
+    )
+    out = capsys.readouterr().out
+
+    assert "    - Access Denied - This item has been taken offline" in out
+    assert exit_code == 1
+
+
+def test_sync_from_sheet_prints_why_a_row_failed(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_sync_metadata
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    client = FakeSheetClient(_synced_grid())
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: client)
+
+    def refused(metadata, target):
+        raise RuntimeError("no such item")
+
+    monkeypatch.setattr("ia_bulk.update_metadata_row", refused)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert "    - no such item" in out
+    assert "0 item(s) updated successfully, 0 unchanged, 1 error(s)" in out
+    assert exit_code == 1
+
+
+def test_a_successful_row_prints_no_error_line(tmp_path, monkeypatch, capsys):
+    """The error line is a signal, not a banner."""
+    from ia_bulk import cmd_upload
+
+    grid = [SHEET_HEADER, ["First photo", "photo1.jpg", "", "", "", ""]]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg",)
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert "    - " not in out
+    assert exit_code == 0
