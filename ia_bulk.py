@@ -85,6 +85,12 @@ SHEET_REQUIRED_COLUMNS = ("mediatype",)
 # unrelated pass-through metadata, so check_header rejects it.
 KNOWN_LOWERCASE_COLUMNS = frozenset(REQUIRED_UPLOAD_COLUMNS) | {"date"}
 CHUNK_SIZE = 500
+# Internet Archive's per-account daily item cap. CHUNK_SIZE covers the
+# 500-items-per-run half of the limit in `.claude/CLAUDE.md` ("IA batch
+# limits: 500 items per upload run, 5000/day"); this covers the other half,
+# which nothing enforced. Applies in test mode too - a rehearsal uploads to
+# test_collection through the same account and spends the same quota.
+DAILY_ITEM_CAP = 5000
 TEST_COLLECTION = "test_collection"
 TEST_IDENTIFIER_PREFIX = "zztest-"
 UNDATED_PLACEHOLDER = "[n.d.]"
@@ -2252,6 +2258,22 @@ def upload_from_csv(args, csv_path: str) -> int:
 
     to_upload = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
+    # The CSV path has no --limit to trim with (it is rejected above), so the
+    # fix here is to split the file - but the cap is Internet Archive's and
+    # applies to this path just as much, and relying on the operator to
+    # remember it is what left it unenforced. Counted after --resume-from
+    # filtering: rows a prior run already uploaded do not spend today's quota.
+    if len(to_upload) > DAILY_ITEM_CAP and not getattr(args, "allow_over_daily_cap", False):
+        print(
+            f"this CSV would upload {len(to_upload)} items, over Internet Archive's "
+            f"{DAILY_ITEM_CAP}/day cap for the account. Split it into files of "
+            f"{DAILY_ITEM_CAP} rows or fewer and run them on separate days. Pass "
+            "--allow-over-daily-cap to override if you know this account's cap has been "
+            "raised.",
+            file=sys.stderr,
+        )
+        return 1
+
     validation_results = header_validation(data.fieldnames) + validate_csv_rows(
         rows, files_dir, registry, frozenset(skip_identifiers)
     )
@@ -2526,6 +2548,22 @@ def upload_from_sheet(args) -> int:
     if limit is not None:
         targets = targets[:limit]
 
+    # Checked AFTER --limit, so --limit is the ordinary way to satisfy it: a
+    # Sheet with 9,000 ready rows is not an error, running at all 9,000 of
+    # them in one day is. Refuses rather than silently capping - a run that
+    # quietly stops short reads as a complete one, which is the same trap the
+    # --limit <= 0 guard above exists to avoid.
+    if len(targets) > DAILY_ITEM_CAP and not getattr(args, "allow_over_daily_cap", False):
+        print(
+            f"this run would upload {len(targets)} items, over Internet Archive's "
+            f"{DAILY_ITEM_CAP}/day cap for the account. Pass --limit {DAILY_ITEM_CAP} (or "
+            "less) and run again tomorrow for the rest; identifiers are minted fresh each "
+            "run, so nothing is lost by splitting it. Pass --allow-over-daily-cap to "
+            "override if you know this account's cap has been raised.",
+            file=sys.stderr,
+        )
+        return 1
+
     collection = config.ia_collection if live else TEST_COLLECTION
 
     # `upload` is where something permanent happens, so it shows the same
@@ -2705,6 +2743,15 @@ def build_parser() -> argparse.ArgumentParser:
             "--limit 100 uploads 100 of the 150 ready rows, not the first 100 rows read. "
             "Combines with --chunk-size as 'this many total, batched this way': --limit 10 "
             "--chunk-size 3 uploads 10 items in chunks of 3, not 10 chunks of 3."
+        ),
+    )
+    upload_parser.add_argument(
+        "--allow-over-daily-cap",
+        action="store_true",
+        help=(
+            f"Upload more than Internet Archive's {DAILY_ITEM_CAP}/day account cap in one "
+            "run. Only pass this if you know the cap has been raised for this account - "
+            "otherwise the run is throttled partway through and stops mid-batch."
         ),
     )
     upload_parser.add_argument(

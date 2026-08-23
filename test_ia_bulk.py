@@ -6128,3 +6128,127 @@ def test_upload_row_refuses_a_whitespace_only_file_value(tmp_path, monkeypatch):
             collection="test_collection",
             files_dir=tmp_path,
         )
+
+
+def _three_ready_row_grid():
+    return [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+        ["Third photo", "photo3.jpg", "", "", "", ""],
+    ]
+
+
+def test_cmd_upload_refuses_a_sheet_run_over_the_daily_item_cap(
+    tmp_path, monkeypatch, capsys
+):
+    """`.claude/CLAUDE.md`: "IA batch limits: 500 items per upload run,
+    5000/day". CHUNK_SIZE covered the per-run half; nothing covered the daily
+    half, so a bare `upload --live` on a fully catalogued Sheet planned every
+    ready row and relied on best-effort 429/503 detection - which has never
+    been observed against a live response - to notice."""
+    from ia_bulk import cmd_upload
+
+    monkeypatch.setattr("ia_bulk.DAILY_ITEM_CAP", 2)
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        _three_ready_row_grid(),
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    err = capsys.readouterr().err
+
+    # Refuses rather than silently capping: a run that quietly stops short
+    # reads as a complete one.
+    assert recorder.uploads == []
+    assert recorder.writes == []
+    assert "would upload 3 items, over Internet Archive's 2/day cap" in err
+    assert "--limit 2" in err
+    assert exit_code == 1
+
+
+def test_cmd_upload_daily_cap_is_satisfied_by_limit(tmp_path, monkeypatch, capsys):
+    """--limit is the ordinary way through: the cap is checked AFTER the
+    slice, so a Sheet with more ready rows than the cap is not itself an
+    error - running at all of them in one day is."""
+    from ia_bulk import cmd_upload
+
+    monkeypatch.setattr("ia_bulk.DAILY_ITEM_CAP", 2)
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        _three_ready_row_grid(),
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, registry_path, write_identifier=True, limit=2)
+    )
+
+    assert len(recorder.uploads) == 2
+    assert "over Internet Archive's" not in capsys.readouterr().err
+    assert exit_code == 0
+
+
+def test_cmd_upload_daily_cap_can_be_overridden_explicitly(tmp_path, monkeypatch, capsys):
+    """The cap is Internet Archive's, and an account whose cap has been
+    raised is a real case - but it has to be stated, not assumed."""
+    from ia_bulk import cmd_upload
+
+    monkeypatch.setattr("ia_bulk.DAILY_ITEM_CAP", 2)
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        _three_ready_row_grid(),
+        files=("photo1.jpg", "photo2.jpg", "photo3.jpg"),
+    )
+
+    exit_code = cmd_upload(
+        make_upload_args(
+            tmp_path, registry_path, write_identifier=True, allow_over_daily_cap=True
+        )
+    )
+
+    assert len(recorder.uploads) == 3
+    assert "over Internet Archive's" not in capsys.readouterr().err
+    assert exit_code == 0
+
+
+def test_cmd_upload_refuses_a_csv_run_over_the_daily_item_cap(tmp_path, monkeypatch, capsys):
+    """The CSV path has no --limit to trim with, so the fix there is to split
+    the file - but the cap is Internet Archive's and applies to this path
+    just as much. It was documented as an operator responsibility and
+    enforced nowhere."""
+    from ia_bulk import cmd_upload
+
+    monkeypatch.setattr("ia_bulk.DAILY_ITEM_CAP", 1)
+    for name in ("photo1.jpg", "photo2.jpg"):
+        (tmp_path / name).write_bytes(b"data")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title"],
+        [
+            {
+                "identifier": "lcps-astoriaphotos-0000%d" % n,
+                "file": "photo%d.jpg" % n,
+                "mediatype": "image",
+                "title": "Photo %d" % n,
+            }
+            for n in (1, 2)
+        ],
+    )
+    uploaded = []
+    monkeypatch.setattr("ia_bulk.upload_row", lambda *a, **k: uploaded.append(a))
+
+    exit_code = cmd_upload(
+        make_upload_args(tmp_path, "projects_registry.json", csv=str(csv_path), files_dir=str(tmp_path))
+    )
+    err = capsys.readouterr().err
+
+    assert uploaded == []
+    assert "would upload 2 items, over Internet Archive's 1/day cap" in err
+    assert "Split it" in err
+    assert exit_code == 1

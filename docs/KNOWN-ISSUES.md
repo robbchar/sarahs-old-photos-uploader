@@ -24,14 +24,17 @@ be right the first time.
 **Implication:** decide the `noindex` policy for the collection before the live
 upload, not after.
 
-## 2. Batch limits are documented but not enforced
+## 2. Batch pacing is manual, though the daily total is enforced
 
-**Severity: medium for a 10,000-item batch. Partially mitigated 2026-08-22.**
+**Severity: low. Daily cap enforced 2026-08-23; pacing still manual.**
 
 `chunk_rows()` groups rows into 500s to match IA's per-run limit, but the loop
-still has no pacing (no sleep between batches) and no running counter against
-the 5,000/day limit. That much is structural only, unchanged from the
-original build review. What did change: the Sheet path's `upload --limit N`
+still has no pacing (no sleep between batches) and no running counter *across*
+a day's separate runs — a second run started the same day does not know what
+the first one spent. What a single run can no longer do is exceed the
+5,000/day cap by itself: both `upload` paths refuse to start such a run and
+name the fix (`--limit` on the Sheet path, splitting the file on `--csv`),
+with `--allow-over-daily-cap` as the explicit override. Beyond that: the Sheet path's `upload --limit N`
 now caps how many items a single invocation uploads at all (an operator can
 size a day's runs by hand with a number the tool enforces, rather than by
 pre-splitting a CSV), `--chunk-size` makes the 500-per-run batch size an
@@ -41,10 +44,12 @@ unexplained failures — though that detector is unverified against a real
 response; see `DECISIONS.md`, "Rate-limit detection matches a status
 code...".
 
-**Mitigation today:** pace `--limit` across the day's runs by hand; see
+**Mitigation today:** pace `--limit` across the day's runs by hand — the tool
+enforces the cap per run, not per day; see
 [`OPERATIONS.md`](OPERATIONS.md#pacing-and-batch-limits). The `--csv` path
-still has neither flag (see `DECISIONS.md`, "`--limit` counts planned
-targets...") — size those CSVs by hand as before.
+still has neither `--limit` nor `--chunk-size` (see `DECISIONS.md`, "`--limit`
+counts planned targets...") — size those CSVs by hand, though a file over
+5,000 rows is now refused rather than attempted.
 
 ## 3. No retry on transient network failures
 
