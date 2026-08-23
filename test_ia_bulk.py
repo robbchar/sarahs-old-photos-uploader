@@ -20,6 +20,7 @@ from ia_bulk import (
     check_identifier,
     check_required_for_upload,
     resolve_sheet_files,
+    survey_files,
     validate_rows,
     validate_sheet_grid,
     RowValidation,
@@ -368,6 +369,38 @@ def test_validate_rows_row_numbers_start_at_2_for_header():
     results = validate_rows(rows, files_dir="/tmp", registry=make_registry())
 
     assert results[0].row_number == 2
+
+
+def test_survey_files_separates_resolved_rows_from_unresolved(tmp_path):
+    """The claimed set is what stops two rows being pointed at one file -
+    the misattribution hazard in issue #1. It is built before any matching."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Good.jpg").write_bytes(b"x")
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+    (folder / "contact sheet.pdf").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Good.jpg"},
+        {"folder": "SOP CD 1", "name": "Finnis Meat Market.jpg"},
+    ]
+
+    survey = survey_files(rows, config)
+
+    assert survey.unresolved == {3: "SOP CD 1"}
+    assert survey.wanted == {3: "Finnis Meat Market.jpg"}
+    assert survey.claimed == {"SOP CD 1/Good.jpg"}
+    # the resolved file is not offered as a candidate, and the PDF is excluded
+    assert survey.unclaimed == {"SOP CD 1": ["Finnish Meat Market.jpg"]}
+
+
+def test_survey_files_treats_a_blank_filename_cell_as_unresolved(tmp_path):
+    (tmp_path / "SOP CD 1").mkdir()
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    survey = survey_files([{"folder": "SOP CD 1", "name": ""}], config)
+    assert survey.unresolved == {2: "SOP CD 1"}
+    assert survey.wanted == {2: ""}
 
 
 def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers():

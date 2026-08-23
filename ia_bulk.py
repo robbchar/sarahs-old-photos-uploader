@@ -1248,6 +1248,66 @@ class FileOutcomes:
     blank: dict[int, list[str]]
 
 
+@dataclass(frozen=True)
+class FileSurvey:
+    """What the Sheet says versus what is on the drive.
+
+    `claimed` is built before any matching runs, and `unclaimed` is its
+    complement. That ordering is the whole safety property: a file another
+    row already resolves to can never be proposed to a second row, which is
+    the misattribution hazard in issue #1."""
+
+    unresolved: dict[int, str]
+    wanted: dict[int, str]
+    claimed: set[str]
+    unclaimed: dict[str, list[str]]
+
+
+def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurvey:
+    """Resolve every row, then work out which files nothing points at.
+
+    Deliberately does not mutate rows, unlike resolve_sheet_files(): this runs
+    before any decision is made, and a row's cells must still read as the
+    operator wrote them when they are shown one."""
+    listing_cache: dict[Path, list[str]] = {}
+    fields = template_fields(config.file_template)
+    unresolved: dict[int, str] = {}
+    wanted: dict[int, str] = {}
+    claimed: set[str] = set()
+    folders: set[str] = set()
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2
+        folder = (row.get(fields[0]) or "").strip() if fields else ""
+        folders.add(folder)
+        name_field = fields[-1] if fields else ""
+
+        blank = [name for name in fields if not (row.get(name) or "").strip()]
+        if blank:
+            unresolved[row_number] = folder
+            wanted[row_number] = (row.get(name_field) or "").strip()
+            continue
+        try:
+            claimed.add(resolve_file(config.files_dir, candidate_path(config.file_template, row), listing_cache))
+        except FileResolutionError:
+            unresolved[row_number] = folder
+            wanted[row_number] = (row.get(name_field) or "").strip()
+
+    unclaimed: dict[str, list[str]] = {}
+    for folder in sorted(f for f in folders if f):
+        directory = Path(config.files_dir) / folder
+        if not directory.is_dir():
+            continue
+        unclaimed[folder] = sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_file()
+            and entry.suffix.lower() in config.photo_extensions
+            and f"{folder}/{entry.name}" not in claimed
+        )
+    return FileSurvey(unresolved=unresolved, wanted=wanted, claimed=claimed, unclaimed=unclaimed)
+
+
 def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileOutcomes:
     """Resolves each row's file against disk BEFORE validation runs, so a row
     either carries a real, disk-verified 'file' value (and the resolved name,
