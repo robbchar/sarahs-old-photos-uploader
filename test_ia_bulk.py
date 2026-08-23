@@ -7548,3 +7548,41 @@ def test_cmd_reconcile_files_exits_zero_with_rows_still_unresolved(tmp_path, mon
     assert written == []
     assert "1 row still unresolved" in capsys.readouterr().out
     assert exit_code == 0
+
+
+def test_cmd_reconcile_files_does_not_reoffer_a_file_claimed_earlier_this_run(tmp_path, monkeypatch):
+    """Two rows in the same folder, both unresolvable, can each be within
+    matching distance of the SAME single file on disk. Once row 2 claims it,
+    row 3 must not be proposed it again - that is the exact misattribution
+    FileSurvey's own docstring promises cannot happen, and 'unclaimed' alone
+    cannot prevent it: it is a snapshot taken once, before the run started.
+
+    Rather than a canned decision queue, this uses a fake prompt that mirrors
+    what a real operator can do: accept whatever is proposed, or - when
+    nothing is proposed - there is nothing to press [y] on. If the candidate
+    pool has not been re-filtered against what earlier rows in this same run
+    claimed, row 3 would still see the file as a candidate, propose_match
+    would propose it a second time, and this fake would accept it too."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    def accept_whatever_is_proposed(row_number, folder, wanted, proposal, candidates, config, claimed):
+        if proposal is None:
+            return Decision(action="reject", filename="")
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Finnish Meet Market.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", accept_whatever_is_proposed)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+    assert exit_code == 0

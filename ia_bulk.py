@@ -3438,7 +3438,18 @@ def cmd_reconcile_files(args) -> int:
     for row_number in sorted(survey.unresolved):
         folder = survey.unresolved[row_number]
         wanted = survey.wanted[row_number]
-        candidates = survey.unclaimed.get(folder, [])
+        # survey.unclaimed is a snapshot taken once, before any row in this
+        # run was decided - it never shrinks on its own. Re-filter against
+        # survey.claimed on every iteration (not just once before the loop):
+        # accepting row N adds its file to `claimed` a few lines below, and
+        # without this filter row N+1 in the same folder would still see
+        # that same file as a candidate and could be proposed - and
+        # accepted onto - it too. That is the exact misattribution FileSurvey's
+        # own docstring promises cannot happen.
+        candidates = [
+            name for name in survey.unclaimed.get(folder, [])
+            if f"{folder}/{name}" not in survey.claimed
+        ]
         try:
             proposal = propose_match(wanted, candidates) if wanted else None
             reason = proposal.reason if proposal else ""
