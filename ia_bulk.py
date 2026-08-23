@@ -2268,6 +2268,17 @@ def upload_from_csv(args, csv_path: str) -> int:
 
     to_upload = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
+    validation_results = header_validation(data.fieldnames) + validate_csv_rows(
+        rows, files_dir, registry, frozenset(skip_identifiers)
+    )
+    if not all(r.is_valid for r in validation_results):
+        print(format_report(validation_results))
+        print(
+            "validation failed; run 'validate' and fix the errors above before uploading",
+            file=sys.stderr,
+        )
+        return 1
+
     # The CSV path has no --limit to trim with (it is rejected above), so the
     # fix here is to split the file - but the cap is Internet Archive's and
     # applies to this path just as much, and relying on the operator to
@@ -2280,17 +2291,6 @@ def upload_from_csv(args, csv_path: str) -> int:
             f"{DAILY_ITEM_CAP} rows or fewer and run them on separate days. Pass "
             "--allow-over-daily-cap to override if you know this account's cap has been "
             "raised.",
-            file=sys.stderr,
-        )
-        return 1
-
-    validation_results = header_validation(data.fieldnames) + validate_csv_rows(
-        rows, files_dir, registry, frozenset(skip_identifiers)
-    )
-    if not all(r.is_valid for r in validation_results):
-        print(format_report(validation_results))
-        print(
-            "validation failed; run 'validate' and fix the errors above before uploading",
             file=sys.stderr,
         )
         return 1

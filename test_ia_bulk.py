@@ -6225,14 +6225,19 @@ def test_cmd_upload_refuses_a_csv_run_over_the_daily_item_cap(tmp_path, monkeypa
             for n in (1, 2)
         ],
     )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
     uploaded = []
     monkeypatch.setattr("ia_bulk.upload_row", lambda *a, **k: uploaded.append(a))
 
     exit_code = cmd_upload(
-        make_upload_args(tmp_path, "projects_registry.json", csv=str(csv_path), files_dir=str(tmp_path))
+        make_upload_args(tmp_path, registry_path, csv=str(csv_path), files_dir=str(tmp_path))
     )
     err = capsys.readouterr().err
 
+    # The rows are valid: the cap check runs after validation, because an
+    # invalid file uploads nothing anyway and "fix your rows" has to come
+    # before "split your file".
     assert uploaded == []
     assert "would upload 2 items, over Internet Archive's 1/day cap" in err
     assert "Split it" in err
