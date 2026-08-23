@@ -38,6 +38,7 @@ from column_map import (
 from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers, parse_identifier
 from project_config import ProjectConfig, load_project_config
+from reconcile import Proposal
 from sheet_client import CellUpdate, SheetClient, column_letter
 
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
@@ -1306,6 +1307,70 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
             and f"{folder}/{entry.name}" not in claimed
         )
     return FileSurvey(unresolved=unresolved, wanted=wanted, claimed=claimed, unclaimed=unclaimed)
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str          # "accept" | "reject" | "stop"
+    filename: str        # the RESOLVED name, empty unless accepting
+
+
+def prompt_for_decision(
+    row_number: int,
+    folder: str,
+    wanted: str,
+    proposal: Proposal | None,
+    unclaimed: list[str],
+    config: ProjectConfig,
+    claimed: set[str],
+    read_line=input,
+) -> Decision:
+    """Ask about one row and return what the operator decided.
+
+    `read_line` is injected so tests drive this without a terminal.
+
+    A typed name goes through the same resolve_file() every other path uses,
+    so it must resolve to exactly one real file AND that file must not
+    already be claimed. That is what keeps typing from becoming a new way to
+    introduce the error being fixed - and it means a name typed without its
+    extension, or in the wrong case, resolves anyway."""
+    shown = wanted or "(blank)"
+    print(f"row {row_number}  '{shown}'  does not resolve in '{folder}'")
+    keys = "[y] accept   " if proposal else ""
+    if proposal:
+        print(f"       proposed: '{proposal.filename}'   ({proposal.reason})")
+    print(f"       {keys}[n] not this one   [e] type it   [l] list unclaimed   [q] stop")
+
+    while True:
+        answer = read_line("       > ").strip().lower()
+        if answer == "q":
+            return Decision(action="stop", filename="")
+        if answer == "n":
+            return Decision(action="reject", filename="")
+        if answer == "y" and proposal:
+            return Decision(action="accept", filename=proposal.filename)
+        if answer == "l":
+            if unclaimed:
+                for name in unclaimed:
+                    print(f"           {name}")
+            else:
+                print(f"           nothing unclaimed in '{folder}'")
+            continue
+        if answer == "e":
+            typed = read_line("       filename> ").strip()
+            if not typed:
+                continue
+            try:
+                resolved = resolve_file(config.files_dir, f"{folder}/{typed}", {})
+            except FileResolutionError as exc:
+                print(f"           {exc}")
+                continue
+            name = resolved.rpartition("/")[2]
+            if resolved in claimed:
+                print(f"           '{name}' is already used by another row")
+                continue
+            return Decision(action="accept", filename=name)
+        print("           expected y, n, e, l or q")
 
 
 def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileOutcomes:

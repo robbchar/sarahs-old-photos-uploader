@@ -7245,3 +7245,104 @@ def test_sync_from_sheet_live_reports_a_failure_without_claiming_success(
     assert "    - Access Denied - This item has been taken offline" in out
     assert "0 item(s) updated successfully, 0 unchanged, 1 error(s)" in out
     assert exit_code == 1
+
+
+# Task 5: The prompt tests
+def test_prompt_accepts_a_proposal(capsys):
+    from ia_bulk import Decision, prompt_for_decision
+    from reconcile import Proposal
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", Proposal("Finnish.jpg", "edit distance 1"),
+        ["Finnish.jpg"], _sheet_config(), set(), read_line=lambda _: "y",
+    )
+    assert decision == Decision(action="accept", filename="Finnish.jpg")
+
+
+def test_prompt_rejects_without_a_filename():
+    from ia_bulk import Decision, prompt_for_decision
+    from reconcile import Proposal
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", Proposal("Finnish.jpg", "edit distance 1"),
+        ["Finnish.jpg"], _sheet_config(), set(), read_line=lambda _: "n",
+    )
+    assert decision == Decision(action="reject", filename="")
+
+
+def test_prompt_typed_name_is_resolved_before_it_is_accepted(tmp_path):
+    """The whole point: a typed name goes through the same resolve_file()
+    every other path uses, so it cannot introduce a new broken cell - and a
+    name typed without its extension resolves anyway."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Finnish Meat Market"])   # no extension
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    assert decision.action == "accept"
+    assert decision.filename == "Finnish Meat Market.jpg"   # the RESOLVED name
+
+
+def test_prompt_reprompts_when_a_typed_name_does_not_resolve(tmp_path, capsys):
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Real.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Nonexistent", "e", "Real", ])
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    assert decision.filename == "Real.jpg"
+    assert "no file found" in capsys.readouterr().out.lower()
+
+
+def test_prompt_refuses_a_typed_name_another_row_already_claims(tmp_path, capsys):
+    """Typing must not be a way around the one-file-one-row rule."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Taken.jpg").write_bytes(b"x")
+    (folder / "Free.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Taken", "e", "Free"])
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config,
+        {"SOP CD 1/Taken.jpg"}, read_line=lambda _: next(answers),
+    )
+    assert decision.filename == "Free.jpg"
+    assert "already" in capsys.readouterr().out.lower()
+
+
+def test_prompt_lists_unclaimed_files_on_demand(capsys):
+    from ia_bulk import prompt_for_decision
+
+    answers = iter(["l", "n"])
+    prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, ["Alpha.jpg", "Beta.jpg"],
+        _sheet_config(), set(), read_line=lambda _: next(answers),
+    )
+    out = capsys.readouterr().out
+    assert "Alpha.jpg" in out and "Beta.jpg" in out
+
+
+def test_prompt_stops_the_run():
+    from ia_bulk import Decision, prompt_for_decision
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], _sheet_config(), set(),
+        read_line=lambda _: "q",
+    )
+    assert decision == Decision(action="stop", filename="")
