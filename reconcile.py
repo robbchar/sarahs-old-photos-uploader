@@ -5,6 +5,7 @@ supplies the candidates and acts on the result."""
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,14 +14,28 @@ _DIGITS = re.compile(r"\d+")
 
 
 def normalize_name(name: str) -> str:
-    """Casefold, replace every run of non-alphanumeric characters with a
-    single space, and strip.
+    """Fold accents to their base letters, casefold, replace every run of
+    non-alphanumeric characters with a single space, and strip.
 
     This is what makes the copy artifacts compare equal without any fuzzy
     matching at all: apostrophes become underscores and single spaces become
     double when files are copied off source media, so `Roy's Shell` on the
-    drive is ` Roy_s  Shell`. Both normalize to `roy s shell`."""
-    return _NON_ALNUM.sub(" ", name.casefold()).strip()
+    drive is ` Roy_s  Shell`. Both normalize to `roy s shell`.
+
+    The accent fold is not decoration in an Astoria Finnish/Scandinavian
+    collection. Without it an accented character is simply deleted along with
+    the punctuation, so two distinct names differing only in which vowels
+    carry diaereses collapse to the same skeleton (`v in`) and are reported
+    as an exact match - the tool's MOST certain register - for two different
+    photographs, while a stem written entirely in accented characters
+    collapses to nothing at all and lands within edit distance of any short
+    name on the drive. Decomposing (NFKD) and dropping the
+    combining marks instead turns those into ordinary ASCII names, which
+    also promotes several real matches from a distance-2 guess to a Pass A
+    certainty."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    unaccented = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return _NON_ALNUM.sub(" ", unaccented.casefold()).strip()
 
 
 def digit_runs(name: str) -> tuple[str, ...]:
@@ -92,6 +107,14 @@ def propose_match(wanted: str, candidates: list[str]) -> Proposal | None:
 
     Raises AmbiguousMatch if a pass produces more than one candidate."""
     target = _stem(wanted)
+    if not target:
+        # Nothing survived normalization - a name written entirely in
+        # characters this comparison cannot see. An empty target is inside
+        # the edit-distance budget of every candidate with a stem of two
+        # characters or fewer, so proceeding would build a confident
+        # proposal out of no evidence at all. Same reason a candidate whose
+        # own stem normalizes to nothing is dropped below.
+        return None
 
     exact = sorted({c for c in candidates if _stem(c) == target})
     if len(exact) == 1:
@@ -105,7 +128,8 @@ def propose_match(wanted: str, candidates: list[str]) -> Proposal | None:
         {
             c
             for c in candidates
-            if digit_runs(_stem(c)) == target_digits
+            if _stem(c)
+            and digit_runs(_stem(c)) == target_digits
             and levenshtein(_stem(c), target) <= MAX_EDIT_DISTANCE
         }
     )

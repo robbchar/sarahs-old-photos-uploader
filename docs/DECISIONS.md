@@ -79,6 +79,7 @@ until a human accepts it.
 
 - [A correction is proposed, never applied](decisions/RECONCILIATION.md#a-correction-is-proposed-never-applied)
 - [Pass B requires identical digit sequences](decisions/RECONCILIATION.md#pass-b-requires-identical-digit-sequences)
+- [Accents are folded, not deleted](decisions/RECONCILIATION.md#accents-are-folded-not-deleted)
 - [A typed filename is resolved, not trusted](decisions/RECONCILIATION.md#a-typed-filename-is-resolved-not-trusted)
 - [Reconciliation ships before append](decisions/RECONCILIATION.md#reconciliation-ships-before-append)
 - [Exit code is 0 while work remains](decisions/RECONCILIATION.md#exit-code-is-0-while-work-remains)

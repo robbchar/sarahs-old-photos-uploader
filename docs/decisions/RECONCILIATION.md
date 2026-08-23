@@ -55,6 +55,35 @@ may not. That keeps `finnis`/`finnish` (identical digits, letters one edit
 apart) matchable while refusing `001_seaside_beach`/`002_seaside_beach`
 (different digits) outright, however close their edit distance.
 
+## Accents are folded, not deleted
+
+*Decided 2026-08-23, after a review measured what `normalize_name()` did to
+Nordic names.*
+
+`normalize_name()` replaces every run of characters outside `[a-z0-9]` with
+a single space, which is what makes ` Roy_s  Shell` and `Roy's Shell`
+compare equal. An accented character is outside that set too, so it was
+being deleted along with the punctuation — and that is not a graceful
+degradation, it is a wrong answer stated confidently. Two distinct names
+differing only in which vowels carry diaereses collapsed to the same
+skeleton and came back as a Pass A match, the tool's *most* certain
+register, for two different photographs; a stem written entirely in
+accented characters collapsed to nothing at all, which is within the edit
+budget of every short name in the folder. This is an Astoria
+Finnish/Scandinavian collection — the sample drive already holds a "Finnish
+Meat Market" — so neither case is hypothetical.
+
+The names are now NFKD-decomposed and their combining marks dropped before
+the substitution runs, so an accented vowel becomes its base letter rather
+than a gap. That also promotes real matches: an accented name against its
+unaccented transcription used to be a distance-2 guess and is now an exact
+match after normalization. `propose_match()` refuses outright when the
+normalized target is empty, and skips any candidate whose own normalized
+stem is empty, so neither side of the comparison can be built out of
+nothing. Letters that carry no combining mark to drop — `ø` and `æ` — still
+degrade to a gap; that leaves them a short edit away from their base
+spelling, which proposes correctly, rather than colliding with anything.
+
 ## A typed filename is resolved, not trusted
 
 *Decided 2026-08-23, designing the `[e]` prompt key.*
