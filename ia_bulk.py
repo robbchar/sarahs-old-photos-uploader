@@ -2028,9 +2028,17 @@ def sheet_row_fingerprints(
     "is this still the same row?".
 
     The template's columns are the right fingerprint for one specific reason:
-    this tool never writes them. Checking `ia_identifier` instead would be
+    `upload` never writes them. Checking `ia_identifier` instead would be
     tautological on the reserve->confirm leg, because reserve is what put that
     value there - the check would be verifying its own write.
+
+    `reconcile-files` is the one command that DOES write a file_template
+    column (the filename cell, and only that one). It never runs inside an
+    upload run, so it cannot make this check verify its own write; a
+    reconciliation landing in the Sheet mid-upload instead makes that row
+    fingerprint as moved, so `upload` skips it and it goes out on the next
+    run - the safe direction, and the same outcome as any other human edit
+    to the same cell.
 
     Must be computed from the RAW cells, before resolve_sheet_files() rewrites
     row['file'] to the resolved name: the comparison is against a fresh read of
@@ -3439,6 +3447,21 @@ def sync_from_csv(args) -> int:
 RECONCILE_FLUSH_EVERY = 25
 
 
+@dataclass(frozen=True)
+class PendingCorrection:
+    """An accepted correction waiting to be written, carrying what its cell
+    said when it was matched.
+
+    `wanted` is the whole point of the dataclass: it is what flush() checks
+    the row against on a fresh read before writing, so a Sheet edited mid
+    session cannot land a filename on a photograph it was never about. Same
+    role as `sheet_row_fingerprints()` for `upload`, one cell wide."""
+
+    update: CellUpdate
+    row_number: int
+    wanted: str
+
+
 def log_decision(log_path, row_number: int, folder: str, wanted: str, status: str,
                  chosen: str = "", reason: str = "") -> None:
     """One line per row considered. Prompt-per-proposal leaves no record of
@@ -3532,15 +3555,50 @@ def cmd_reconcile_files(args) -> int:
     print()
 
     log_path = None if dry_run else open_log(args.log_dir, "reconcile-files")
-    pending: list[CellUpdate] = []
+    pending: list[PendingCorrection] = []
     accepted = stopped = 0
 
     def flush() -> bool:
-        nonlocal pending
+        """Write what has been accepted, dropping anything whose row moved.
+
+        This command has by far the longest read-to-write window in the tool:
+        an interactive session over a Sheet several volunteers share can put
+        an hour between the grid read that fixed `row_number` and the write
+        that uses it, and one row inserted or deleted in that hour shifts
+        every later write by one - silently putting a filename on the wrong
+        photograph. `upload` already refuses to write through that window
+        (sheet_row_fingerprints/read_sheet_snapshot/split_moved_targets);
+        this is the same idea at a fraction of the cost, since reconcile
+        knows exactly what each target cell said when it matched.
+
+        A re-read that fails stops the run rather than writing unverified:
+        the whole point is that an unchecked write here is the hazard."""
+        nonlocal pending, accepted
         if not pending:
             return True
         try:
-            sheet.client.write_cells(pending)
+            grid = sheet.client.read_grid()
+        except Exception as exc:
+            print(
+                f"could not re-read the Sheet to check the rows before writing: {exc}. "
+                "Stopping here without writing - rerun to pick these up.",
+                file=sys.stderr,
+            )
+            return False
+
+        updates: list[CellUpdate] = []
+        for correction in pending:
+            now = cell_value(grid, correction.row_number, name_column)
+            if now != correction.wanted:
+                accepted -= 1
+                print(f"row {correction.row_number}  the Sheet now says '{now}' where this "
+                      f"run read '{correction.wanted}' - the row moved or was edited, so "
+                      "the correction was NOT written")
+                continue
+            updates.append(correction.update)
+
+        try:
+            sheet.client.write_cells(updates)
         except Exception as exc:
             print(f"the Sheet write failed: {exc}. Stopping here.", file=sys.stderr)
             return False
@@ -3596,7 +3654,13 @@ def cmd_reconcile_files(args) -> int:
         accepted += 1
         survey.claimed.add(claim_key(f"{folder}/{decision.filename}"))
         pending.append(
-            CellUpdate(f"{column_letter(name_column)}{row_number}", decision.filename)
+            PendingCorrection(
+                update=CellUpdate(
+                    f"{column_letter(name_column)}{row_number}", decision.filename
+                ),
+                row_number=row_number,
+                wanted=wanted,
+            )
         )
         if log_path:
             status = "accepted" if proposal and decision.filename == proposal.filename else "typed"

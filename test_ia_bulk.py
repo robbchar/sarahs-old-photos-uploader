@@ -7395,7 +7395,8 @@ def test_prompt_stops_the_run():
 RECONCILE_HEADER = ["Folder on LaCie Drive", "File Name", "Title"]
 
 
-def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions, header=None):
+def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions, header=None,
+                     grid_after=None):
     """A reconcile world: files on disk, a registry, a client that records
     every write, and a canned answer per prompt."""
     for folder, names in disk.items():
@@ -7420,8 +7421,15 @@ def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions, header=
     class RecordingClient:
         def __init__(self, grid):
             self._grid = grid
+            self._reads = 0
 
         def read_grid(self):
+            # `grid_after` is what the Sheet says on every read AFTER the
+            # first - i.e. what flush()'s re-read sees once somebody else has
+            # edited the Sheet mid-session.
+            self._reads += 1
+            if grid_after is not None and self._reads > 1:
+                return grid_after
             return self._grid
 
         def write_cells(self, updates):
@@ -7496,6 +7504,58 @@ def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch)
     cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
 
     assert written == []
+
+
+def test_cmd_reconcile_files_drops_a_correction_whose_row_moved_mid_session(tmp_path, monkeypatch, capsys):
+    """The longest read-to-write window in the tool: an hour of prompting
+    can sit between the grid read that fixed the row number and the write
+    that uses it, on a Sheet several volunteers share. One row inserted in
+    that hour shifts every later write by one, putting a filename on the
+    wrong photograph. flush() re-reads and drops anything whose cell no
+    longer says what it said when it matched."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    original = ["SOP CD 1", "Finnis Meat Market.jpg", "A title"]
+    inserted = ["SOP CD 1", "Someone Else's Row.jpg", "Inserted since"]
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [original],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+        grid_after=[RECONCILE_HEADER, inserted, original],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert written == []
+    assert "was NOT written" in out
+    assert "0 filename(s) corrected" in out
+    assert "1 row still unresolved" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_writes_when_the_row_still_says_what_it_said(tmp_path, monkeypatch):
+    """The other half of the guard: an unrelated edit elsewhere in the Sheet
+    must not stop a correction whose own row is untouched."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    original = ["SOP CD 1", "Finnis Meat Market.jpg", "A title"]
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [original],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+        grid_after=[RECONCILE_HEADER, original, ["SOP CD 2", "Appended.jpg", "Later"]],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
 
 
 def test_cmd_reconcile_files_refuses_a_sheet_whose_headers_collide(tmp_path, monkeypatch, capsys):

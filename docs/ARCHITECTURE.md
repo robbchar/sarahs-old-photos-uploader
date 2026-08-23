@@ -339,6 +339,20 @@ proposal via `prompt_for_decision()` and, on acceptance, batches a
 doesn't hold hundreds of accepted corrections in memory, unsaved, until
 the very end.
 
+**Accepted corrections are re-checked before they are written.**
+`flush()` re-reads the grid and drops any pending update whose row no
+longer holds the filename it was matched against, saying so on screen. This
+is the same hazard `upload`'s `sheet_row_fingerprints()` guard exists for,
+one cell wide: `reconcile-files` has the longest read-to-write window in
+the tool — an interactive session over a shared Sheet — so a row inserted
+or deleted mid-session would otherwise shift every later write by one. A
+re-read that fails stops the run rather than writing unverified.
+Reconciliation is also the **only** command that writes a `file_template`
+column, which `sheet_row_fingerprints()` otherwise relies on being
+never-written; the two never run together, and a correction landing during
+an `upload` makes that row fingerprint as moved and be skipped, which is
+the safe direction.
+
 **The candidate pool shrinks as the run progresses.** `claimed` is a
 snapshot built once, before any row is decided, but the candidates offered
 to each row are re-filtered against it on *every* iteration of the loop —

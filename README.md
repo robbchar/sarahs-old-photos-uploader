@@ -394,6 +394,13 @@ A file accepted for one row is removed from the pool offered to every row
 still to come in the same run, so two misspelled rows in one folder can
 never both be pointed at the same photograph.
 
+Before each batch of accepted corrections is written, the Sheet is read
+again and any correction whose row no longer holds the filename it was
+matched against is dropped and reported rather than written — a session can
+run for an hour on a Sheet other volunteers are editing, and one row
+inserted in that time would otherwise shift every later write onto the
+wrong photograph.
+
 Exits `0` whether or not every row ends up resolved — rows left for later
 are the normal state of a ~10,000-row backlog worked over many sessions,
 not a failure; see
