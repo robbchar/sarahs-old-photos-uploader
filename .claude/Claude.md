@@ -27,10 +27,14 @@ they go in the `identifier-bib` metadata field instead.
 - IA batch limits: 500 items per upload run, 5000/day — always chunk CSVs
   accordingly, never submit the full set in one call.
 - Testing: `ia_bulk.py` targets `collection:test_collection` (IA's sandbox,
-  auto-expires ~30 days) by default, and automatically prepends `zztest-`
-  to the real identifier for every network call unless `--live` is passed.
-  The CSV always holds real, permanent identifiers — never author a
-  `zztest-` identifier by hand in the CSV itself.
+  auto-expires ~30 days) by default, and automatically prepends
+  `zztest-<run's stamp>-` to the real identifier for every network call
+  unless `--live` is passed. The stamp is unique per invocation (one stamp
+  per run, shared by every row it touches), so a rehearsal never collides
+  with a previous rehearsal's items — see `docs/DECISIONS.md`, "Test
+  identifiers carry a per-run stamp". The CSV always holds real, permanent
+  identifiers — never author a `zztest-` identifier by hand in the CSV
+  itself.
 
 ## Source of truth
 Canonical metadata lives in a Google Sheet (replacing the old emailed-CSV

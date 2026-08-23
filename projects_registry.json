@@ -1,8 +1,16 @@
 {
   "collection_key": "lcps",
   "projects": {
-    "sarahsoldphotos": {
-      "description": "Sarah's donated collection of historical Astoria photos"
+    "sarasoldphotos": {
+      "description": "Sara's donated collection of historical Astoria photos",
+      "mediatype": "image",
+      "ia_collection": "sarasoldphotos",
+      "sheet_id": "REPLACE_WITH_REAL_SHEET_ID",
+      "test_sheet_id": "1Kgm7pRJSN7WIYt5pMpI0krw4V6Bs9UrAfeeO7jFcXPI",
+      "sheet_tab": "Test Sheet",
+      "files_dir": "./data",
+      "file_template": "{folder_on_lacie_drive}/{file_name}",
+      "required_for_upload": ["title", "theme"]
     }
   }
 }
