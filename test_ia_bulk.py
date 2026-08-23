@@ -7068,3 +7068,143 @@ def test_not_attempted_summary_says_where_to_look(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
 
     assert "not attempted - the run stopped early; see the reason on stderr above" in out
+
+
+# --- issue #3: sync-metadata's live path, which writes to permanent items ---
+
+
+def _live_grid():
+    """A Sheet whose rows were uploaded by a --live run: ia_url names the
+    real, unstamped item."""
+    return _synced_grid([
+        ["Stone Customshouse", "photo1.jpg", "lcps-astoriaphotos-00001",
+         "2026-08-23T16:13:31Z",
+         "https://archive.org/details/lcps-astoriaphotos-00001", "photo1.jpg"],
+    ])
+
+
+def test_sync_from_sheet_sends_a_live_correction_to_the_real_item(
+    tmp_path, monkeypatch, capsys
+):
+    """The only success-case test of a path that writes permanent metadata to
+    real archival items. Every other live-mode assertion in the suite is a
+    refusal, which proves the guards fire but never that a correction the
+    operator meant to make actually goes out.
+
+    Internet Archive can darken an item on request but cannot rename it, and
+    metadata edits are permanent enough to be worth failing loudly over -
+    `upload` has success coverage for its live path; this did not."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _live_grid(), sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, live=True))
+    out = capsys.readouterr().out
+
+    assert len(sent) == 1
+    target, metadata = sent[0]
+    # the real, permanent identifier - no zztest- prefix, no run stamp
+    assert target == "lcps-astoriaphotos-00001"
+    assert not target.startswith("zztest-")
+    assert metadata["title"] == "Stone Customshouse"
+    assert "1 item(s) updated successfully" in out
+    assert exit_code == 0
+
+
+def test_sync_from_sheet_live_reads_the_real_spreadsheet_not_the_test_one(
+    tmp_path, monkeypatch, capsys
+):
+    """A live correction read from the TEST Sheet would send that Sheet's
+    metadata to real items. sheet_id and test_sheet_id are deliberately
+    different values in the fixture so this is answerable rather than
+    coincidental."""
+    from ia_bulk import cmd_sync_metadata
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    # Two DIFFERENT grids behind the two spreadsheet ids, so reading the wrong
+    # one sends the wrong metadata and this test can actually fail. Asserting
+    # only on the printed sheet id would prove the right id was reported, not
+    # that it was the one read.
+    grids = {
+        "REAL_SHEET_ID": _live_grid(),
+        "TEST_SHEET_ID": _synced_grid([
+            ["REHEARSAL TITLE", "photo1.jpg", "lcps-astoriaphotos-00001",
+             "2026-08-23T16:13:31Z",
+             "https://archive.org/details/lcps-astoriaphotos-00001", "photo1.jpg"],
+        ]),
+    }
+    monkeypatch.setattr(
+        "ia_bulk.build_sheet_client",
+        lambda config, live: FakeSheetClient(grids[config.sheet_id_for(live)]),
+    )
+    sent = []
+    monkeypatch.setattr(
+        "ia_bulk.update_metadata_row",
+        lambda metadata, target: sent.append((target, metadata)),
+    )
+
+    cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, live=True))
+    out = capsys.readouterr().out
+
+    assert "live mode" in out
+    assert "REAL_SHEET_ID" in out
+    assert "TEST_SHEET_ID" not in out
+    # the metadata that went out came from the REAL Sheet
+    assert sent[0][1]["title"] == "Stone Customshouse"
+    assert sent[0][1]["title"] != "REHEARSAL TITLE"
+
+
+def test_sync_from_sheet_live_records_the_mode_in_its_log(tmp_path, monkeypatch):
+    """The log's `live` field is load-bearing, not decoration:
+    _read_log_results filters on it, so a live run recorded as a test run
+    would let a test-mode log answer for real items later."""
+    from ia_bulk import cmd_sync_metadata
+
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, _live_grid(), sent)
+
+    cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, live=True))
+
+    log_file = next((tmp_path / "logs").glob("sync-metadata-*.jsonl"))
+    entries = [
+        json.loads(line)
+        for line in log_file.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    header = [e for e in entries if e.get("record") == "run_header"]
+    rows = [e for e in entries if e.get("record") != "run_header"]
+
+    assert header and header[0]["live"] is True
+    assert [e["status"] for e in rows] == ["success"]
+    assert all(e["live"] is True for e in rows)
+    assert rows[0]["uploaded_as"] == "lcps-astoriaphotos-00001"
+
+
+def test_sync_from_sheet_live_reports_a_failure_without_claiming_success(
+    tmp_path, monkeypatch, capsys
+):
+    """A refused live edit must not read as a clean run - this is the command
+    whose failures are least recoverable."""
+    from ia_bulk import cmd_sync_metadata
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path))), encoding="utf-8"
+    )
+    client = FakeSheetClient(_live_grid())
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: client)
+
+    def refused(metadata, target):
+        raise RuntimeError("Access Denied - This item has been taken offline")
+
+    monkeypatch.setattr("ia_bulk.update_metadata_row", refused)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path, live=True))
+    out = capsys.readouterr().out
+
+    assert "    - Access Denied - This item has been taken offline" in out
+    assert "0 item(s) updated successfully, 0 unchanged, 1 error(s)" in out
+    assert exit_code == 1
