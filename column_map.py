@@ -52,10 +52,14 @@ class ColumnMap:
     held_back: list[str]
 
     def uploadable_fields(self) -> list[str]:
+        # held_back is scanned as a set: as a plain list membership test this
+        # was O(headers x held_back) on every call, and SheetUploadRun calls
+        # it once per run over a real Sheet's full header row.
+        held_back = set(self.held_back)
         return [
             self.field_names[header]
             for header in self.headers
-            if header not in self.held_back
+            if header not in held_back
             and self.field_names[header] not in RESERVED_FIELDS
         ]
 

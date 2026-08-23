@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import re
 import sys
@@ -35,11 +36,10 @@ from column_map import (
     template_fields,
 )
 from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
-from identifiers import RowState, classify_row, next_identifiers
+from identifiers import RowState, classify_row, next_identifiers, parse_identifier
 from project_config import ProjectConfig, load_project_config
 from sheet_client import CellUpdate, SheetClient, column_letter
 
-IDENTIFIER_RE = re.compile(r"^[a-z0-9]+-[a-z0-9]+-\d{5}$")
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
 # Deliberately excludes "identifier" only - do not "fix" this back to
 # REQUIRED_UPLOAD_COLUMNS, and do not add "identifier" back either.
@@ -177,12 +177,16 @@ def check_identifier(
         return [f"missing required column '{column_name}'"]
 
     errors: list[str] = []
-    if not IDENTIFIER_RE.match(identifier):
+    # identifiers.parse_identifier is the single decoder for the scheme - see
+    # its docstring for why this file no longer carries a second copy of the
+    # pattern.
+    parsed = parse_identifier(identifier)
+    if parsed is None:
         errors.append(
             f"{column_name} '{identifier}' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
         )
     else:
-        collection_key, project_id, _number = identifier.split("-")
+        collection_key, project_id, _number = parsed
         known_prefix = collection_key == registry.get("collection_key") and project_id in registry.get(
             "projects", {}
         )
@@ -1011,17 +1015,6 @@ def is_rate_limit_error(exc: Exception) -> bool:
     return status_code in RATE_LIMIT_STATUS_CODES
 
 
-class RateLimited(Exception):
-    """Marks an upload failure as Internet Archive's rate limit rather than
-    an ordinary per-row error. Nothing ever raises or catches this - despite
-    the name, it is never thrown. SheetUploadRun.execute() CONSTRUCTS one
-    (reassigning it to the local `exc`) once is_rate_limit_error() has
-    already matched the original exception, then checks `isinstance(exc,
-    RateLimited)` to decide whether to stop the whole run or log this row
-    and continue - a plain marker object checked by type, not a control-flow
-    signal raised up the stack."""
-
-
 class UploadFailed(RuntimeError):
     """Raised by upload_row() below when internetarchive.upload() returns a
     not-ok Response. Subclasses RuntimeError (rather than plain Exception)
@@ -1350,7 +1343,7 @@ def cmd_validate(args) -> int:
     if csv_path is not None:
         data = read_csv(csv_path)
         registry = load_registry(args.registry)
-        results = header_validation(data.fieldnames) + validate_rows(
+        results = header_validation(data.fieldnames) + validate_csv_rows(
             data.rows, args.files_dir, registry
         )
         print(format_report(results))
@@ -1488,38 +1481,45 @@ def run_rows(
     describe,
     file_value_for,
 ) -> dict[str, int]:
-    """Shared chunk/progress/log-and-count loop for cmd_upload and
+    """Shared progress/log-and-count loop for cmd_upload and
     cmd_sync_metadata - they differ only in how a row is processed, how its
     progress line reads, and what (if anything) goes in the log's file
     field. process_row(row, target_identifier) may raise MetadataUnchanged
     to count as "unchanged" rather than "failure".
 
+    Deliberately a flat loop. This used to iterate chunk_rows(rows) and then
+    the rows within each chunk, which was exactly equivalent - nothing
+    happened at a chunk boundary, no pause, no batched write - while implying
+    a batching guarantee this path does not have. SheetUploadRun.execute()
+    chunks for a real reason (a reserve and a confirm write per chunk, and a
+    re-read of the Sheet between them); there is no equivalent here, which is
+    why --chunk-size is rejected on the --csv path rather than honored.
+
     `stamp` is computed once by the caller (run_stamp(), called once per
     command invocation) and passed in rather than computed here, so every row
-    this run touches - across every chunk - shares one stamp. See
-    run_stamp()'s docstring for why that matters."""
+    this run touches shares one stamp. See run_stamp()'s docstring for why
+    that matters."""
     total = len(rows)
     counts = {"success": 0, "unchanged": 0, "failure": 0}
     position = 0
-    for chunk in chunk_rows(rows):
-        for row in chunk:
-            position += 1
-            identifier = row["identifier"].strip()
-            target_identifier = effective_identifier(identifier, live, stamp)
-            file_value = file_value_for(row)
-            print(f"[{position}/{total}] {action} {describe(row, target_identifier)}")
-            try:
-                process_row(row, target_identifier)
-                counts["success"] += 1
-                log_result(log_path, identifier, file_value, "success", live, uploaded_as=target_identifier)
-            except MetadataUnchanged:
-                counts["unchanged"] += 1
-                log_result(log_path, identifier, file_value, "unchanged", live, uploaded_as=target_identifier)
-            except Exception as exc:
-                counts["failure"] += 1
-                log_result(
-                    log_path, identifier, file_value, "failure", live, error=str(exc), uploaded_as=target_identifier
-                )
+    for row in rows:
+        position += 1
+        identifier = row["identifier"].strip()
+        target_identifier = effective_identifier(identifier, live, stamp)
+        file_value = file_value_for(row)
+        print(f"[{position}/{total}] {action} {describe(row, target_identifier)}")
+        try:
+            process_row(row, target_identifier)
+            counts["success"] += 1
+            log_result(log_path, identifier, file_value, "success", live, uploaded_as=target_identifier)
+        except MetadataUnchanged:
+            counts["unchanged"] += 1
+            log_result(log_path, identifier, file_value, "unchanged", live, uploaded_as=target_identifier)
+        except Exception as exc:
+            counts["failure"] += 1
+            log_result(
+                log_path, identifier, file_value, "failure", live, error=str(exc), uploaded_as=target_identifier
+            )
     return counts
 
 
@@ -1797,7 +1797,7 @@ def split_moved_targets(
 
 
 def sheet_upload_metadata(
-    target: UploadTarget, column_map: ColumnMap, mediatype: str
+    target: UploadTarget, uploadable: frozenset[str], mediatype: str
 ) -> dict[str, str]:
     """The row dict handed to upload_row on the Sheet path.
 
@@ -1806,7 +1806,10 @@ def sheet_upload_metadata(
     tool's own bookkeeping columns and anything a Sheet author marked (LCPS
     Internal) have to be filtered out HERE, before upload_row ever sees them.
     ColumnMap.uploadable_fields() is the single definition of what may be
-    uploaded and already excludes both.
+    uploaded and already excludes both. It is passed in already computed
+    (see SheetUploadRun.uploadable) rather than derived here: the column map
+    is fixed for the whole run, and rebuilding the set per row made a
+    10,000-row upload rebuild it 10,000 times.
 
     `identifier-bib` and `mediatype` are generated rather than read from a
     column - see docs/DECISIONS.md, "`identifier-bib` and `mediatype` are
@@ -1814,7 +1817,6 @@ def sheet_upload_metadata(
     zztest-lcps-sarahsoldphotos-00005 carries a permanently misspelled
     `indentifier-bib` because a header typo shipped once; a generated field
     name cannot do that."""
-    uploadable = set(column_map.uploadable_fields()) - DROPPED_BY_UPLOAD_ROW
     metadata_row = {key: value for key, value in target.row.items() if key in uploadable}
     metadata_row["mediatype"] = mediatype
     metadata_row["identifier-bib"] = target.identifier_bib
@@ -1939,6 +1941,18 @@ class SheetUploadRun:
     # test's own monkeypatched value).
     chunk_size: int = CHUNK_SIZE
 
+    @functools.cached_property
+    def uploadable(self) -> frozenset[str]:
+        """Which normalized field names may be sent as IA metadata.
+
+        Computed once per run, not once per row. The column map is fixed for
+        the whole run - it is a field on this dataclass - so deriving this
+        inside sheet_upload_metadata() meant a 10,000-row upload rebuilding
+        the same set 10,000 times. cached_property works on a frozen
+        dataclass because it writes through __dict__ rather than
+        __setattr__."""
+        return frozenset(self.column_map.uploadable_fields()) - DROPPED_BY_UPLOAD_ROW
+
     def execute(self, targets: list[UploadTarget]) -> dict[str, int]:
         """One chunk at a time: verify, reserve, upload, verify, confirm,
         having logged each row's outcome as it happened.
@@ -1958,7 +1972,7 @@ class SheetUploadRun:
         A rate-limited row (is_rate_limit_error() matches its exception)
         stops the run after finishing this chunk's confirm write, rather
         than being logged as an ordinary failure and moving on to the next
-        target - see RateLimited's docstring. Every row this run already
+        target. Every row this run already
         uploaded successfully, in this chunk or an earlier one, is still
         confirmed before returning: a rate limit must not leave a row
         RESERVED-but-unconfirmed, which would make tomorrow's run re-upload
@@ -1999,22 +2013,18 @@ class SheetUploadRun:
                 print(f"[{position}/{total}] uploading {target.uploaded_as} ({target.row['file']})")
                 try:
                     upload_row(
-                        sheet_upload_metadata(target, self.column_map, self.mediatype),
+                        sheet_upload_metadata(target, self.uploadable, self.mediatype),
                         target.uploaded_as,
                         self.collection,
                         self.files_dir,
                     )
                 except Exception as exc:
-                    # Wrapping (rather than a bare is_rate_limit_error() check
-                    # here) keeps the detection logic in one place and makes
-                    # the `except RateLimited` below the only thing that can
-                    # stop the run - str(exc) is unchanged either way, so the
-                    # logged message is identical to an ordinary failure's.
-                    if is_rate_limit_error(exc):
-                        exc = RateLimited(str(exc))
+                    # A rate limit is logged as an ordinary failure - the
+                    # message is the server's either way - and additionally
+                    # ends the run after this chunk's confirm write.
                     counts["failure"] += 1
                     self._log(target, "failure", error=str(exc))
-                    if isinstance(exc, RateLimited):
+                    if is_rate_limit_error(exc):
                         rate_limited = True
                         break
                     continue

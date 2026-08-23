@@ -5,6 +5,7 @@ from identifiers import (
     classify_row,
     format_identifier,
     next_identifiers,
+    parse_identifier,
     parse_number,
 )
 
@@ -142,3 +143,36 @@ def test_next_identifiers_raises_when_maximum_exhausted():
 
     with pytest.raises(ValueError, match="exceeds 5-digit maximum"):
         next_identifiers(existing, "lcps", "sarasoldphotos", 1)
+
+
+def test_parse_identifier_splits_a_well_formed_identifier():
+    assert parse_identifier("lcps-sarasoldphotos-00042") == ("lcps", "sarasoldphotos", 42)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "lcps-sarasoldphotos-42",       # not zero-padded to NUMBER_WIDTH
+        "lcps-sarasoldphotos-000042",   # too wide
+        "LCPS-sarasoldphotos-00042",    # scheme is lowercase
+        "lcps_sarasoldphotos_00042",    # wrong separator
+        "CD 1 01 53 58 1 Central SS",   # a donor archival reference
+        "",
+    ],
+)
+def test_parse_identifier_returns_none_for_anything_off_scheme(bad):
+    assert parse_identifier(bad) is None
+
+
+def test_parse_identifier_tolerates_surrounding_whitespace():
+    """Sheet cells routinely carry a stray space."""
+    assert parse_identifier("  lcps-sarasoldphotos-00042  ") == ("lcps", "sarasoldphotos", 42)
+
+
+def test_parse_number_and_parse_identifier_agree():
+    """parse_number is expressed in terms of parse_identifier so the scheme
+    is decoded in exactly one place - ia_bulk.py used to carry a second copy
+    of the pattern with NUMBER_WIDTH's 5 hardcoded into it."""
+    for identifier in ("lcps-sarasoldphotos-00042", "not-an-identifier"):
+        parsed = parse_identifier(identifier)
+        assert parse_number(identifier) == (parsed[2] if parsed else None)

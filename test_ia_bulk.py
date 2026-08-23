@@ -36,7 +36,6 @@ from ia_bulk import (
     main,
     CHUNK_SIZE,
     is_rate_limit_error,
-    RateLimited,
     UploadFailed,
 )
 from project_config import ProjectConfig
@@ -4999,20 +4998,6 @@ def test_is_rate_limit_error_reads_the_structured_status_from_requests_httperror
     assert is_rate_limit_error(exc) is True
 
 
-def test_rate_limited_carries_the_original_message():
-    """RateLimited is the documented public interface's second half: a
-    dedicated exception type SheetUploadRun.execute() raises internally once
-    is_rate_limit_error() has already matched, so the rest of that method can
-    tell 'stop the whole run' from 'log this row and continue' by type
-    rather than re-running the detector a second time. str() is unchanged
-    from the original exception, so a rate-limited row's logged error message
-    reads identically to an ordinary failure's."""
-    assert issubclass(RateLimited, Exception)
-    original = RuntimeError("failed with status 503: SlowDown")
-    wrapped = RateLimited(str(original))
-    assert str(wrapped) == str(original)
-
-
 def test_cmd_upload_limit_stops_after_n_planned_targets(tmp_path, monkeypatch, capsys):
     """--limit counts PLANNED upload targets (valid, ready, not already
     done) - not Sheet rows scanned. Five ready, unassigned rows with
@@ -6252,3 +6237,42 @@ def test_cmd_upload_refuses_a_csv_run_over_the_daily_item_cap(tmp_path, monkeypa
     assert "would upload 2 items, over Internet Archive's 1/day cap" in err
     assert "Split it" in err
     assert exit_code == 1
+
+
+def test_sheet_upload_run_computes_the_uploadable_set_once_per_run(tmp_path):
+    """The column map is fixed for a whole run, so deriving the uploadable
+    set inside sheet_upload_metadata meant a 10,000-row upload rebuilding the
+    same set 10,000 times, each rebuild scanning every header."""
+    from column_map import build_column_map
+    from ia_bulk import SheetColumns, SheetUploadRun
+    from sheet_client import SheetClient
+
+    column_map = build_column_map(["Title", "file", "Notes (LCPS Internal)"])
+    calls = {"n": 0}
+    real = column_map.uploadable_fields
+
+    def counting_uploadable_fields():
+        calls["n"] += 1
+        return real()
+
+    object.__setattr__(column_map, "uploadable_fields", counting_uploadable_fields)
+
+    run = SheetUploadRun(
+        # never touched: `uploadable` reads only the column map
+        client=SheetClient(None, "SHEET_ID", "Sheet1"),
+        columns=SheetColumns(ia_identifier=2, ia_uploaded=3, ia_url=4, ia_identifier_bib=5),
+        column_map=column_map,
+        mediatype="image",
+        file_template="{file}",
+        files_dir=str(tmp_path),
+        collection="test_collection",
+        live=False,
+        write_back=False,
+        log_path=tmp_path / "log.jsonl",
+    )
+
+    first = run.uploadable
+    second = run.uploadable
+
+    assert first == second == frozenset({"title"})
+    assert calls["n"] == 1

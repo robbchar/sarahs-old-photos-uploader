@@ -25,9 +25,25 @@ def format_identifier(collection_key: str, project_id: str, number: int) -> str:
     return f"{collection_key}-{project_id}-{number:0{NUMBER_WIDTH}d}"
 
 
-def parse_number(identifier: str) -> int | None:
+def parse_identifier(identifier: str) -> tuple[str, str, int] | None:
+    """(collection_key, project_id, number), or None if `identifier` does not
+    match the scheme.
+
+    The one place the scheme is decoded. ia_bulk.py used to carry its own
+    copy of the pattern for the same job, including a literal `\\d{5}` that
+    NUMBER_WIDTH here parameterizes - so widening the scheme (which
+    format_identifier tells you to do once a project exhausts 99999) would
+    have left that copy rejecting every new identifier as malformed, failing
+    a whole Sheet for a reason that is not real."""
     match = _IDENTIFIER_RE.match(identifier.strip())
-    return int(match.group("number")) if match else None
+    if match is None:
+        return None
+    return match.group("collection"), match.group("project"), int(match.group("number"))
+
+
+def parse_number(identifier: str) -> int | None:
+    parsed = parse_identifier(identifier)
+    return parsed[2] if parsed else None
 
 
 def next_identifiers(
