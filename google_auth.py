@@ -49,7 +49,8 @@ def load_credentials(
             # entirely, e.g. a JSON list or string instead of an object.
             raise AuthUnavailable(
                 f"the cached token at {token_path} is unreadable ({exc}). Delete "
-                "it and re-run 'python ia_bulk.py auth' to re-authorize."
+                "it and re-run any command (for example 'python ia_bulk.py validate "
+                "--project <id>') from a terminal to re-authorize."
             ) from exc
 
     if credentials and credentials.valid:
@@ -72,7 +73,8 @@ def load_credentials(
         raise AuthUnavailable(
             "Google authorization is needed but this run is not attached to a "
             "terminal, so the browser consent flow cannot be shown. Run "
-            "'python ia_bulk.py auth' from a terminal first."
+            "any command (for example 'python ia_bulk.py validate --project <id>') "
+            "from a terminal first to complete it."
         )
 
     if not client_secrets_path.exists():

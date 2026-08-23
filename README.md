@@ -262,7 +262,10 @@ Other behavior, both paths:
 
 ### `sync-metadata` — update metadata on already-uploaded items
 
-`--project` is required here too, for the same reason as `upload`.
+`--project` is required on the command line for consistency with the other
+two commands, but `sync-metadata` never reads it: the CSV's own columns are
+what gets sent, and `check_identifier` validates identifiers against every
+project in the registry rather than the one named here.
 
 ```bash
 python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos

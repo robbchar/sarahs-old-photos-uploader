@@ -1296,7 +1296,7 @@ def cmd_validate(args) -> int:
             f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
             f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
             "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
-            "been shared with the service account.",
+            "been shared with the Google account you authorized as.",
             file=sys.stderr,
         )
         return 1
@@ -1315,7 +1315,7 @@ def cmd_validate(args) -> int:
         # A dedicated branch, not just another row-1 structural error: an
         # empty read is far more likely to mean a wrong tab name, an
         # unpopulated copy of the Sheet, or a Sheet never actually shared
-        # with the service account than a real project with zero rows, and
+        # with the account you authorized as than a real project with zero rows, and
         # reporting that as success would defeat the entire purpose of
         # running `validate`. Handled separately from the normal report
         # (rather than folded into sheet_structure_validation's row-1
@@ -2250,7 +2250,7 @@ def upload_from_sheet(args) -> int:
             f"could not read spreadsheet '{sheet_id}' tab '{config.sheet_tab}': {exc}. Check "
             f"that 'sheet_tab' in {args.registry} names the tab exactly (case-sensitive) as it "
             "appears in the Sheet, that the spreadsheet ID is correct, and that the Sheet has "
-            "been shared with the service account.",
+            "been shared with the Google account you authorized as.",
             file=sys.stderr,
         )
         return 1
