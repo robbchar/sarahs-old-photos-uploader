@@ -312,7 +312,11 @@ neither uploads nor changes metadata. `survey_files()` resolves every row
 against `files_dir` the same way `resolve_sheet_files()` does, and returns
 a `FileSurvey` splitting the result into `claimed` (every disk file some
 row currently resolves to) and `unclaimed` (every file matching the
-project's `photo_extensions`, in a row's own folder, that no row claims) —
+project's `photo_extensions`, in a row's own folder, that no row claims;
+both keyed through `claim_key()`, so two rows spelling one folder
+differently — `SOP CD 1` and `sop cd 1`, one folder on a case-insensitive
+filesystem — cannot end up in two disjoint namespaces with the duplicate
+check missing between them) —
 plus `unresolved`/`wanted`, the row numbers that failed and what each
 one's filename cell said. A row whose `file_template` cells are blank is
 counted in `not_ready` and appears in none of the other three: it asserted

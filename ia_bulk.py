@@ -9,6 +9,7 @@ import argparse
 import csv
 import functools
 import json
+import os
 import re
 import sys
 import time
@@ -1269,6 +1270,25 @@ class FileSurvey:
     not_ready: list[int]
 
 
+def claim_key(folder_and_name: str) -> str:
+    """The one spelling of "some row has already taken this file".
+
+    `claimed` holds `<folder cell as typed>/<real disk name>`: the name half
+    comes back from resolve_file() exactly as it is on disk, but the folder
+    half is whatever the Sheet cell said. On Windows - a case-insensitive
+    filesystem - `SOP CD 1` and `sop cd 1` are ONE folder holding ONE
+    photograph, so keyed by the raw cell those two rows get two disjoint
+    namespaces and the check that stops two rows being pointed at one file
+    silently misses. os.path.normcase folds exactly the differences the
+    local filesystem itself ignores, and nothing at all on a case-sensitive
+    one, where two such folders really are two folders.
+
+    Every producer and every consumer of `claimed` goes through here: a set
+    half of whose members are normalized is worse than one that is not
+    normalized at all."""
+    return os.path.normcase(folder_and_name)
+
+
 def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurvey:
     """Resolve every row, then work out which files nothing points at.
 
@@ -1308,7 +1328,15 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
         # scan whose result nothing reads.
         folders.add(folder)
         try:
-            claimed.add(resolve_file(config.files_dir, candidate_path(config.file_template, row), listing_cache))
+            claimed.add(
+                claim_key(
+                    resolve_file(
+                        config.files_dir,
+                        candidate_path(config.file_template, row),
+                        listing_cache,
+                    )
+                )
+            )
         except FileResolutionError:
             unresolved[row_number] = folder
             wanted[row_number] = (row.get(name_field) or "").strip()
@@ -1323,7 +1351,7 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
             for entry in directory.iterdir()
             if entry.is_file()
             and entry.suffix.lower() in config.photo_extensions
-            and f"{folder}/{entry.name}" not in claimed
+            and claim_key(f"{folder}/{entry.name}") not in claimed
         )
     return FileSurvey(
         unresolved=unresolved,
@@ -1391,7 +1419,7 @@ def prompt_for_decision(
                 print(f"           {exc}")
                 continue
             name = resolved.rpartition("/")[2]
-            if resolved in claimed:
+            if claim_key(resolved) in claimed:
                 print(f"           '{name}' is already used by another row")
                 continue
             return Decision(action="accept", filename=name)
@@ -3481,7 +3509,7 @@ def cmd_reconcile_files(args) -> int:
         # own docstring promises cannot happen.
         candidates = [
             name for name in survey.unclaimed.get(folder, [])
-            if f"{folder}/{name}" not in survey.claimed
+            if claim_key(f"{folder}/{name}") not in survey.claimed
         ]
         try:
             proposal = propose_match(wanted, candidates)
@@ -3515,7 +3543,7 @@ def cmd_reconcile_files(args) -> int:
             continue
 
         accepted += 1
-        survey.claimed.add(f"{folder}/{decision.filename}")
+        survey.claimed.add(claim_key(f"{folder}/{decision.filename}"))
         pending.append(
             CellUpdate(f"{column_letter(name_column)}{row_number}", decision.filename)
         )

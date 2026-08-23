@@ -20,6 +20,7 @@ from ia_bulk import (
     check_identifier,
     check_required_for_upload,
     resolve_sheet_files,
+    claim_key,
     survey_files,
     validate_rows,
     validate_sheet_grid,
@@ -390,7 +391,7 @@ def test_survey_files_separates_resolved_rows_from_unresolved(tmp_path):
 
     assert survey.unresolved == {3: "SOP CD 1"}
     assert survey.wanted == {3: "Finnis Meat Market.jpg"}
-    assert survey.claimed == {"SOP CD 1/Good.jpg"}
+    assert survey.claimed == {claim_key("SOP CD 1/Good.jpg")}
     # the resolved file is not offered as a candidate, and the PDF is excluded
     assert survey.unclaimed == {"SOP CD 1": ["Finnish Meat Market.jpg"]}
 
@@ -406,6 +407,28 @@ def test_survey_files_files_a_blank_filename_cell_as_not_ready_not_unresolved(tm
     assert survey.unresolved == {}
     assert survey.wanted == {}
     assert survey.not_ready == [2]
+
+
+def test_survey_files_claims_one_file_once_across_case_divergent_folder_cells(tmp_path):
+    """`SOP CD 1` and `sop cd 1` are one folder on a case-insensitive
+    filesystem. Keyed by the raw folder cell the two rows get two disjoint
+    namespaces, the file a resolved row already claims still shows up as
+    unclaimed under the other spelling, and two rows can be pointed at one
+    photograph."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Good.jpg").write_bytes(b"x")
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Good.jpg"},
+        {"folder": "sop cd 1", "name": "Finnis Meat Market.jpg"},
+    ]
+
+    survey = survey_files(rows, config)
+
+    assert "Good.jpg" not in survey.unclaimed.get("sop cd 1", [])
 
 
 def test_survey_files_lists_an_uppercase_extension_as_a_candidate(tmp_path):
@@ -7339,7 +7362,7 @@ def test_prompt_refuses_a_typed_name_another_row_already_claims(tmp_path, capsys
     answers = iter(["e", "Taken", "e", "Free"])
     decision = prompt_for_decision(
         3, "SOP CD 1", "Finnis.jpg", None, [], config,
-        {"SOP CD 1/Taken.jpg"}, read_line=lambda _: next(answers),
+        {claim_key("SOP CD 1/Taken.jpg")}, read_line=lambda _: next(answers),
     )
     assert decision.filename == "Free.jpg"
     assert "already" in capsys.readouterr().out.lower()
@@ -7473,6 +7496,36 @@ def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch)
     cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
 
     assert written == []
+
+
+def test_cmd_reconcile_files_refuses_one_file_for_two_case_divergent_folder_cells(tmp_path, monkeypatch):
+    """Two rows naming one photograph mint two permanent identifiers for one
+    image. On Windows `SOP CD 1` and `sop cd 1` are the same folder, so
+    unless both sides of the claimed check are normalized the second row is
+    proposed - and accepts - the file the first row just took."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    def accept_whatever_is_proposed(row_number, folder, wanted, proposal, candidates, config, claimed):
+        if proposal is None:
+            return Decision(action="reject", filename="")
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["sop cd 1", "Finnish Meet Market.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", accept_whatever_is_proposed)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+    assert exit_code == 0
 
 
 def test_cmd_reconcile_files_never_prompts_about_an_uncatalogued_row(tmp_path, monkeypatch, capsys):
