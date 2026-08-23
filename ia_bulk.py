@@ -848,32 +848,30 @@ def log_result(
         f.write(json.dumps(entry) + "\n")
 
 
-def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
-    """Identifiers logged as success/unchanged in the SAME mode (test vs
-    --live) as this run. A test-mode log entry only ever confirms that the
-    zztest-prefixed item landed in test_collection, never the real one, so
-    it must not be allowed to skip a real --live upload (and vice versa).
-    Logs from before the "live" field existed have no mode recorded and are
-    treated conservatively as not matching either mode. A run_header record
-    (see log_run_header) is skipped explicitly rather than relying on it
-    merely lacking a "status" key - the header schema is free to grow a
-    "status"-named field of its own later without silently turning this into
-    a bug.
+def _read_log_results(log_path: str | Path, live: bool) -> list[dict]:
+    """Every row-result record in a prior run's log, for the SAME mode (test
+    vs --live) as this run. Damaged lines are skipped and reported.
+
+    Shared by load_prior_successes() and load_uploaded_as(), which ask two
+    different questions of the same records. The mode filter is load-bearing
+    for both: a test-mode entry only ever confirms that the zztest-prefixed
+    item landed in test_collection, never the real one, so it must not answer
+    for a --live run (or vice versa). Logs from before the "live" field
+    existed have no mode recorded and are treated conservatively as matching
+    neither.
 
     A line that will not parse is SKIPPED, not raised on. log_result appends
     one line per row with no atomic write, so a run killed mid-write - Ctrl-C,
     a full disk, a closed laptop - leaves a truncated final line. Raising
-    there made the log permanently unusable as a resume source, which disables
-    the only recovery mechanism the CSV path has using the exact crash it
-    exists to recover from. Every intact line before the damaged one is still
-    a real record and is still honored.
+    there made the log permanently unusable, disabling the only recovery
+    mechanism the CSV path has using the exact crash it exists to recover
+    from. Every intact line before the damaged one is still a real record and
+    is still honored.
 
     Damaged lines are counted and reported on stderr rather than skipped in
-    silence: a lost line means an identifier that DID upload is no longer
-    known to have, so the resumed run will attempt it again. That is safe -
-    Internet Archive matches on MD5 and will not duplicate the file - but the
-    operator should know why the run is longer than they expected."""
-    successes: set[str] = set()
+    silence: a lost line is a row this run no longer knows anything about, and
+    the operator should know why the run does not match the last one."""
+    results: list[dict] = []
     damaged = 0
     with open(log_path, encoding="utf-8") as f:
         for line in f:
@@ -882,16 +880,21 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
                 continue
             try:
                 entry = json.loads(line)
+                # A run_header is skipped explicitly rather than by merely
+                # lacking a "status" key - the header schema is free to grow a
+                # "status"-named field of its own later without silently
+                # turning this into a bug.
                 if entry.get("record") == "run_header":
                     continue
-                if entry.get("status") in ("success", "unchanged") and entry.get("live") == live:
-                    # A record with no identifier cannot skip anything, and is
-                    # damage of the same kind as a line that will not parse.
-                    identifier = entry.get("identifier")
-                    if not identifier:
-                        damaged += 1
-                        continue
-                    successes.add(identifier)
+                if entry.get("live") != live:
+                    continue
+                # A record naming no identifier cannot answer either caller's
+                # question, and is damage of the same kind as a line that will
+                # not parse.
+                if not entry.get("identifier"):
+                    damaged += 1
+                    continue
+                results.append(entry)
             except (json.JSONDecodeError, AttributeError):
                 # AttributeError covers a line that parses as valid JSON of the
                 # wrong shape entirely - a bare list or string has no .get().
@@ -900,12 +903,47 @@ def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
     if damaged:
         print(
             f"{_pluralize(damaged, 'line')} in {log_path} could not be read and were skipped - "
-            "the log is damaged, most likely truncated by a run that was killed mid-write. Any "
-            "row recorded on those lines will be attempted again; Internet Archive matches on "
-            "MD5, so an already-uploaded file is not duplicated.",
+            "the log is damaged, most likely truncated by a run that was killed mid-write.",
             file=sys.stderr,
         )
-    return successes
+    return results
+
+
+def load_prior_successes(log_path: str | Path, live: bool) -> set[str]:
+    """Identifiers logged as success/unchanged in the same mode as this run,
+    for --resume-from to skip. See _read_log_results() for the mode filter and
+    the damaged-line handling."""
+    return {
+        entry["identifier"]
+        for entry in _read_log_results(log_path, live)
+        if entry.get("status") in ("success", "unchanged")
+    }
+
+
+def load_uploaded_as(log_path: str | Path, live: bool) -> dict[str, str]:
+    """Real identifier -> the identifier that run actually sent to Internet
+    Archive.
+
+    In test mode the two differ: effective_identifier() prepends
+    `zztest-<that run's stamp>-`, and the stamp is unique per invocation (see
+    run_stamp()). Any later command that re-derives the target with its OWN
+    stamp therefore names an item that has never existed - which is precisely
+    what made test-mode sync-metadata impossible before this existed. The log's
+    `uploaded_as` field is the only record of which stamped item a row's files
+    actually went to, so it is read rather than recomputed.
+
+    Entries with no `uploaded_as` are skipped rather than counted as damage:
+    upload_from_csv writes a "carried over from resumed log" success record per
+    skipped identifier, and those legitimately name no target.
+
+    Later entries win, which is what a resumed run needs: a row re-uploaded
+    under a second stamp is on Internet Archive under the LATER one, and that
+    is the item to correct."""
+    return {
+        entry["identifier"]: entry["uploaded_as"]
+        for entry in _read_log_results(log_path, live)
+        if entry.get("status") in ("success", "unchanged") and entry.get("uploaded_as")
+    }
 
 
 def run_stamp() -> str:
@@ -1480,6 +1518,7 @@ def run_rows(
     process_row,
     describe,
     file_value_for,
+    targets: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Shared progress/log-and-count loop for cmd_upload and
     cmd_sync_metadata - they differ only in how a row is processed, how its
@@ -1498,14 +1537,25 @@ def run_rows(
     `stamp` is computed once by the caller (run_stamp(), called once per
     command invocation) and passed in rather than computed here, so every row
     this run touches shares one stamp. See run_stamp()'s docstring for why
-    that matters."""
+    that matters.
+
+    `targets` maps a real identifier to the one to send, for a caller that
+    must NOT re-derive it - sync-metadata corrects items an earlier run
+    created, and in test mode those carry that run's stamp, not this one's
+    (see load_uploaded_as()). When it is passed, every row is guaranteed to
+    be in it: cmd_sync_metadata rejects the whole file up front otherwise,
+    rather than letting a miss fall back to a recomputed target that names
+    an item which has never existed."""
     total = len(rows)
     counts = {"success": 0, "unchanged": 0, "failure": 0}
     position = 0
     for row in rows:
         position += 1
         identifier = row["identifier"].strip()
-        target_identifier = effective_identifier(identifier, live, stamp)
+        target_identifier = (
+            targets[identifier] if targets is not None
+            else effective_identifier(identifier, live, stamp)
+        )
         file_value = file_value_for(row)
         print(f"[{position}/{total}] {action} {describe(row, target_identifier)}")
         try:
@@ -2639,20 +2689,86 @@ def upload_from_sheet(args) -> int:
     )
 
 
+def check_uploaded_as(
+    rows: list[dict[str, str]],
+    targets: dict[str, str],
+    skip_identifiers: frozenset[str],
+    log_path: str,
+) -> list[RowValidation]:
+    """Rows whose identifier the --from-log upload log does not record as
+    having been uploaded.
+
+    A miss is an error, never a fall back to recomputing the target. In test
+    mode recomputing is the exact bug --from-log exists to fix, and it fails
+    SILENTLY: modify_metadata() is sent to a stamped identifier that has never
+    existed, so the run reports failures whose message says nothing about the
+    real cause. Reported per row, before anything is sent, so a wrong CSV is
+    fixed in one pass.
+
+    A blank identifier is skipped here - validate_identifiers already reports
+    it as a missing required column, and two messages for one cell reads as
+    two problems."""
+    results: list[RowValidation] = []
+    for offset, row in enumerate(rows):
+        identifier = (row.get("identifier") or "").strip()
+        if not identifier or identifier in skip_identifiers or identifier in targets:
+            continue
+        results.append(
+            RowValidation(
+                row_number=offset + 2,
+                identifier=identifier,
+                errors=[
+                    f"'{identifier}' is not recorded as uploaded in {log_path} - "
+                    "sync-metadata can only correct an item an upload run actually created"
+                ],
+            )
+        )
+    return results
+
+
 def cmd_sync_metadata(args) -> int:
     data = read_csv(args.csv)
     rows = data.rows
     registry = load_registry(args.registry)
+    live = bool(args.live)
+    from_log = getattr(args, "from_log", None)
+
+    # Every test item carries the stamp of the run that created it, and a
+    # stamp is unique per invocation (see run_stamp()), so the CSV alone
+    # cannot say which zztest- item a row's metadata belongs to. Deriving it
+    # here with THIS run's stamp named an item that has never existed and
+    # failed every row - a rehearsal mode that cannot rehearse. --from-log
+    # names the upload run being corrected; its `uploaded_as` field is the
+    # only record of that mapping. Live identifiers are unstamped, so the
+    # flag is optional there.
+    if not live and not from_log:
+        print(
+            "sync-metadata needs --from-log <upload log> in test mode. A test item is named "
+            "zztest-<stamp>-<identifier>, where the stamp is unique to the run that created "
+            "it, so the CSV alone cannot say which items to correct. Pass the log written by "
+            "the upload run you are correcting, or pass --live to target the real, unstamped "
+            "identifiers.",
+            file=sys.stderr,
+        )
+        return 1
+
+    targets: dict[str, str] | None = None
+    if from_log:
+        targets = load_uploaded_as(from_log, live)
 
     skip_identifiers: set[str] = set()
     if args.resume_from:
-        skip_identifiers = load_prior_successes(args.resume_from, args.live)
+        skip_identifiers = load_prior_successes(args.resume_from, live)
 
     to_sync = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
     validation_results = header_validation(data.fieldnames) + validate_identifiers(
         rows, registry, frozenset(skip_identifiers)
     )
+    if targets is not None:
+        validation_results += check_uploaded_as(
+            rows, targets, frozenset(skip_identifiers), str(from_log)
+        )
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
         print("identifier validation failed; fix the errors above before syncing", file=sys.stderr)
@@ -2660,17 +2776,18 @@ def cmd_sync_metadata(args) -> int:
 
     log_path = open_log(args.log_dir, "sync-metadata")
     for identifier in skip_identifiers:
-        log_result(log_path, identifier, "", "success", args.live, error="carried over from resumed log")
+        log_result(log_path, identifier, "", "success", live, error="carried over from resumed log")
 
     counts = run_rows(
         to_sync,
         log_path,
-        args.live,
+        live,
         run_stamp(),
         action="updating metadata for",
         process_row=lambda row, target: update_metadata_row(row, target),
         describe=lambda row, target: target,
         file_value_for=lambda row: "",
+        targets=targets,
     )
 
     print(f"{counts['success']} item(s) updated successfully, {counts['unchanged']} unchanged, {counts['failure']} error(s)")
@@ -2783,6 +2900,19 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--live", action="store_true", help="Target the real collection instead of test_collection")
     sync_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
     sync_parser.add_argument("--resume-from", default=None, help="Path to a prior log; identifiers marked success there are skipped")
+    sync_parser.add_argument(
+        "--from-log",
+        default=None,
+        help=(
+            "Path to the log of the upload run whose items are being corrected. REQUIRED in "
+            "test mode: a test item is named zztest-<stamp>-<identifier> where the stamp is "
+            "unique to the run that created it, so the CSV alone cannot say which items to "
+            "correct - this log's 'uploaded_as' field is the only record of that mapping. "
+            "Optional with --live, where identifiers are unstamped. Distinct from "
+            "--resume-from, which says which rows to SKIP; this says where the rows that "
+            "remain should be SENT."
+        ),
+    )
 
     return parser
 

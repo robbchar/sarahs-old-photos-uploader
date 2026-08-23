@@ -279,10 +279,26 @@ what gets sent, and `check_identifier` validates identifiers against every
 project in the registry rather than the one named here.
 
 ```bash
-python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos
+# correcting a real, live batch
+python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos --live
+
+# rehearsing against the items a previous test upload created
+python ia_bulk.py sync-metadata updates.csv --project sarasoldphotos --from-log logs/upload-20260823T161331Z.jsonl
 ```
 
-Same chunking/logging/safety-rail behavior as `upload`, but only requires
+**`--from-log` is required in test mode.** A test item is named
+`zztest-<stamp>-<identifier>`, and the stamp is unique to the run that
+created it, so the CSV alone cannot say which items to correct — deriving
+the target from this run's stamp would name an item that has never existed.
+The upload log's `uploaded_as` field is the only record of that mapping, so
+`sync-metadata` reads it rather than recomputing. A row the log does not
+record as uploaded is an error, never a silent fall back. Live identifiers
+are unstamped, so the flag is optional with `--live`.
+
+It is distinct from `--resume-from`: that says which rows to *skip*, this
+says where the rows that remain should be *sent*.
+
+Same logging/safety-rail behavior as `upload`, but only requires
 an `identifier` column plus whichever metadata columns changed — no
 `file`/`mediatype`/`title`/`date` needed. A blank cell means "leave this
 field alone"; to actually delete an existing field on the IA item, put the

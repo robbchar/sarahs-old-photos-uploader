@@ -3317,6 +3317,37 @@ def test_cmd_upload_resume_from_a_test_mode_log_does_not_skip_a_live_run(tmp_pat
     assert uploaded == ["lcps-astoriaphotos-00001"]
 
 
+# The stamp of the *upload* run a sync-metadata test corrects. Deliberately
+# NOT FIXED_STAMP (which run_stamp() is pinned to): a sync run that recomputed
+# the target would produce FIXED_STAMP and name an item that never existed, so
+# keeping the two different is what makes these tests able to fail.
+UPLOAD_RUN_STAMP = "20260819t144907"
+
+
+def write_upload_log(path, identifiers, live=False, stamp=UPLOAD_RUN_STAMP):
+    """A prior upload run's log, in the shape sync-metadata --from-log reads."""
+    prefix = "" if live else f"zztest-{stamp}-"
+    path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "identifier": identifier,
+                    "file": "photo.jpg",
+                    "status": "success",
+                    "error": None,
+                    "uploaded_as": f"{prefix}{identifier}",
+                    "live": live,
+                    "timestamp": "2026-08-19T14:49:07Z",
+                }
+            )
+            for identifier in identifiers
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not_live(tmp_path, monkeypatch):
     from ia_bulk import cmd_sync_metadata
 
@@ -3331,6 +3362,7 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
 
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target_identifier: None)
     monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
+    upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"])
 
     args = Namespace(
         csv=str(csv_path),
@@ -3338,6 +3370,7 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
         live=False,
         log_dir=str(log_dir),
         resume_from=None,
+        from_log=str(upload_log),
     )
 
     exit_code = cmd_sync_metadata(args)
@@ -3347,7 +3380,11 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
     assert len(log_files) == 1
     entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
     assert entry["status"] == "success"
-    assert entry["uploaded_as"] == f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"
+    # The UPLOAD run's stamp, not this run's. Recomputing would give
+    # FIXED_STAMP and name an item that has never existed - which is exactly
+    # what this test asserted, and passed on, before --from-log existed.
+    assert entry["uploaded_as"] == f"zztest-{UPLOAD_RUN_STAMP}-lcps-astoriaphotos-00001"
+    assert FIXED_STAMP not in entry["uploaded_as"]
 
 
 def test_cmd_sync_metadata_treats_no_changes_as_unchanged_not_failure(tmp_path, monkeypatch, capsys):
@@ -3374,6 +3411,10 @@ def test_cmd_sync_metadata_treats_no_changes_as_unchanged_not_failure(tmp_path, 
             raise MetadataUnchanged(target_identifier)
 
     monkeypatch.setattr("ia_bulk.update_metadata_row", fake_update_metadata_row)
+    upload_log = write_upload_log(
+        tmp_path / "upload.jsonl",
+        ["lcps-astoriaphotos-00001", "lcps-astoriaphotos-00002"],
+    )
 
     args = Namespace(
         csv=str(csv_path),
@@ -3381,6 +3422,7 @@ def test_cmd_sync_metadata_treats_no_changes_as_unchanged_not_failure(tmp_path, 
         live=False,
         log_dir=str(log_dir),
         resume_from=None,
+        from_log=str(upload_log),
     )
 
     exit_code = cmd_sync_metadata(args)
@@ -3410,6 +3452,7 @@ def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, 
     )
 
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target_identifier: None)
+    upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"])
 
     args = Namespace(
         csv=str(csv_path),
@@ -3417,6 +3460,7 @@ def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, 
         live=False,
         log_dir=str(tmp_path / "logs"),
         resume_from=None,
+        from_log=str(upload_log),
     )
 
     exit_code = cmd_sync_metadata(args)
@@ -6281,3 +6325,164 @@ def test_sheet_upload_run_computes_the_uploadable_set_once_per_run(tmp_path):
 
     assert first == second == frozenset({"title"})
     assert calls["n"] == 1
+
+
+def _sync_registry(tmp_path):
+    path = tmp_path / "projects_registry.json"
+    path.write_text(json.dumps(make_registry()), encoding="utf-8")
+    return path
+
+
+def test_cmd_sync_metadata_refuses_test_mode_without_from_log(tmp_path, capsys):
+    """Every test item carries the stamp of the run that created it, and a
+    stamp is unique per invocation. Recomputing the target here named an item
+    that has never existed and failed every row - a rehearsal mode that
+    cannot rehearse. Refusing is the only honest answer, since there is no
+    value the CSV could carry that would work."""
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "lcps-astoriaphotos-00001", "title": "T"}])
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(_sync_registry(tmp_path)),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        from_log=None,
+    )
+
+    exit_code = cmd_sync_metadata(args)
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "needs --from-log" in err
+    # No log directory is created: nothing ran.
+    assert not (tmp_path / "logs").exists()
+
+
+def test_cmd_sync_metadata_allows_live_without_from_log(tmp_path, monkeypatch):
+    """Live identifiers are unstamped, so there is nothing to look up."""
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "lcps-astoriaphotos-00001", "title": "T"}])
+    seen = []
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target: seen.append(target))
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(_sync_registry(tmp_path)),
+        live=True,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        from_log=None,
+    )
+
+    assert cmd_sync_metadata(args) == 0
+    assert seen == ["lcps-astoriaphotos-00001"]
+
+
+def test_cmd_sync_metadata_rejects_a_row_the_upload_log_never_uploaded(tmp_path, monkeypatch, capsys):
+    """A miss must never fall back to recomputing the target: that is the bug
+    --from-log exists to fix, and it fails silently by sending
+    modify_metadata to an identifier that has never existed."""
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "title"],
+        [
+            {"identifier": "lcps-astoriaphotos-00001", "title": "Fixed"},
+            {"identifier": "lcps-astoriaphotos-00009", "title": "Never uploaded"},
+        ],
+    )
+    upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"])
+    seen = []
+    monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target: seen.append(target))
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(_sync_registry(tmp_path)),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        from_log=str(upload_log),
+    )
+
+    exit_code = cmd_sync_metadata(args)
+    out = capsys.readouterr().out
+
+    # All-or-nothing, like the rest of the CSV path: nothing is sent.
+    assert seen == []
+    assert exit_code == 1
+    assert "lcps-astoriaphotos-00009" in out
+    assert "is not recorded as uploaded in" in out
+    # row 3 of the CSV, not row 2 - the numbering must survive the check
+    assert "[FAIL] row 3" in out
+
+
+def test_cmd_sync_metadata_ignores_an_upload_log_from_the_other_mode(tmp_path, capsys):
+    """A test-mode log records where a zztest- item went; it says nothing
+    about the real one, and vice versa. Reusing it across modes would send a
+    live correction to a test item, or the reverse."""
+    from ia_bulk import cmd_sync_metadata
+
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "lcps-astoriaphotos-00001", "title": "T"}])
+    # a LIVE log, handed to a TEST-mode run
+    upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"], live=True)
+
+    args = Namespace(
+        csv=str(csv_path),
+        registry=str(_sync_registry(tmp_path)),
+        live=False,
+        log_dir=str(tmp_path / "logs"),
+        resume_from=None,
+        from_log=str(upload_log),
+    )
+
+    assert cmd_sync_metadata(args) == 1
+    assert "is not recorded as uploaded in" in capsys.readouterr().out
+
+
+def test_load_uploaded_as_prefers_the_later_entry_for_a_reuploaded_row(tmp_path):
+    """A row re-uploaded by a resumed run is on Internet Archive under the
+    LATER stamp, so that is the item to correct."""
+    from ia_bulk import load_uploaded_as
+
+    log_path = tmp_path / "upload.jsonl"
+    log_path.write_text(
+        json.dumps({"identifier": "lcps-astoriaphotos-00001", "status": "success",
+                    "uploaded_as": "zztest-first-lcps-astoriaphotos-00001", "live": False})
+        + "\n"
+        + json.dumps({"identifier": "lcps-astoriaphotos-00001", "status": "success",
+                      "uploaded_as": "zztest-second-lcps-astoriaphotos-00001", "live": False})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_uploaded_as(log_path, live=False) == {
+        "lcps-astoriaphotos-00001": "zztest-second-lcps-astoriaphotos-00001"
+    }
+
+
+def test_load_uploaded_as_skips_carried_over_records_that_name_no_target(tmp_path, capsys):
+    """upload_from_csv writes a "carried over from resumed log" success record
+    per skipped identifier, with no uploaded_as. Those are legitimate, not
+    damage, so they must not be counted as a damaged line."""
+    from ia_bulk import load_uploaded_as
+
+    log_path = tmp_path / "upload.jsonl"
+    log_path.write_text(
+        json.dumps({"identifier": "lcps-astoriaphotos-00001", "status": "success",
+                    "uploaded_as": None, "live": False,
+                    "error": "carried over from resumed log"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_uploaded_as(log_path, live=False) == {}
+    assert capsys.readouterr().err == ""

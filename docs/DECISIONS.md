@@ -684,6 +684,50 @@ row's identifier is already in the Sheet — that is what RESERVED means — and
 after the reserve write so are this run's own, so checking either would stop
 every ordinary run on its own writes.
 
+## `sync-metadata` reads its targets from the upload log
+
+*Decided 2026-08-23, closing a defect introduced by the per-run stamp above.*
+
+"Test identifiers carry a per-run stamp" solved rehearsal collisions on
+`upload` and silently broke `sync-metadata`, which nothing noticed because
+that command had never been run.
+
+`cmd_sync_metadata` derived its target the same way `upload` does, by calling
+`effective_identifier()` with `run_stamp()`. But a stamp is unique to the
+invocation, so a correction run computed `zztest-<today's stamp>-<identifier>`
+for an item created under *yesterday's* stamp — an identifier that has never
+existed. Every row would have failed, with a message about the item not being
+found rather than about the real cause. Test-mode `sync-metadata` was
+unusable, which left `--live` as the only way to exercise it: the worst
+possible place to run something for the first time.
+
+The mapping already existed. Every upload log line records both `identifier`
+(the real, permanent one) and `uploaded_as` (what actually went over the
+wire), precisely so a later reader can tell what landed where. `--from-log`
+points at that log and `load_uploaded_as()` reads the pairs out of it.
+
+Three choices went into the shape:
+
+- **Required in test mode, optional with `--live`.** Live identifiers are
+  unstamped, so there is nothing to look up. In test mode there is no value
+  the CSV could carry that would work — the operator is told never to author a
+  `zztest-` identifier by hand, and `check_identifier` would reject one
+  anyway — so refusing is the only honest answer.
+- **A miss is an error, never a fall back.** Recomputing the target when the
+  log does not name a row is exactly the bug being fixed, and it fails
+  silently. Rows the log does not record are reported before anything is sent,
+  all-or-nothing like the rest of the CSV path.
+- **Mode-filtered, like `--resume-from`.** A test log records where a
+  `zztest-` item went and says nothing about the real one. Both flags read
+  logs through the same `_read_log_results()`, which drops entries from the
+  other mode and tolerates a truncated line.
+
+`--from-log` is deliberately separate from `--resume-from` rather than folded
+into it: they read the same file for opposite purposes. `--resume-from` says
+which rows to SKIP; `--from-log` says where the rows that remain should be
+SENT. A single flag doing both would make "skip what is done" and "correct
+what is done" the same instruction, which they are not.
+
 ## Still open
 
 - `collection_key` (currently `"lcps"`, the first segment of every minted

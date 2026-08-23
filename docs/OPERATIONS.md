@@ -327,6 +327,20 @@ columns that changed. Blank cell = leave alone; literal `REMOVE_TAG` = delete
 that field. `noindex` cannot be changed this way —
 see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3).
 
+**To rehearse a correction first**, point `--from-log` at the log of the
+upload run whose items you are correcting:
+
+```bash
+python ia_bulk.py sync-metadata data/update-metadata.csv --project sarasoldphotos --from-log logs/upload-20260823T161331Z.jsonl
+```
+
+The flag is **required** without `--live`: test items carry the stamp of the
+run that created them, and that log's `uploaded_as` field is the only record
+of which stamped item each row went to. Without it the command refuses rather
+than sending corrections to identifiers that have never existed. See
+[`DECISIONS.md`](DECISIONS.md), "`sync-metadata` reads its targets from the
+upload log".
+
 ## Pacing and batch limits
 
 IA's limits are **500 items per upload run** and **5,000 per day**.
