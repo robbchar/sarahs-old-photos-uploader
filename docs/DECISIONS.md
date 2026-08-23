@@ -604,6 +604,86 @@ failure and the run continues, same as any other transient error, whereas a
 false match aborts a run mid-flight over an unrelated error. `--limit`
 (above) remains the operator-controlled fallback either way.
 
+## Every recorded timestamp is UTC
+
+*Decided 2026-08-23.*
+
+`run_stamp()` already used `time.gmtime()`, and said why: local time repeats
+an hour during the DST fall-back transition, so two rehearsals started an hour
+apart across it would mint the same stamp. Exactly the same is true of the
+values that outlive the run — the `ia_uploaded` cell, which is the permanent
+record of when an archival item was published, and every line of the log that
+`--resume-from` and any later audit read. Both were naive local time, with no
+offset recorded to reconstruct the real instant from afterwards.
+
+All of them now go through `utc_timestamp()`: ISO-8601 UTC with an explicit
+`Z`. The `Z` is not decoration — without it the string is ambiguous, and the
+ambiguity is only resolvable by knowing which machine wrote it and what its
+clock was set to that day. `open_log()`'s filename stamp is UTC for the same
+reason, so a directory listing sorts in the order the runs actually happened.
+
+## A run may not exceed Internet Archive's daily item cap
+
+*Decided 2026-08-23.*
+
+`.claude/CLAUDE.md` states IA's limits as "500 items per upload run,
+5000/day". `CHUNK_SIZE` covered the per-run half from the beginning. Nothing
+covered the daily half on either path: a bare `upload --live` on a fully
+catalogued Sheet planned every ready row, and the only thing between it and a
+throttled half-finished batch was rate-limit detection that has never been
+observed against a live response.
+
+Both paths now refuse a run over `DAILY_ITEM_CAP` and name the fix. Three
+choices went into that:
+
+- **Refuse rather than silently cap.** Defaulting `--limit` to 5,000 would
+  make an over-cap run stop short and still report cleanly, which reads as a
+  complete run. That is the same trap the `--limit <= 0` guard already exists
+  to avoid.
+- **Check after the `--limit` slice.** A Sheet holding more ready rows than
+  the cap is not itself an error; running at all of them in one day is. So
+  `--limit` is the ordinary way through, not a special case.
+- **An explicit override, not none at all.** The cap is IA's, not ours, and an
+  account whose cap has been raised is a real case — but it has to be stated.
+  `--allow-over-daily-cap` is deliberately verbose enough not to be passed by
+  reflex.
+
+It applies in test mode too. A rehearsal uploads to `test_collection` through
+the same account and spends the same quota.
+
+## Minted numbers are re-checked against the Sheet before reserving
+
+*Decided 2026-08-23.*
+
+`plan_upload_targets()` mints the whole run's numbers up front, as `max+1`,
+`max+2`, … over a single read — see "Identifiers are minted by `upload` and
+written back to the Sheet" for why minting happens once rather than per chunk.
+On a full-collection run that read can be hours old by the time the last chunk
+reserves.
+
+`split_moved_targets()` guards the reserve write, but it only inspects each
+target's *own* row. A number written to a row this run is not targeting is
+invisible to it — and that is precisely the case that mints a duplicate: two
+Sheet rows carrying one permanent identifier. `internetarchive.upload()`
+appends to an existing item rather than refusing, so the second upload puts a
+second photograph inside the first one's item, unrenameably.
+
+`check_claimed_identifiers()` closes it: `SheetSnapshot` now carries every
+`ia_identifier` the fresh read holds, and the reserve leg compares this run's
+minted numbers against all of them.
+
+It stops the whole run rather than dropping the colliding target. Every number
+this run holds came out of the same arithmetic over the same stale read, so
+one collision means the maximum was wrong and the rest are suspect too —
+reserving its neighbours would be reserving numbers that are wrong for the
+same reason. Nothing has been reserved or uploaded at that point, so a rerun
+re-reads, re-mints from the real maximum, and proceeds.
+
+Only newly-minted targets are checked, and only before reserve. A RESERVED
+row's identifier is already in the Sheet — that is what RESERVED means — and
+after the reserve write so are this run's own, so checking either would stop
+every ordinary run on its own writes.
+
 ## Still open
 
 - `collection_key` (currently `"lcps"`, the first segment of every minted
@@ -654,6 +734,11 @@ false match aborts a run mid-flight over an unrelated error. `--limit`
   reaching this codebase's upload path either way it can arrive - but "should"
   is still verified only against the installed library's source, not an
   actual response from archive.org, since no `--live` run has happened.
+  **2026-08-23:** the run no longer depends on detecting the cap at all to
+  respect it — both paths refuse to *start* a run of more than 5,000 items
+  (see "A run may not exceed Internet Archive's daily item cap" above). What
+  stays open is only whether IA's response is distinguishable when the cap is
+  hit anyway, e.g. across two runs in one day, which the tool does not track.
   `--limit` (see "`--limit` counts planned targets..." above) remains the
   operator-controlled fallback either way.
 - ~~How a run establishes the next free `NUMBER`~~ **Settled 2026-08-08**:

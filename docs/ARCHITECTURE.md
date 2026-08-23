@@ -60,11 +60,18 @@ every mode including the default rehearsal — see
 which normalized fields will upload and which are held back. `file` and the
 four `ia_` columns never reach this list at all — `uploadable_fields()`
 already excludes them via `RESERVED_FIELDS` (see "Tool-owned columns" above).
-The receipt's own "NOT uploaded" section is for `identifier` alone
+The receipt separates two different reasons a column does not ship. "NOT
+uploaded — Internet Archive reserves these names" is `identifier` alone
 (`DROPPED_BY_UPLOAD_ROW`): the one name `upload_row` itself strips that
 isn't already tool-owned, since the Sheet's own `Identifier` column, if it
 has one, is ordinary donor metadata rather than something `RESERVED_FIELDS`
-would catch earlier — see
+would catch earlier. "uploaded with a value this tool generates" is
+`mediatype` and `collection` (`ia_fields.PIPELINE_OWNED_FIELDS`): those
+fields *are* sent, but `upload_from_sheet` overwrites `row['mediatype']`
+from the registry and `upload_row` sets `metadata['collection']`
+unconditionally, so a Sheet column of either name has its own value
+discarded. That section prints only when such a column actually exists —
+it is a collision warning, not a standing disclaimer. See
 [`DECISIONS.md`](DECISIONS.md#sheet-metadata-is-filtered-at-the-upload-boundary-not-in-upload_row).
 
 **File resolution.** A row's file is *resolved*, not constructed from a
@@ -194,6 +201,16 @@ Per chunk, `SheetUploadRun.execute()` does four things in this order:
    [`DECISIONS.md`](DECISIONS.md#a-rows-identity-is-its-file_template-columns-not-its-ia_identifier)
    for why the fingerprint, not `ia_identifier`, is what makes this check
    meaningful). Targets that moved are reported and skipped, never written to.
+   Before the reserve write only, `check_claimed_identifiers()` additionally
+   compares this run's *minted* numbers against every `ia_identifier` the
+   fresh read holds, anywhere in the Sheet. The per-target check above sees
+   only a target's own row, so a number claimed on a row this run is not
+   targeting is invisible to it — and that is the case that mints a
+   duplicate. A collision stops the whole run rather than dropping one
+   target: every number came out of the same `max+1` arithmetic over the
+   same stale read, so one collision means the maximum was wrong and the
+   rest are suspect. Nothing is reserved or uploaded at that point, so a
+   rerun re-mints from the Sheet's current state.
 2. **reserve** — one batch write (`write_cells_if_any`) putting each target's
    minted `ia_identifier` in the Sheet, before any upload happens.
 3. **upload** — row by row, via `upload_row()`/`internetarchive.upload()`, so
@@ -220,16 +237,25 @@ A row is chosen for this run based on its own two tool-owned columns
 never re-mint), both set means skip entirely.
 
 ## Chunking
-All `upload`/`sync-metadata` runs process rows in batches of 500 (IA's
-per-run batch limit) by default, via `chunk_rows()`. This is a
-pacing/checkpoint boundary, not a literal separate CSV file per chunk —
-each row is uploaded individually through the `internetarchive` Python
-library so outcomes are captured per-row. On the Sheet path, `upload
---chunk-size N` overrides the batch size for that run
-(`SheetUploadRun.chunk_size`, threaded into `chunk_rows()` at the same call
-site `CHUNK_SIZE` used to be read from directly); `--csv` has no
-`--chunk-size` of its own, since `run_rows()`'s chunking has no per-chunk
-Sheet write for a batch size to actually change.
+The **Sheet path** processes targets in batches of 500 (IA's per-run batch
+limit) by default, via `chunk_rows()`. This is a real checkpoint boundary:
+each chunk gets its own re-read of the Sheet, reserve write, uploads and
+confirm write. It is not a literal separate CSV file per chunk — each row is
+uploaded individually through the `internetarchive` Python library so
+outcomes are captured per-row. `upload --chunk-size N` overrides the batch
+size for that run (`SheetUploadRun.chunk_size`, threaded into `chunk_rows()`).
+
+The **`--csv` path does not chunk at all.** `run_rows()` is a flat loop; it
+previously iterated `chunk_rows()` and then the rows within each chunk,
+which was exactly equivalent — nothing happened at a boundary — while
+implying a batching guarantee that path does not have. This is why `--csv`
+has no `--chunk-size`: there is no per-chunk Sheet write for a batch size to
+change.
+
+Neither path may exceed `DAILY_ITEM_CAP` (5,000, IA's per-account daily
+limit) in one run. Both refuse rather than silently capping and name the fix
+— `--limit` on the Sheet path, splitting the file on `--csv` — with
+`--allow-over-daily-cap` as the explicit override.
 
 `upload --limit N` (Sheet path only) caps how many *planned* upload targets
 (valid, ready, not already done — `plan_upload_targets()`'s own output) a
@@ -262,6 +288,11 @@ IA's `derive` task) for anything already present with a matching MD5.
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:
 `{identifier, file, status, error, uploaded_as, live, timestamp}`.
+Every `timestamp` this tool records is ISO-8601 UTC with an explicit `Z`
+(`utc_timestamp()`), as is the `ia_uploaded` cell written back to the Sheet.
+Local time repeats an hour during the DST fall-back transition, so a run
+spanning it would stamp a later chunk with an earlier wall-clock time — the
+same reason `run_stamp()` uses UTC.
 
 On the Sheet path, `log_run_header()` writes one more record as the log's
 **first** line, before any row result: `{record: "run_header", timestamp,
@@ -277,6 +308,14 @@ moved on. `load_prior_successes()` explicitly skips this record by its
 `record` field (not merely by lacking a `status` key, which would also
 happen to work but for the wrong reason) so it is never mistaken for a
 row result.
+
+`load_prior_successes()` also **skips any line it cannot read** rather than
+raising, and reports the count on stderr. `log_result()` appends per row
+with no atomic write, so a run killed mid-write leaves a truncated final
+line — raising on it made the log permanently unusable as a resume source,
+disabling the only recovery mechanism the `--csv` path has using the exact
+crash it exists to recover from. A skipped line means that row is attempted
+again, which is safe: IA matches on MD5.
 
 **`dry_run` is always `False` in a real log.** `upload_from_sheet` returns
 on the `if dry_run:` branch (nothing uploaded, nothing logged) before

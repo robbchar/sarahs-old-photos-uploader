@@ -244,14 +244,25 @@ the two combine literally, as shown above. Both are recorded in the
 `docs/ARCHITECTURE.md`) and rejected on `--csv`, the same way
 `--write-identifier`/`--dry-run` are rejected on the Sheet path.
 
+**The 5,000/day cap is enforced.** Internet Archive allows 5,000 items per
+account per day. A run planning more than that is refused before anything is
+uploaded, naming the fix — `--limit 5000` on the Sheet path, splitting the
+file on `--csv`. It refuses rather than silently capping, because a run that
+quietly stopped short would read as a complete one. `--allow-over-daily-cap`
+overrides it, and is only correct if you know IA has raised this account's
+cap. The refusal applies in test mode too: a rehearsal uploads through the
+same account and spends the same quota.
+
 Other behavior, both paths:
 
-- Processes rows in chunks of 500 by default (Internet Archive's per-run
-  batch limit), overridable on the Sheet path via `--chunk-size`
+- The Sheet path processes rows in chunks of 500 by default (Internet
+  Archive's per-run batch limit), overridable via `--chunk-size`
 - Uploads each row via the `internetarchive` Python library (not the `ia`
   CLI), so per-row success/failure is captured directly
 - Writes a timestamped JSONL log to `logs/upload-<timestamp>.jsonl`, one
-  line per row: `{identifier, file, status, error, uploaded_as, live, timestamp}`
+  line per row: `{identifier, file, status, error, uploaded_as, live, timestamp}`.
+  Timestamps are ISO-8601 UTC with an explicit `Z`, as is the `ia_uploaded`
+  cell written back to the Sheet
 - `--collection` and `--files-dir` are `--csv`-path overrides only; on the
   Sheet path they come from the project's registry entry, and passing them
   is an error rather than a silently ignored flag
