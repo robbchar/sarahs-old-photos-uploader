@@ -1407,7 +1407,11 @@ def prompt_for_decision(
     keys = "[y] accept   " if proposal else ""
     if proposal:
         print(f"       proposed: '{proposal.filename}'   ({proposal.reason})")
-    print(f"       {keys}[n] not this one   [e] type it   [l] list unclaimed   [q] stop")
+    # Reprinted on every path that lands the operator back at '>' from
+    # somewhere else - after [l]'s listing or a failed [e] the keys have
+    # scrolled away, and a bare '>' does not say which prompt this is.
+    keys_line = f"       {keys}[n] not this one   [e] type it   [l] list unclaimed   [q] stop"
+    print(keys_line)
 
     while True:
         answer = read_line("       > ").strip().lower()
@@ -1423,19 +1427,23 @@ def prompt_for_decision(
                     print(f"           {name}")
             else:
                 print(f"           nothing unclaimed in '{folder}'")
+            print(keys_line)
             continue
         if answer == "e":
             typed = read_line("       filename> ").strip()
             if not typed:
+                print(keys_line)
                 continue
             try:
                 resolved = resolve_file(config.files_dir, f"{folder}/{typed}", {})
             except FileResolutionError as exc:
                 print(f"           {exc}")
+                print(keys_line)
                 continue
             name = resolved.rpartition("/")[2]
             if claim_key(resolved) in claimed:
                 print(f"           '{name}' is already used by another row")
+                print(keys_line)
                 continue
             return Decision(action="accept", filename=name, typed=True)
         print("           expected y, n, e, l or q")

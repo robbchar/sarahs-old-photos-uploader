@@ -7406,6 +7406,29 @@ def test_prompt_lists_unclaimed_files_on_demand(capsys):
     assert "Alpha.jpg" in out and "Beta.jpg" in out
 
 
+def test_prompt_reprints_the_keys_after_a_bounce_back_to_the_prompt(tmp_path, capsys):
+    """After [l]'s listing or a failed [e], the operator lands back at the
+    key-choice '>' - but the keys row has scrolled away, and a bare '>'
+    does not say which prompt this is. Reprinting it makes the bounce
+    visible."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Real.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["l", "e", "Nonexistent", "e", "", "n"])
+    prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, ["Real.jpg"], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    out = capsys.readouterr().out
+    # once up front, then after the listing, the failed resolve, and the
+    # empty entry
+    assert out.count("[e] type it") == 4
+
+
 def test_prompt_stops_the_run():
     from ia_bulk import Decision, prompt_for_decision
 
