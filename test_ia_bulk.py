@@ -35,6 +35,7 @@ from ia_bulk import (
     format_lifecycle_summary,
     format_readiness_breakdown,
     _format_result_lines,
+    _pluralize,
     main,
     CHUNK_SIZE,
     is_rate_limit_error,
@@ -394,6 +395,20 @@ def test_survey_files_separates_resolved_rows_from_unresolved(tmp_path):
     assert survey.claimed == {claim_key("SOP CD 1/Good.jpg")}
     # the resolved file is not offered as a candidate, and the PDF is excluded
     assert survey.unclaimed == {"SOP CD 1": ["Finnish Meat Market.jpg"]}
+
+
+def test_claim_key_folds_case_on_macos_where_normcase_is_the_identity(monkeypatch):
+    """os.path.normcase goes by platform convention, not the actual
+    filesystem: on macOS it is the identity even though the default
+    filesystem (APFS) is case-insensitive like Windows's. Without a fold of
+    our own, `SOP CD 1` and `sop cd 1` get two disjoint claim namespaces
+    there and the two-rows-one-file guard silently misses. The exact-value
+    assert is what exercises the darwin branch on any host: Windows's
+    normcase would flip the slash to a backslash, POSIX's would keep the
+    capitals."""
+    monkeypatch.setattr("sys.platform", "darwin")
+    assert claim_key("SOP CD 1/Photo.JPG") == "sop cd 1/photo.jpg"
+    assert claim_key("SOP CD 1/Photo.JPG") == claim_key("sop cd 1/photo.jpg")
 
 
 def test_survey_files_files_a_blank_filename_cell_as_not_ready_not_unresolved(tmp_path):
@@ -1020,6 +1035,14 @@ def test_lifecycle_summary_uses_singular_row_for_a_count_of_one():
 
     assert "1 row ready to upload" in summary
     assert "1 rows ready to upload" not in summary
+
+
+def test_pluralize_separates_thousands():
+    """README quotes `2,914 rows not yet catalogued` as sample output, and
+    the real Sheet's headline counts sit near 3,000 - the separator is what
+    keeps the doc's sample and the tool's output the same string."""
+    assert _pluralize(2914, "row") == "2,914 rows"
+    assert _pluralize(1, "row") == "1 row"
 
 
 def test_lifecycle_summary_does_not_count_a_failed_unassigned_row_as_ready():

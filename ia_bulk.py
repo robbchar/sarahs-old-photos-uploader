@@ -574,7 +574,10 @@ def format_row_error(exc: Exception) -> str:
 
 
 def _pluralize(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+    """Headline counts reach ~3,000 on the real Sheet, so thousands are
+    separated. Any raw count printed beside a _pluralize line must use the
+    same {:,} format, or adjacent lines disagree about how a number looks."""
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
 
 
 def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowValidation]) -> str:
@@ -660,7 +663,7 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
             "not be uploaded until fixed"
         )
 
-    lines.append(f"{counts[(RowState.DONE, 'ready')]} already uploaded")
+    lines.append(f"{counts[(RowState.DONE, 'ready')]:,} already uploaded")
     if counts[(RowState.DONE, "not_ready")]:
         lines.append(
             f"{_pluralize(counts[(RowState.DONE, 'not_ready')], 'row')} already uploaded "
@@ -675,7 +678,7 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
         )
 
     lines.append(
-        f"{counts[(RowState.RESERVED, 'ready')]} reserved but unconfirmed - will retry "
+        f"{counts[(RowState.RESERVED, 'ready')]:,} reserved but unconfirmed - will retry "
         "under existing identifier"
     )
     if counts[(RowState.RESERVED, "not_ready")]:
@@ -751,11 +754,11 @@ def format_readiness_breakdown(row_results: list[RowValidation]) -> str:
 
     lines = [f"{_pluralize(len(not_ready), 'row')} not yet catalogued"]
     for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        lines.append(f"    {count} missing {name}")
+        lines.append(f"    {count:,} missing {name}")
     if any(len(result.missing_fields) > 1 for result in not_ready):
         lines.append(
             "    (a row missing more than one field appears in more than one count "
-            f"above, so these do not sum to {len(not_ready)})"
+            f"above, so these do not sum to {len(not_ready):,})"
         )
     return "\n".join(lines)
 
@@ -1279,13 +1282,20 @@ def claim_key(folder_and_name: str) -> str:
     filesystem - `SOP CD 1` and `sop cd 1` are ONE folder holding ONE
     photograph, so keyed by the raw cell those two rows get two disjoint
     namespaces and the check that stops two rows being pointed at one file
-    silently misses. os.path.normcase folds exactly the differences the
-    local filesystem itself ignores, and nothing at all on a case-sensitive
-    one, where two such folders really are two folders.
+    silently misses. os.path.normcase folds that difference on Windows and
+    nothing on Linux, where two such folders really are two folders - but
+    it goes by platform CONVENTION, not the actual filesystem, and on macOS
+    the convention (identity) disagrees with the default filesystem (APFS
+    is case-insensitive too), so the fold is done here instead. On the rare
+    case-sensitive Mac volume that fold merely withholds a same-name-
+    different-case file from auto-proposal - erring on the quiet side,
+    where the un-folded key errs by letting two rows take one file.
 
     Every producer and every consumer of `claimed` goes through here: a set
     half of whose members are normalized is worse than one that is not
     normalized at all."""
+    if sys.platform == "darwin":
+        return folder_and_name.casefold()
     return os.path.normcase(folder_and_name)
 
 
@@ -3001,7 +3011,7 @@ def upload_from_sheet(args) -> int:
         if not_ready_broken:
             verb = "has" if len(not_ready_broken) == 1 else "have"
             line += (
-                f" ({len(not_ready_broken)} of them also {verb} an unresolvable "
+                f" ({len(not_ready_broken):,} of them also {verb} an unresolvable "
                 "filename - run `validate` to see them)"
             )
         print(line)
