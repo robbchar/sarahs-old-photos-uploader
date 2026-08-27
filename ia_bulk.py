@@ -3880,15 +3880,28 @@ def cmd_append_rows(args) -> int:
     for folder, names in unclaimed.items():
         print(f"{folder}: {_pluralize(len(names), 'file')} with no row")
 
+    folder_field, name_field = fields[0], fields[-1]
     if dry_run:
-        for folder, name in to_append:
-            print(f"  {folder}/{name}")
+        # Shown as the two cells the real run would write, under the Sheet's
+        # own header spellings - not a joined folder/name string the reader
+        # has to mentally re-split. The dry run's whole job is confidence
+        # about the exact write.
+        folder_header = sheet.column_map.headers[columns[folder_field]]
+        name_header = sheet.column_map.headers[columns[name_field]]
+        quoted = [(f"'{folder}'", f"'{name}'") for folder, name in to_append]
+        folder_width = max(len(folder_header), max(len(q) for q, _ in quoted))
+        print()
+        print("each row would carry exactly these two cells - every other column "
+              "is left blank for the cataloguer:")
+        print()
+        print(f"  {folder_header.ljust(folder_width)}  {name_header}")
+        for quoted_folder, quoted_name in quoted:
+            print(f"  {quoted_folder.ljust(folder_width)}  {quoted_name}")
         print()
         print(f"--dry-run: {_pluralize(len(to_append), 'row')} would be appended")
         return 0
 
     width = len(sheet.column_map.headers)
-    folder_field, name_field = fields[0], fields[-1]
     new_rows = []
     for folder, name in to_append:
         # Full header width with values at the template's own columns -

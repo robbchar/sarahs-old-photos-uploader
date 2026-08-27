@@ -8252,6 +8252,36 @@ def test_cmd_append_rows_dry_run_appends_nothing_and_writes_no_log(tmp_path, mon
     assert exit_code == 0
 
 
+def test_cmd_append_rows_dry_run_shows_the_two_target_cells_by_their_sheet_names(
+    tmp_path, monkeypatch, capsys
+):
+    """The dry run's job is confidence about the real write: name the two
+    Sheet columns as the header actually spells them and show which value
+    lands in each, rather than a joined folder/name string a reader must
+    mentally re-split. The header here is reordered so the test also fails
+    if the display hardcodes column names instead of reading the Sheet's."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, _ = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["A title", "SOP CD 1", "Good.jpg"]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+        header=["Title", "Folder on LaCie Drive", "File Name"],
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "Folder on LaCie Drive" in out
+    assert "File Name" in out
+    assert "'SOP CD 1'" in out
+    assert "'Extra.jpg'" in out
+    assert "SOP CD 1/Extra.jpg" not in out
+    assert "left blank" in out
+    assert exit_code == 0
+
+
 def test_cmd_append_rows_logs_each_appended_row(tmp_path, monkeypatch):
     from ia_bulk import cmd_append_rows
 
