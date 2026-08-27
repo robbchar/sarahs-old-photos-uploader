@@ -20,6 +20,8 @@ from ia_bulk import (
     check_identifier,
     check_required_for_upload,
     resolve_sheet_files,
+    claim_key,
+    survey_files,
     validate_rows,
     validate_sheet_grid,
     RowValidation,
@@ -33,12 +35,13 @@ from ia_bulk import (
     format_lifecycle_summary,
     format_readiness_breakdown,
     _format_result_lines,
+    _pluralize,
     main,
     CHUNK_SIZE,
     is_rate_limit_error,
     UploadFailed,
 )
-from project_config import ProjectConfig
+from project_config import ProjectConfig, DEFAULT_PHOTO_EXTENSIONS
 
 
 class FakeResponse:
@@ -155,6 +158,7 @@ def _sheet_config(**overrides) -> ProjectConfig:
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
     return dataclasses.replace(base, **overrides)
 
@@ -367,6 +371,93 @@ def test_validate_rows_row_numbers_start_at_2_for_header():
     results = validate_rows(rows, files_dir="/tmp", registry=make_registry())
 
     assert results[0].row_number == 2
+
+
+def test_survey_files_separates_resolved_rows_from_unresolved(tmp_path):
+    """The claimed set is what stops two rows being pointed at one file -
+    the misattribution hazard in issue #1. It is built before any matching."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Good.jpg").write_bytes(b"x")
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+    (folder / "contact sheet.pdf").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Good.jpg"},
+        {"folder": "SOP CD 1", "name": "Finnis Meat Market.jpg"},
+    ]
+
+    survey = survey_files(rows, config)
+
+    assert survey.unresolved == {3: "SOP CD 1"}
+    assert survey.wanted == {3: "Finnis Meat Market.jpg"}
+    assert survey.claimed == {claim_key("SOP CD 1/Good.jpg")}
+    # the resolved file is not offered as a candidate, and the PDF is excluded
+    assert survey.unclaimed == {"SOP CD 1": ["Finnish Meat Market.jpg"]}
+
+
+def test_claim_key_folds_case_on_macos_where_normcase_is_the_identity(monkeypatch):
+    """os.path.normcase goes by platform convention, not the actual
+    filesystem: on macOS it is the identity even though the default
+    filesystem (APFS) is case-insensitive like Windows's. Without a fold of
+    our own, `SOP CD 1` and `sop cd 1` get two disjoint claim namespaces
+    there and the two-rows-one-file guard silently misses. The exact-value
+    assert is what exercises the darwin branch on any host: Windows's
+    normcase would flip the slash to a backslash, POSIX's would keep the
+    capitals."""
+    monkeypatch.setattr("sys.platform", "darwin")
+    assert claim_key("SOP CD 1/Photo.JPG") == "sop cd 1/photo.jpg"
+    assert claim_key("SOP CD 1/Photo.JPG") == claim_key("sop cd 1/photo.jpg")
+
+
+def test_survey_files_files_a_blank_filename_cell_as_not_ready_not_unresolved(tmp_path):
+    """A row that asserted no file is not-ready, not broken - the same split
+    resolve_sheet_files() draws between `errors` and `blank`. Filed as
+    unresolved it becomes a prompt with no proposal and no candidates, once
+    per uncatalogued row, which on the real Sheet is ~2,900 of them."""
+    (tmp_path / "SOP CD 1").mkdir()
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    survey = survey_files([{"folder": "SOP CD 1", "name": ""}], config)
+    assert survey.unresolved == {}
+    assert survey.wanted == {}
+    assert survey.not_ready == [2]
+
+
+def test_survey_files_claims_one_file_once_across_case_divergent_folder_cells(tmp_path):
+    """`SOP CD 1` and `sop cd 1` are one folder on a case-insensitive
+    filesystem. Keyed by the raw folder cell the two rows get two disjoint
+    namespaces, the file a resolved row already claims still shows up as
+    unclaimed under the other spelling, and two rows can be pointed at one
+    photograph."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Good.jpg").write_bytes(b"x")
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Good.jpg"},
+        {"folder": "sop cd 1", "name": "Finnis Meat Market.jpg"},
+    ]
+
+    survey = survey_files(rows, config)
+
+    assert "Good.jpg" not in survey.unclaimed.get("sop cd 1", [])
+
+
+def test_survey_files_lists_an_uppercase_extension_as_a_candidate(tmp_path):
+    """161 of the 189 sample files are `.JPG`. A regression here would make
+    a whole folder invisible as candidates, and would present as "the tool
+    just never proposes anything" rather than as an error."""
+    folder = tmp_path / "SOP CD 2 COE"
+    folder.mkdir()
+    (folder / "001_seaside_beach.JPG").write_bytes(b"x")
+
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    survey = survey_files([{"folder": "SOP CD 2 COE", "name": "Nothing Like It.jpg"}], config)
+
+    assert survey.unclaimed == {"SOP CD 2 COE": ["001_seaside_beach.JPG"]}
 
 
 def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers():
@@ -946,6 +1037,14 @@ def test_lifecycle_summary_uses_singular_row_for_a_count_of_one():
     assert "1 rows ready to upload" not in summary
 
 
+def test_pluralize_separates_thousands():
+    """README quotes `2,914 rows not yet catalogued` as sample output, and
+    the real Sheet's headline counts sit near 3,000 - the separator is what
+    keeps the doc's sample and the tool's output the same string."""
+    assert _pluralize(2914, "row") == "2,914 rows"
+    assert _pluralize(1, "row") == "1 row"
+
+
 def test_lifecycle_summary_does_not_count_a_failed_unassigned_row_as_ready():
     """The bug the coordinator caught: classify_row() alone can't see
     validation results, so a row with a blank identifier that actually
@@ -1212,6 +1311,7 @@ def test_build_sheet_client_reads_the_real_sheet_id_when_live(monkeypatch):
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     client = build_sheet_client(config, live=True)
@@ -1235,6 +1335,7 @@ def test_build_sheet_client_reads_the_test_sheet_id_when_not_live(monkeypatch):
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     client = build_sheet_client(config, live=False)
@@ -1271,6 +1372,7 @@ def test_build_sheet_client_passes_credentials_through_to_discovery_build(monkey
         files_dir=".",
         file_template="{file}",
         required_for_upload=("title",),
+        photo_extensions=DEFAULT_PHOTO_EXTENSIONS,
     )
 
     build_sheet_client(config, live=True)
@@ -7208,3 +7310,680 @@ def test_sync_from_sheet_live_reports_a_failure_without_claiming_success(
     assert "    - Access Denied - This item has been taken offline" in out
     assert "0 item(s) updated successfully, 0 unchanged, 1 error(s)" in out
     assert exit_code == 1
+
+
+# Task 5: The prompt tests
+def test_prompt_accepts_a_proposal(capsys):
+    from ia_bulk import Decision, prompt_for_decision
+    from reconcile import Proposal
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", Proposal("Finnish.jpg", "edit distance 1"),
+        ["Finnish.jpg"], _sheet_config(), set(), read_line=lambda _: "y",
+    )
+    assert decision == Decision(action="accept", filename="Finnish.jpg")
+
+
+def test_prompt_rejects_without_a_filename():
+    from ia_bulk import Decision, prompt_for_decision
+    from reconcile import Proposal
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", Proposal("Finnish.jpg", "edit distance 1"),
+        ["Finnish.jpg"], _sheet_config(), set(), read_line=lambda _: "n",
+    )
+    assert decision == Decision(action="reject", filename="")
+
+
+def test_prompt_typed_name_is_resolved_before_it_is_accepted(tmp_path):
+    """The whole point: a typed name goes through the same resolve_file()
+    every other path uses, so it cannot introduce a new broken cell - and a
+    name typed without its extension resolves anyway."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Finnish Meat Market"])   # no extension
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    assert decision.action == "accept"
+    assert decision.filename == "Finnish Meat Market.jpg"   # the RESOLVED name
+    # how it was answered, not what was answered - the decision log has to
+    # tell a typed name from an accepted proposal even when they agree
+    assert decision.typed is True
+
+
+def test_prompt_reprompts_when_a_typed_name_does_not_resolve(tmp_path, capsys):
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Real.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Nonexistent", "e", "Real", ])
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    assert decision.filename == "Real.jpg"
+    assert "no file found" in capsys.readouterr().out.lower()
+
+
+def test_prompt_refuses_a_typed_name_another_row_already_claims(tmp_path, capsys):
+    """Typing must not be a way around the one-file-one-row rule."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Taken.jpg").write_bytes(b"x")
+    (folder / "Free.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["e", "Taken", "e", "Free"])
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], config,
+        {claim_key("SOP CD 1/Taken.jpg")}, read_line=lambda _: next(answers),
+    )
+    assert decision.filename == "Free.jpg"
+    assert "already" in capsys.readouterr().out.lower()
+
+
+def test_prompt_lists_unclaimed_files_on_demand(capsys):
+    from ia_bulk import prompt_for_decision
+
+    answers = iter(["l", "n"])
+    prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, ["Alpha.jpg", "Beta.jpg"],
+        _sheet_config(), set(), read_line=lambda _: next(answers),
+    )
+    out = capsys.readouterr().out
+    assert "Alpha.jpg" in out and "Beta.jpg" in out
+
+
+def test_prompt_reprints_the_keys_after_a_bounce_back_to_the_prompt(tmp_path, capsys):
+    """After [l]'s listing or a failed [e], the operator lands back at the
+    key-choice '>' - but the keys row has scrolled away, and a bare '>'
+    does not say which prompt this is. Reprinting it makes the bounce
+    visible."""
+    from ia_bulk import prompt_for_decision
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Real.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    answers = iter(["l", "e", "Nonexistent", "e", "", "n"])
+    prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, ["Real.jpg"], config, set(),
+        read_line=lambda _: next(answers),
+    )
+    out = capsys.readouterr().out
+    # once up front, then after the listing, the failed resolve, and the
+    # empty entry
+    assert out.count("[e] type it") == 4
+
+
+def test_prompt_stops_the_run():
+    from ia_bulk import Decision, prompt_for_decision
+
+    decision = prompt_for_decision(
+        3, "SOP CD 1", "Finnis.jpg", None, [], _sheet_config(), set(),
+        read_line=lambda _: "q",
+    )
+    assert decision == Decision(action="stop", filename="")
+
+
+# --- Task 6: the reconcile-files command ---
+
+RECONCILE_HEADER = ["Folder on LaCie Drive", "File Name", "Title"]
+
+
+def _setup_reconcile(tmp_path, monkeypatch, sheet_rows, disk, decisions, header=None,
+                     grid_after=None):
+    """A reconcile world: files on disk, a registry, a client that records
+    every write, and a canned answer per prompt."""
+    for folder, names in disk.items():
+        (tmp_path / folder).mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (tmp_path / folder / name).write_bytes(b"x")
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(
+                files_dir=str(tmp_path),
+                file_template="{folder_on_lacie_drive}/{file_name}",
+                required_for_upload=["title"],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    written = []
+
+    class RecordingClient:
+        def __init__(self, grid):
+            self._grid = grid
+            self._reads = 0
+
+        def read_grid(self):
+            # `grid_after` is what the Sheet says on every read AFTER the
+            # first - i.e. what flush()'s re-read sees once somebody else has
+            # edited the Sheet mid-session.
+            self._reads += 1
+            if grid_after is not None and self._reads > 1:
+                return grid_after
+            return self._grid
+
+        def write_cells(self, updates):
+            written.extend(updates)
+
+    grid = [header or RECONCILE_HEADER] + sheet_rows
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: RecordingClient(grid))
+
+    answers = iter(decisions)
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", lambda *a, **k: next(answers))
+    return registry_path, written
+
+
+def _reconcile_args(tmp_path, registry_path, **overrides):
+    args = Namespace(
+        project="astoriaphotos",
+        registry=str(registry_path),
+        live=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def test_cmd_reconcile_files_writes_only_the_file_name_column(tmp_path, monkeypatch):
+    """The acceptance criterion made mechanical: whatever else changes, the
+    write batch must never contain another column letter. File Name is the
+    second header, so column B."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+    )
+
+    assert cmd_reconcile_files(_reconcile_args(tmp_path, registry_path)) == 0
+    assert {update.a1[0] for update in written} == {"B"}
+
+
+def test_cmd_reconcile_files_applies_an_accepted_correction(tmp_path, monkeypatch):
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+
+
+def test_cmd_reconcile_files_writes_nothing_when_rejected(tmp_path, monkeypatch):
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="reject", filename="")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+
+
+def _reconcile_log_lines(tmp_path):
+    logs = sorted((tmp_path / "logs").glob("reconcile-files-*.jsonl"))
+    assert len(logs) == 1
+    return [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
+
+
+def test_cmd_reconcile_files_logs_what_was_decided_about_every_row(tmp_path, monkeypatch):
+    """One line per row *considered*. Prompt-per-proposal leaves no other
+    record of what a volunteer decided, so a rejected proposal has to say
+    what was turned down and an ambiguous row has to name the files it
+    could not choose between - the console says both and used to be the
+    only place that did."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another title"],
+            ["SOP CD 2", "Liberty.jpg", "A third title"],
+        ],
+        {
+            "SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"],
+            "SOP CD 2": ["Liberty.JPG", "liberty.jpeg"],
+        },
+        [
+            Decision(action="accept", filename="Finnish Meat Market.jpg"),
+            Decision(action="reject", filename=""),
+        ],
+    )
+
+    assert cmd_reconcile_files(_reconcile_args(tmp_path, registry_path)) == 0
+    accepted, rejected, ambiguous = _reconcile_log_lines(tmp_path)
+
+    assert accepted["row"] == 2
+    assert accepted["folder"] == "SOP CD 1"
+    assert accepted["wanted"] == "Finnis Meat Market.jpg"
+    assert accepted["status"] == "accepted"
+    assert accepted["chosen"] == "Finnish Meat Market.jpg"
+    assert accepted["proposed"] == "Finnish Meat Market.jpg"
+    assert accepted["reason"] == "edit distance 1"
+    assert accepted["matches"] == []
+    assert accepted["timestamp"].endswith("Z")
+
+    assert rejected["row"] == 3
+    assert rejected["status"] == "rejected"
+    assert rejected["chosen"] == ""
+    assert rejected["proposed"] == "Alderbrook Hall.jpg"   # what was turned down
+    assert rejected["reason"] == "edit distance 1"
+
+    assert ambiguous["row"] == 4
+    assert ambiguous["status"] == "ambiguous"
+    assert ambiguous["chosen"] == ""
+    assert sorted(ambiguous["matches"]) == ["Liberty.JPG", "liberty.jpeg"]
+
+
+def test_cmd_reconcile_files_logs_a_typed_name_as_typed_even_when_it_matches_the_proposal(
+    tmp_path, monkeypatch
+):
+    """`typed` records how the operator answered, not whether the two
+    strings agree. Comparing them called a name a human typed at [e]
+    `accepted`, claiming the tool proposed something it did not."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg", typed=True)],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    (entry,) = _reconcile_log_lines(tmp_path)
+
+    assert entry["status"] == "typed"
+    assert entry["chosen"] == "Finnish Meat Market.jpg"
+    assert entry["proposed"] == "Finnish Meat Market.jpg"
+
+
+def test_cmd_reconcile_files_logs_a_stop(tmp_path, monkeypatch):
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="stop", filename="")],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    (entry,) = _reconcile_log_lines(tmp_path)
+
+    assert entry["status"] == "stopped"
+    assert entry["chosen"] == ""
+
+
+def test_cmd_reconcile_files_drops_a_correction_whose_row_moved_mid_session(tmp_path, monkeypatch, capsys):
+    """The longest read-to-write window in the tool: an hour of prompting
+    can sit between the grid read that fixed the row number and the write
+    that uses it, on a Sheet several volunteers share. One row inserted in
+    that hour shifts every later write by one, putting a filename on the
+    wrong photograph. flush() re-reads and drops anything whose cell no
+    longer says what it said when it matched."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    original = ["SOP CD 1", "Finnis Meat Market.jpg", "A title"]
+    inserted = ["SOP CD 1", "Someone Else's Row.jpg", "Inserted since"]
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [original],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+        grid_after=[RECONCILE_HEADER, inserted, original],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert written == []
+    assert "was NOT written" in out
+    assert "0 filename(s) corrected" in out
+    assert "1 row still unresolved" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_writes_when_the_row_still_says_what_it_said(tmp_path, monkeypatch):
+    """The other half of the guard: an unrelated edit elsewhere in the Sheet
+    must not stop a correction whose own row is untouched."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    original = ["SOP CD 1", "Finnis Meat Market.jpg", "A title"]
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [original],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [Decision(action="accept", filename="Finnish Meat Market.jpg")],
+        grid_after=[RECONCILE_HEADER, original, ["SOP CD 2", "Appended.jpg", "Later"]],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+
+
+def test_cmd_reconcile_files_refuses_a_sheet_whose_headers_collide(tmp_path, monkeypatch, capsys):
+    """Two headers normalizing to `file_name` corrupt every row identically,
+    so - unlike a bad row - the defect cannot be routed around by skipping
+    it. It is not just a missing warning: grid_to_rows reads the LAST such
+    column while the write targets the FIRST, so the correction would land
+    in a column nothing reads, leaving the stale value in place and the run
+    reporting success."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("a Sheet with a header defect must not be reconciled")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+        header=["Folder on LaCie Drive", "File Name", "File  name", "Title"],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert written == []
+    assert "refusing to reconcile anything" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_reconcile_files_skips_a_row_whose_cells_are_shifted(tmp_path, monkeypatch, capsys):
+    """A data row longer than the header may have every cell shifted against
+    it, so which cell a correction would land in is exactly what is in
+    doubt. One bad row is skipped, not fatal - the rest of the run still
+    works, which is the split READINESS.md draws."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    prompted = []
+
+    def record(row_number, folder, wanted, proposal, candidates, config, claimed):
+        prompted.append(row_number)
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title", "an extra cell"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", record)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert prompted == [3]
+    assert written == [CellUpdate("B3", "Alderbrook Hall.jpg")]
+    assert "may have cells shifted" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_refuses_one_file_for_two_case_divergent_folder_cells(tmp_path, monkeypatch):
+    """Two rows naming one photograph mint two permanent identifiers for one
+    image. On Windows `SOP CD 1` and `sop cd 1` are the same folder, so
+    unless both sides of the claimed check are normalized the second row is
+    proposed - and accepts - the file the first row just took."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    def accept_whatever_is_proposed(row_number, folder, wanted, proposal, candidates, config, claimed):
+        if proposal is None:
+            return Decision(action="reject", filename="")
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["sop cd 1", "Finnish Meet Market.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", accept_whatever_is_proposed)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_never_prompts_about_an_uncatalogued_row(tmp_path, monkeypatch, capsys):
+    """The live Sheet is ~3,000 rows of which ~2,900 carry no filename at
+    all. A row that asserted nothing has no proposal, no candidates and
+    nothing an operator could decide - prompting about it buries the
+    handful of genuinely fixable rows under thousands of identical
+    non-problems, which is the exact failure the readiness split exists to
+    prevent (docs/decisions/READINESS.md)."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    prompted = []
+
+    def record(row_number, folder, wanted, proposal, candidates, config, claimed):
+        prompted.append(row_number)
+        assert proposal is not None
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]]
+        + [["SOP CD 1", "", ""] for _ in range(8)],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", record)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert prompted == [2]                      # the one real mismatch, not all nine
+    assert "1 row named a file that does not resolve" in out
+    assert "8 rows not yet catalogued" in out   # one contained line, not eight
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_dry_run_says_nothing_about_uncatalogued_rows(tmp_path, monkeypatch, capsys):
+    """--dry-run floods the same way a real run prompts: one
+    `no candidate in ''` line per uncatalogued row."""
+    from ia_bulk import cmd_reconcile_files
+
+    registry_path, _ = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "", ""] for _ in range(8)],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "no candidate" not in out
+    assert "8 rows not yet catalogued" in out
+    assert "nothing to reconcile" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_dry_run_neither_prompts_nor_writes(tmp_path, monkeypatch, capsys):
+    """--dry-run writes no log either, matching upload --dry-run, which
+    returns before open_log()."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("--dry-run must not prompt")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert written == []
+    assert not (tmp_path / "logs").exists()
+    assert "Finnish Meat Market.jpg" in out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_on_a_clean_sheet_proposes_nothing(tmp_path, monkeypatch, capsys):
+    """Safe to re-run: no drive changes, no mismatches, nothing proposed and
+    nothing written."""
+    from ia_bulk import cmd_reconcile_files
+
+    def refuse(*a, **k):
+        raise AssertionError("a resolvable row must not be prompted about")
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", refuse)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+    assert "nothing to reconcile" in capsys.readouterr().out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_flushes_before_stopping_on_q(tmp_path, monkeypatch):
+    """[q] is a clean stop: corrections accepted before it reach the Sheet.
+    Only an abrupt kill can lose a partial batch."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Alderbrok Hall.jpg", "Another"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg", "Alderbrook Hall.jpg"]},
+        [
+            Decision(action="accept", filename="Finnish Meat Market.jpg"),
+            Decision(action="stop", filename=""),
+        ],
+    )
+
+    cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+
+
+def test_cmd_reconcile_files_exits_zero_with_rows_still_unresolved(tmp_path, monkeypatch, capsys):
+    """Non-zero while work remains would return non-zero for months and teach
+    the operator to ignore it - the trap upload's readiness split avoids."""
+    from ia_bulk import Decision, cmd_reconcile_files
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Nothing Like This.jpg", "A title"]],
+        {"SOP CD 1": ["Completely Different.jpg"]},
+        [Decision(action="reject", filename="")],
+    )
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == []
+    assert "1 row still unresolved" in capsys.readouterr().out
+    assert exit_code == 0
+
+
+def test_cmd_reconcile_files_does_not_reoffer_a_file_claimed_earlier_this_run(tmp_path, monkeypatch):
+    """Two rows in the same folder, both unresolvable, can each be within
+    matching distance of the SAME single file on disk. Once row 2 claims it,
+    row 3 must not be proposed it again - that is the exact misattribution
+    FileSurvey's own docstring promises cannot happen, and 'unclaimed' alone
+    cannot prevent it: it is a snapshot taken once, before the run started.
+
+    Rather than a canned decision queue, this uses a fake prompt that mirrors
+    what a real operator can do: accept whatever is proposed, or - when
+    nothing is proposed - there is nothing to press [y] on. If the candidate
+    pool has not been re-filtered against what earlier rows in this same run
+    claimed, row 3 would still see the file as a candidate, propose_match
+    would propose it a second time, and this fake would accept it too."""
+    from ia_bulk import CellUpdate, Decision, cmd_reconcile_files
+
+    def accept_whatever_is_proposed(row_number, folder, wanted, proposal, candidates, config, claimed):
+        if proposal is None:
+            return Decision(action="reject", filename="")
+        return Decision(action="accept", filename=proposal.filename)
+
+    registry_path, written = _setup_reconcile(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Finnis Meat Market.jpg", "A title"],
+            ["SOP CD 1", "Finnish Meet Market.jpg", "Another title"],
+        ],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+        [],
+    )
+    monkeypatch.setattr("ia_bulk.prompt_for_decision", accept_whatever_is_proposed)
+
+    exit_code = cmd_reconcile_files(_reconcile_args(tmp_path, registry_path))
+
+    assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
+    assert exit_code == 0

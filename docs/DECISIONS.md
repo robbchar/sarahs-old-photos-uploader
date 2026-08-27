@@ -71,6 +71,19 @@ Archive metadata.
 - [Blank `date` becomes `[n.d.]` rather than being omitted](decisions/FILES-AND-METADATA.md#blank-date-becomes-nd-rather-than-being-omitted)
 - [`checksum=True` and `verbose=True` on upload](decisions/FILES-AND-METADATA.md#checksumtrue-and-verbosetrue-on-upload)
 
+## [Reconciliation](decisions/RECONCILIATION.md)
+
+Matching a Sheet's filename cell against what `reconcile-files` finds on
+disk when the two disagree, and why every match it makes stays a proposal
+until a human accepts it.
+
+- [A correction is proposed, never applied](decisions/RECONCILIATION.md#a-correction-is-proposed-never-applied)
+- [Pass B requires identical digit sequences](decisions/RECONCILIATION.md#pass-b-requires-identical-digit-sequences)
+- [Accents are folded, not deleted](decisions/RECONCILIATION.md#accents-are-folded-not-deleted)
+- [A typed filename is resolved, not trusted](decisions/RECONCILIATION.md#a-typed-filename-is-resolved-not-trusted)
+- [Reconciliation ships before append](decisions/RECONCILIATION.md#reconciliation-ships-before-append)
+- [Exit code is 0 while work remains](decisions/RECONCILIATION.md#exit-code-is-0-while-work-remains)
+
 ## [Quota, pacing and the run record](decisions/QUOTA-AND-RUNS.md)
 
 Internet Archive's limits, how a run paces itself against them, and what each

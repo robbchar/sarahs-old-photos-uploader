@@ -21,6 +21,13 @@ REQUIRED_KEYS = (
     "file_template",
 )
 
+# Which files on the drive count as photographs. Optional with a default,
+# unlike required_for_upload: extensions describe what a photo file IS, while
+# required_for_upload encodes editorial policy that must not be inherited by
+# silence. The default excludes the contact-sheet PDFs that already sit among
+# the photos under data/.
+DEFAULT_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff", ".png")
+
 
 class ConfigError(Exception):
     pass
@@ -38,6 +45,7 @@ class ProjectConfig:
     files_dir: str
     file_template: str
     required_for_upload: tuple[str, ...]
+    photo_extensions: tuple[str, ...]
 
     def sheet_id_for(self, live: bool) -> str:
         return self.sheet_id if live else self.test_sheet_id
@@ -130,6 +138,30 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
                 "normalized form. Your Sheet is fine; the registry entry is not."
             )
 
+    raw_extensions = block.get("photo_extensions")
+    if raw_extensions is None:
+        photo_extensions = DEFAULT_PHOTO_EXTENSIONS
+    else:
+        if not isinstance(raw_extensions, list):
+            raise ConfigError(
+                f"project '{project_id}': photo_extensions must be a list, got "
+                f"{type(raw_extensions).__name__!r}"
+            )
+        if not raw_extensions:
+            raise ConfigError(
+                f"project '{project_id}': photo_extensions must name at least one "
+                "extension - an empty list would exclude every file on the drive"
+            )
+        for entry in raw_extensions:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ConfigError(
+                    f"project '{project_id}': every photo_extensions entry must be a "
+                    f"non-empty string, got {entry!r}"
+                )
+        photo_extensions = tuple(
+            "." + entry.strip().lstrip(".").lower() for entry in raw_extensions
+        )
+
     if block["sheet_id"].strip() == block["test_sheet_id"].strip():
         raise ConfigError(
             f"project '{project_id}': sheet_id and test_sheet_id must differ, "
@@ -147,4 +179,5 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
         files_dir=block["files_dir"].strip(),
         file_template=block["file_template"].strip(),
         required_for_upload=tuple(required_for_upload),
+        photo_extensions=photo_extensions,
     )

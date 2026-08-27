@@ -9,6 +9,7 @@ import argparse
 import csv
 import functools
 import json
+import os
 import re
 import sys
 import time
@@ -38,6 +39,7 @@ from column_map import (
 from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers, parse_identifier
 from project_config import ProjectConfig, load_project_config
+from reconcile import AmbiguousMatch, Proposal, propose_match
 from sheet_client import CellUpdate, SheetClient, column_letter
 
 REQUIRED_UPLOAD_COLUMNS = ("identifier", "file", "mediatype", "title")
@@ -572,7 +574,10 @@ def format_row_error(exc: Exception) -> str:
 
 
 def _pluralize(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+    """Headline counts reach ~3,000 on the real Sheet, so thousands are
+    separated. Any raw count printed beside a _pluralize line must use the
+    same {:,} format, or adjacent lines disagree about how a number looks."""
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
 
 
 def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowValidation]) -> str:
@@ -658,7 +663,7 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
             "not be uploaded until fixed"
         )
 
-    lines.append(f"{counts[(RowState.DONE, 'ready')]} already uploaded")
+    lines.append(f"{counts[(RowState.DONE, 'ready')]:,} already uploaded")
     if counts[(RowState.DONE, "not_ready")]:
         lines.append(
             f"{_pluralize(counts[(RowState.DONE, 'not_ready')], 'row')} already uploaded "
@@ -673,7 +678,7 @@ def format_lifecycle_summary(rows: list[dict[str, str]], row_results: list[RowVa
         )
 
     lines.append(
-        f"{counts[(RowState.RESERVED, 'ready')]} reserved but unconfirmed - will retry "
+        f"{counts[(RowState.RESERVED, 'ready')]:,} reserved but unconfirmed - will retry "
         "under existing identifier"
     )
     if counts[(RowState.RESERVED, "not_ready")]:
@@ -749,11 +754,11 @@ def format_readiness_breakdown(row_results: list[RowValidation]) -> str:
 
     lines = [f"{_pluralize(len(not_ready), 'row')} not yet catalogued"]
     for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        lines.append(f"    {count} missing {name}")
+        lines.append(f"    {count:,} missing {name}")
     if any(len(result.missing_fields) > 1 for result in not_ready):
         lines.append(
             "    (a row missing more than one field appears in more than one count "
-            f"above, so these do not sum to {len(not_ready)})"
+            f"above, so these do not sum to {len(not_ready):,})"
         )
     return "\n".join(lines)
 
@@ -1248,6 +1253,202 @@ class FileOutcomes:
     blank: dict[int, list[str]]
 
 
+@dataclass(frozen=True)
+class FileSurvey:
+    """What the Sheet says versus what is on the drive.
+
+    `claimed` is built before any matching runs, and `unclaimed` is its
+    complement. That ordering is the whole safety property: a file another
+    row already resolves to can never be proposed to a second row, which is
+    the misattribution hazard in issue #1.
+
+    `unresolved` holds only rows that ASSERTED a filename and were wrong.
+    Rows whose file_template cells are blank are counted in `not_ready` and
+    nowhere else - see survey_files()."""
+
+    unresolved: dict[int, str]
+    wanted: dict[int, str]
+    claimed: set[str]
+    unclaimed: dict[str, list[str]]
+    not_ready: list[int]
+
+
+def claim_key(folder_and_name: str) -> str:
+    """The one spelling of "some row has already taken this file".
+
+    `claimed` holds `<folder cell as typed>/<real disk name>`: the name half
+    comes back from resolve_file() exactly as it is on disk, but the folder
+    half is whatever the Sheet cell said. On Windows - a case-insensitive
+    filesystem - `SOP CD 1` and `sop cd 1` are ONE folder holding ONE
+    photograph, so keyed by the raw cell those two rows get two disjoint
+    namespaces and the check that stops two rows being pointed at one file
+    silently misses. os.path.normcase folds that difference on Windows and
+    nothing on Linux, where two such folders really are two folders - but
+    it goes by platform CONVENTION, not the actual filesystem, and on macOS
+    the convention (identity) disagrees with the default filesystem (APFS
+    is case-insensitive too), so the fold is done here instead. On the rare
+    case-sensitive Mac volume that fold merely withholds a same-name-
+    different-case file from auto-proposal - erring on the quiet side,
+    where the un-folded key errs by letting two rows take one file.
+
+    Every producer and every consumer of `claimed` goes through here: a set
+    half of whose members are normalized is worse than one that is not
+    normalized at all."""
+    if sys.platform == "darwin":
+        return folder_and_name.casefold()
+    return os.path.normcase(folder_and_name)
+
+
+def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurvey:
+    """Resolve every row, then work out which files nothing points at.
+
+    A row with a blank file_template cell is NOT unresolved - it is
+    not-ready, the same split resolve_sheet_files() draws between `errors`
+    and `blank`. Nobody asserted a file, so there is nothing to be wrong and
+    nothing a proposal could be matched against. Filing those as unresolved
+    made reconcile-files raise one dead prompt per uncatalogued row: on the
+    real Sheet that is ~2,900 prompts with no proposal and no candidates,
+    burying the ~150-300 genuinely fixable rows - the exact failure
+    docs/decisions/READINESS.md exists to prevent. They are counted in
+    `not_ready` so the run can say how many it passed over in one line.
+
+    Deliberately does not mutate rows, unlike resolve_sheet_files(): this runs
+    before any decision is made, and a row's cells must still read as the
+    operator wrote them when they are shown one."""
+    listing_cache: dict[Path, list[str]] = {}
+    fields = template_fields(config.file_template)
+    unresolved: dict[int, str] = {}
+    wanted: dict[int, str] = {}
+    claimed: set[str] = set()
+    folders: set[str] = set()
+    not_ready: list[int] = []
+
+    for offset, row in enumerate(rows):
+        row_number = offset + 2
+        folder = (row.get(fields[0]) or "").strip() if fields else ""
+        name_field = fields[-1] if fields else ""
+
+        blank = [name for name in fields if not (row.get(name) or "").strip()]
+        if blank:
+            not_ready.append(row_number)
+            continue
+
+        # After the blank check: a folder only an uncatalogued row names has
+        # no row that could be prompted about it, so listing it is a disk
+        # scan whose result nothing reads.
+        folders.add(folder)
+        try:
+            claimed.add(
+                claim_key(
+                    resolve_file(
+                        config.files_dir,
+                        candidate_path(config.file_template, row),
+                        listing_cache,
+                    )
+                )
+            )
+        except FileResolutionError:
+            unresolved[row_number] = folder
+            wanted[row_number] = (row.get(name_field) or "").strip()
+
+    unclaimed: dict[str, list[str]] = {}
+    for folder in sorted(f for f in folders if f):
+        directory = Path(config.files_dir) / folder
+        if not directory.is_dir():
+            continue
+        unclaimed[folder] = sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if entry.is_file()
+            and entry.suffix.lower() in config.photo_extensions
+            and claim_key(f"{folder}/{entry.name}") not in claimed
+        )
+    return FileSurvey(
+        unresolved=unresolved,
+        wanted=wanted,
+        claimed=claimed,
+        unclaimed=unclaimed,
+        not_ready=not_ready,
+    )
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str          # "accept" | "reject" | "stop"
+    filename: str        # the RESOLVED name, empty unless accepting
+    # How the operator answered, not what they answered. [y] accepts the
+    # proposal; [e] is a name they typed - which resolve_file() may well
+    # resolve to the proposed file anyway. Comparing the two strings cannot
+    # tell those apart, and the decision log has to.
+    typed: bool = False
+
+
+def prompt_for_decision(
+    row_number: int,
+    folder: str,
+    wanted: str,
+    proposal: Proposal | None,
+    unclaimed: list[str],
+    config: ProjectConfig,
+    claimed: set[str],
+    read_line=input,
+) -> Decision:
+    """Ask about one row and return what the operator decided.
+
+    `read_line` is injected so tests drive this without a terminal.
+
+    A typed name goes through the same resolve_file() every other path uses,
+    so it must resolve to exactly one real file AND that file must not
+    already be claimed. That is what keeps typing from becoming a new way to
+    introduce the error being fixed - and it means a name typed without its
+    extension, or in the wrong case, resolves anyway."""
+    shown = wanted or "(blank)"
+    print(f"row {row_number}  '{shown}'  does not resolve in '{folder}'")
+    keys = "[y] accept   " if proposal else ""
+    if proposal:
+        print(f"       proposed: '{proposal.filename}'   ({proposal.reason})")
+    # Reprinted on every path that lands the operator back at '>' from
+    # somewhere else - after [l]'s listing or a failed [e] the keys have
+    # scrolled away, and a bare '>' does not say which prompt this is.
+    keys_line = f"       {keys}[n] not this one   [e] type it   [l] list unclaimed   [q] stop"
+    print(keys_line)
+
+    while True:
+        answer = read_line("       > ").strip().lower()
+        if answer == "q":
+            return Decision(action="stop", filename="")
+        if answer == "n":
+            return Decision(action="reject", filename="")
+        if answer == "y" and proposal:
+            return Decision(action="accept", filename=proposal.filename)
+        if answer == "l":
+            if unclaimed:
+                for name in unclaimed:
+                    print(f"           {name}")
+            else:
+                print(f"           nothing unclaimed in '{folder}'")
+            print(keys_line)
+            continue
+        if answer == "e":
+            typed = read_line("       filename> ").strip()
+            if not typed:
+                print(keys_line)
+                continue
+            try:
+                resolved = resolve_file(config.files_dir, f"{folder}/{typed}", {})
+            except FileResolutionError as exc:
+                print(f"           {exc}")
+                print(keys_line)
+                continue
+            name = resolved.rpartition("/")[2]
+            if claim_key(resolved) in claimed:
+                print(f"           '{name}' is already used by another row")
+                print(keys_line)
+                continue
+            return Decision(action="accept", filename=name, typed=True)
+        print("           expected y, n, e, l or q")
+
+
 def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileOutcomes:
     """Resolves each row's file against disk BEFORE validation runs, so a row
     either carries a real, disk-verified 'file' value (and the resolved name,
@@ -1308,6 +1509,26 @@ def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> Fi
     return FileOutcomes(errors=errors, blank=blank)
 
 
+def split_structure_results(
+    structure_results: list[RowValidation], row_count: int
+) -> tuple[list[RowValidation], list[RowValidation]]:
+    """Split sheet_structure_validation()'s output into (header-level,
+    per-data-row) - the two halves every Sheet command treats differently: a
+    bad header stops the whole run, a bad row is skipped.
+
+    check_grid_shape and validate_rows both number rows `offset + 2`, so
+    `row_number - 2` indexes the data rows exactly. The bounds check is
+    load-bearing, not defensive: a bare `row_number - 2` would quietly fold
+    row 1 - where check_column_map's header defects are filed - into the LAST
+    data row via negative indexing."""
+    header_level: list[RowValidation] = []
+    per_row: list[RowValidation] = []
+    for entry in structure_results:
+        index = entry.row_number - 2
+        (per_row if 0 <= index < row_count else header_level).append(entry)
+    return header_level, per_row
+
+
 def validate_sheet_grid(
     rows: list[dict[str, str]],
     registry: dict,
@@ -1366,16 +1587,14 @@ def validate_sheet_grid(
             dict.fromkeys(row_result.missing_fields + blank_cells)
         )
 
-    header_results: list[RowValidation] = []
-    for entry in structure_results:
-        index = entry.row_number - 2
-        if 0 <= index < len(row_results):
-            row_result = row_results[index]
-            # structural errors first: a long row's mis-attributed values are
-            # the likely cause of whatever content errors follow.
-            row_result.errors = entry.errors + row_result.errors
-        else:
-            header_results.append(entry)
+    header_results, row_structure_results = split_structure_results(
+        structure_results, len(row_results)
+    )
+    for entry in row_structure_results:
+        # structural errors first: a long row's mis-attributed values are
+        # the likely cause of whatever content errors follow.
+        row_result = row_results[entry.row_number - 2]
+        row_result.errors = entry.errors + row_result.errors
 
     return header_results, row_results
 
@@ -1832,9 +2051,17 @@ def sheet_row_fingerprints(
     "is this still the same row?".
 
     The template's columns are the right fingerprint for one specific reason:
-    this tool never writes them. Checking `ia_identifier` instead would be
+    `upload` never writes them. Checking `ia_identifier` instead would be
     tautological on the reserve->confirm leg, because reserve is what put that
     value there - the check would be verifying its own write.
+
+    `reconcile-files` is the one command that DOES write a file_template
+    column (the filename cell, and only that one). It never runs inside an
+    upload run, so it cannot make this check verify its own write; a
+    reconciliation landing in the Sheet mid-upload instead makes that row
+    fingerprint as moved, so `upload` skips it and it goes out on the next
+    run - the safe direction, and the same outcome as any other human edit
+    to the same cell.
 
     Must be computed from the RAW cells, before resolve_sheet_files() rewrites
     row['file'] to the resolved name: the comparison is against a fresh read of
@@ -2792,7 +3019,7 @@ def upload_from_sheet(args) -> int:
         if not_ready_broken:
             verb = "has" if len(not_ready_broken) == 1 else "have"
             line += (
-                f" ({len(not_ready_broken)} of them also {verb} an unresolvable "
+                f" ({len(not_ready_broken):,} of them also {verb} an unresolvable "
                 "filename - run `validate` to see them)"
             )
         print(line)
@@ -3240,6 +3467,271 @@ def sync_from_csv(args) -> int:
     return 1 if counts["failure"] else 0
 
 
+RECONCILE_FLUSH_EVERY = 25
+
+
+@dataclass(frozen=True)
+class PendingCorrection:
+    """An accepted correction waiting to be written, carrying what its cell
+    said when it was matched.
+
+    `wanted` is the whole point of the dataclass: it is what flush() checks
+    the row against on a fresh read before writing, so a Sheet edited mid
+    session cannot land a filename on a photograph it was never about. Same
+    role as `sheet_row_fingerprints()` for `upload`, one cell wide."""
+
+    update: CellUpdate
+    row_number: int
+    wanted: str
+
+
+def log_decision(log_path, row_number: int, folder: str, wanted: str, status: str,
+                 chosen: str = "", reason: str = "", proposed: str = "",
+                 matches: list[str] | None = None) -> None:
+    """One line per row considered. Prompt-per-proposal leaves no record of
+    what was decided; this is that record.
+
+    `proposed` and `chosen` are separate on purpose. `chosen` is what was
+    written, so it is empty on every path but an acceptance - and a rejected
+    proposal with no record of WHAT was rejected cannot be reviewed later,
+    which is half of what this log is for. `matches` does the same job for
+    the ambiguous path, where the console names every candidate and the
+    durable record used to name none. Every key is present on every line,
+    empty where it does not apply, so a reader never has to know which
+    statuses carry which fields."""
+    entry = {
+        "row": row_number, "folder": folder, "wanted": wanted,
+        "status": status, "chosen": chosen, "proposed": proposed,
+        "matches": list(matches or []), "reason": reason,
+        "timestamp": utc_timestamp(),
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def cmd_reconcile_files(args) -> int:
+    registry = load_registry(args.registry)
+    config = load_project_config(registry, args.project)
+    live = bool(args.live)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    print(sheet_banner(config, live))
+    if dry_run:
+        print("--dry-run: nothing is written to the Sheet")
+    print()
+
+    try:
+        sheet = read_sheet(args, registry, config, live, "reconcile-files")
+    except SheetSetupFailed:
+        return 1
+
+    # A bad row is skipped; a bad header stops the whole run - the same split
+    # `upload` makes, for the same reason: a header defect corrupts every row
+    # identically, so unlike a bad row it cannot be routed around. It is not
+    # merely a missing warning here. Two headers normalizing to `file_name`
+    # leave grid_to_rows reading the LAST of them (dict comprehension, last
+    # key wins) while the write below targets the FIRST - so the correction
+    # lands in a column nothing reads, the effective cell keeps its stale
+    # value, and the run reports success. structural_rows are individual data
+    # rows whose cells may be shifted relative to the header (check_grid_shape);
+    # those are skipped rather than fatal.
+    header_defects, structural_rows = split_structure_results(
+        sheet.structure_results, len(sheet.rows)
+    )
+    if header_defects:
+        print("\n".join(_format_result_lines(header_defects)))
+        print()
+        print(
+            "the Sheet's header row has problems that affect every row - refusing to "
+            "reconcile anything until they are fixed",
+            file=sys.stderr,
+        )
+        return 1
+    if structural_rows:
+        print("\n".join(_format_result_lines(structural_rows)))
+        print(
+            f"{_pluralize(len(structural_rows), 'row')} above may have cells shifted "
+            "against the header - skipped, since which cell a correction would land in "
+            "is exactly what is in doubt"
+        )
+        print()
+
+    name_field = template_fields(config.file_template)[-1]
+    try:
+        name_column = next(
+            index for index, header in enumerate(sheet.column_map.headers)
+            if sheet.column_map.field_names[header] == name_field
+        )
+    except StopIteration:
+        print(
+            f"the Sheet has no '{name_field}' column, which file_template names - "
+            f"fix 'file_template' in {args.registry} or add the column.",
+            file=sys.stderr,
+        )
+        return 1
+
+    survey = survey_files(sheet.rows, config)
+    skipped_rows = {entry.row_number for entry in structural_rows}
+    to_review = [n for n in sorted(survey.unresolved) if n not in skipped_rows]
+    if survey.not_ready:
+        # One contained line, never one line (let alone one prompt) per row.
+        # The real Sheet is ~3,000 rows of which ~2,900 carry no filename at
+        # all; those are not-ready, not broken, and there is nothing an
+        # operator could decide about them here. Same judgment `upload`
+        # makes about the same rows - see docs/decisions/READINESS.md.
+        print(f"{_pluralize(len(survey.not_ready), 'row')} not yet catalogued - "
+              "no filename to reconcile, skipped")
+    if not to_review:
+        if survey.unresolved:
+            # Every row that failed resolution was skipped above, so there is
+            # nothing left to ask about - but saying "every row resolves"
+            # here would be untrue.
+            print("nothing left to reconcile - every row that named a file either "
+                  "resolves or was skipped above")
+        else:
+            print("nothing to reconcile - every row with a filename resolves against the drive")
+        return 0
+
+    print(f"{_pluralize(len(to_review), 'row')} named a file that does not resolve")
+    print()
+
+    log_path = None if dry_run else open_log(args.log_dir, "reconcile-files")
+    pending: list[PendingCorrection] = []
+    accepted = stopped = 0
+
+    def flush() -> bool:
+        """Write what has been accepted, dropping anything whose row moved.
+
+        This command has by far the longest read-to-write window in the tool:
+        an interactive session over a Sheet several volunteers share can put
+        an hour between the grid read that fixed `row_number` and the write
+        that uses it, and one row inserted or deleted in that hour shifts
+        every later write by one - silently putting a filename on the wrong
+        photograph. `upload` already refuses to write through that window
+        (sheet_row_fingerprints/read_sheet_snapshot/split_moved_targets);
+        this is the same idea at a fraction of the cost, since reconcile
+        knows exactly what each target cell said when it matched.
+
+        A re-read that fails stops the run rather than writing unverified:
+        the whole point is that an unchecked write here is the hazard."""
+        nonlocal pending, accepted
+        if not pending:
+            return True
+        try:
+            grid = sheet.client.read_grid()
+        except Exception as exc:
+            print(
+                f"could not re-read the Sheet to check the rows before writing: {exc}. "
+                "Stopping here without writing - rerun to pick these up.",
+                file=sys.stderr,
+            )
+            return False
+
+        updates: list[CellUpdate] = []
+        for correction in pending:
+            now = cell_value(grid, correction.row_number, name_column)
+            if now != correction.wanted:
+                accepted -= 1
+                print(f"row {correction.row_number}  the Sheet now says '{now}' where this "
+                      f"run read '{correction.wanted}' - the row moved or was edited, so "
+                      "the correction was NOT written")
+                continue
+            updates.append(correction.update)
+
+        try:
+            sheet.client.write_cells(updates)
+        except Exception as exc:
+            print(f"the Sheet write failed: {exc}. Stopping here.", file=sys.stderr)
+            return False
+        pending = []
+        return True
+
+    for row_number in to_review:
+        folder = survey.unresolved[row_number]
+        wanted = survey.wanted[row_number]
+        # survey.unclaimed is a snapshot taken once, before any row in this
+        # run was decided - it never shrinks on its own. Re-filter against
+        # survey.claimed on every iteration (not just once before the loop):
+        # accepting row N adds its file to `claimed` a few lines below, and
+        # without this filter row N+1 in the same folder would still see
+        # that same file as a candidate and could be proposed - and
+        # accepted onto - it too. That is the exact misattribution FileSurvey's
+        # own docstring promises cannot happen.
+        candidates = [
+            name for name in survey.unclaimed.get(folder, [])
+            if claim_key(f"{folder}/{name}") not in survey.claimed
+        ]
+        try:
+            proposal = propose_match(wanted, candidates)
+            reason = proposal.reason if proposal else ""
+        except AmbiguousMatch as exc:
+            print(f"row {row_number}  '{wanted}'  matches {len(exc.matches)} files - "
+                  f"leaving it alone: {', '.join(exc.matches)}")
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted, "ambiguous",
+                             matches=exc.matches)
+            continue
+
+        if dry_run:
+            if proposal:
+                print(f"row {row_number}  '{wanted}' -> '{proposal.filename}'  ({reason})")
+            else:
+                print(f"row {row_number}  '{wanted}'  no candidate in '{folder}'")
+            continue
+
+        decision = prompt_for_decision(
+            row_number, folder, wanted, proposal, candidates, config, survey.claimed
+        )
+        if decision.action == "stop":
+            stopped = 1
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted, "stopped")
+            break
+        if decision.action == "reject":
+            if log_path:
+                log_decision(log_path, row_number, folder, wanted,
+                             "rejected" if proposal else "no_candidate", reason=reason,
+                             proposed=proposal.filename if proposal else "")
+            continue
+
+        accepted += 1
+        survey.claimed.add(claim_key(f"{folder}/{decision.filename}"))
+        pending.append(
+            PendingCorrection(
+                update=CellUpdate(
+                    f"{column_letter(name_column)}{row_number}", decision.filename
+                ),
+                row_number=row_number,
+                wanted=wanted,
+            )
+        )
+        if log_path:
+            # From how the operator answered, not from whether the two
+            # strings happen to agree: a name typed at [e] that matches the
+            # proposal is still a name a human typed, and a log that calls
+            # it `accepted` claims the tool proposed something it did not.
+            status = "typed" if decision.typed else "accepted"
+            log_decision(log_path, row_number, folder, wanted, status,
+                         chosen=decision.filename, reason=reason,
+                         proposed=proposal.filename if proposal else "")
+        if len(pending) >= RECONCILE_FLUSH_EVERY and not flush():
+            return 1
+
+    if not flush():
+        return 1
+
+    print()
+    print(f"{accepted} filename(s) corrected")
+    remaining = len(to_review) - accepted
+    if remaining:
+        print(f"{_pluralize(remaining, 'row')} still unresolved")
+    if stopped:
+        print("stopped early - rerun to pick up where this left off")
+    if log_path:
+        print(f"log written to {log_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ia_bulk",
@@ -3372,6 +3864,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    reconcile_parser = subparsers.add_parser(
+        "reconcile-files",
+        help="Find rows whose filename does not resolve against the drive and correct them",
+    )
+    reconcile_parser.add_argument("--project", required=True, help="Project ID from the registry")
+    reconcile_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    reconcile_parser.add_argument("--live", action="store_true", help="Read and write the project's real Sheet instead of its test Sheet")
+    reconcile_parser.add_argument("--dry-run", action="store_true", help="Print what would be proposed; prompt for nothing and write nothing")
+    reconcile_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
+
     return parser
 
 
@@ -3385,6 +3887,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_upload(args)
     if args.command == "sync-metadata":
         return cmd_sync_metadata(args)
+    if args.command == "reconcile-files":
+        return cmd_reconcile_files(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2

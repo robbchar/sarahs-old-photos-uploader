@@ -248,3 +248,32 @@ def test_a_projects_value_that_is_not_an_object_is_a_config_error():
         load_project_config(registry, "p")
 
     assert "'projects' must be an object" in str(exc.value)
+
+
+def test_photo_extensions_defaults_when_absent():
+    """Optional-with-a-default, unlike required_for_upload which refuses to
+    default. Extensions describe what a photo file IS; required_for_upload
+    encodes editorial policy that should not be inherited by silence."""
+    from project_config import DEFAULT_PHOTO_EXTENSIONS
+
+    config = load_project_config(_registry(), "p")
+    assert config.photo_extensions == DEFAULT_PHOTO_EXTENSIONS
+    assert ".pdf" not in config.photo_extensions
+
+
+def test_photo_extensions_are_normalized_to_lowercase_with_a_dot():
+    config = load_project_config(_registry(photo_extensions=["JPG", ".TIFF"]), "p")
+    assert config.photo_extensions == (".jpg", ".tiff")
+
+
+def test_photo_extensions_must_be_a_list_of_strings():
+    with pytest.raises(ConfigError, match="photo_extensions"):
+        load_project_config(_registry(photo_extensions="jpg"), "p")
+    with pytest.raises(ConfigError, match="photo_extensions"):
+        load_project_config(_registry(photo_extensions=[1]), "p")
+
+
+def test_photo_extensions_may_not_be_empty():
+    """An empty list would silently exclude every file on the drive."""
+    with pytest.raises(ConfigError, match="at least one"):
+        load_project_config(_registry(photo_extensions=[]), "p")

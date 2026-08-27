@@ -305,6 +305,85 @@ The `--csv` path is the offline fallback and is the only one that needs
 target has to come from the upload log's `uploaded_as` field. See
 [`DECISIONS.md`](DECISIONS.md), "The Sheet is the correction".
 
+## Reconciling filenames
+
+`reconcile-files` reads the Sheet live like `validate`/`upload`, but
+neither uploads nor changes metadata. `survey_files()` resolves every row
+against `files_dir` the same way `resolve_sheet_files()` does, and returns
+a `FileSurvey` splitting the result into `claimed` (every disk file some
+row currently resolves to) and `unclaimed` (every file matching the
+project's `photo_extensions`, in a row's own folder, that no row claims;
+both keyed through `claim_key()`, so two rows spelling one folder
+differently — `SOP CD 1` and `sop cd 1`, one folder on a case-insensitive
+filesystem — cannot end up in two disjoint namespaces with the duplicate
+check missing between them) —
+plus `unresolved`/`wanted`, the row numbers that failed and what each
+one's filename cell said. A row whose `file_template` cells are blank is
+counted in `not_ready` and appears in none of the other three: it asserted
+no file, so it is not-ready rather than broken (the same split
+`resolve_sheet_files()` draws between `errors` and `blank`), and
+`cmd_reconcile_files` reports the count in one line rather than raising a
+prompt with no proposal and no candidates for each of the ~2,900
+uncatalogued rows. Unlike `resolve_sheet_files()`, it never mutates
+the rows it's given: reconciliation shows a row's own cells to a human
+before any decision is made, so they have to still read exactly as
+written.
+
+`propose_match()` (`reconcile.py`) looks for a single best match for an
+unresolved row among that row's `unclaimed` candidates — see
+[`DECISIONS.md`](decisions/RECONCILIATION.md) for the two-pass matching
+strategy and its guards. `cmd_reconcile_files` prompts about each
+proposal via `prompt_for_decision()` and, on acceptance, batches a
+`CellUpdate` for that row's filename column alone, flushing every
+`RECONCILE_FLUSH_EVERY` (25) accepted rows so a long interactive session
+doesn't hold hundreds of accepted corrections in memory, unsaved, until
+the very end.
+
+**Accepted corrections are re-checked before they are written.**
+`flush()` re-reads the grid and drops any pending update whose row no
+longer holds the filename it was matched against, saying so on screen. This
+is the same hazard `upload`'s `sheet_row_fingerprints()` guard exists for,
+one cell wide: `reconcile-files` has the longest read-to-write window in
+the tool — an interactive session over a shared Sheet — so a row inserted
+or deleted mid-session would otherwise shift every later write by one. A
+re-read that fails stops the run rather than writing unverified.
+Reconciliation is also the **only** command that writes a `file_template`
+column, which `sheet_row_fingerprints()` otherwise relies on being
+never-written; the two never run together, and a correction landing during
+an `upload` makes that row fingerprint as moved and be skipped, which is
+the safe direction.
+
+**The candidate pool shrinks as the run progresses.** `claimed` is a
+snapshot built once, before any row is decided, but the candidates offered
+to each row are re-filtered against it on *every* iteration of the loop —
+not computed once before the loop starts, and `unclaimed` itself is never
+recomputed. Accepting a file for one row adds it to `claimed` immediately,
+so a later row in the same folder never sees it as a candidate again.
+Without that per-iteration filter, two misspelled rows in one folder that
+both happen to be within matching distance of the same single file on
+disk could each be proposed it — and each accepted onto it — pointing two
+Sheet rows at one photograph. A review caught exactly this: the original
+implementation filtered `unclaimed` against `claimed` only once, before
+the loop started.
+
+`log_decision()` writes reconciliation's own JSONL shape — one line per
+row *considered*, not per row acted on:
+`{row, folder, wanted, status, chosen, proposed, matches, reason,
+timestamp}`, with `status` one of
+`accepted`/`typed`/`rejected`/`no_candidate`/`ambiguous`/`stopped`. Every
+key is on every line, empty where it does not apply. `chosen` is what was
+written and so is empty on every path but an acceptance; `proposed` is what
+the tool put forward, which is the only record of *what* a rejection turned
+down; `matches` names the files an `ambiguous` row could not be chosen
+between. `accepted` versus `typed` comes from how the operator answered
+(`[y]` versus `[e]`), not from comparing the two strings — a name typed at
+`[e]` is still typed when it happens to equal the proposal.
+This is a different record than `upload`/`sync-metadata`'s per-row-result
+log below, because it answers a different question later: not "did this
+identifier upload", but "what did a human decide about this row, and
+why". `--dry-run` opens no log at all — nothing here was decided, only
+printed.
+
 ## Logging and resume
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:

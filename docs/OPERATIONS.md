@@ -81,6 +81,54 @@ wrong metadata if this step is skipped. Follow
 [`CSV-PREPARATION.md`](CSV-PREPARATION.md) — it is the highest-risk step on
 that path.
 
+## 0. Reconcile file names (when rows don't resolve)
+
+Not one of the four phases above — a prerequisite for the first of them,
+needed only when it applies. Run it whenever `validate` (§1) reports rows
+whose filename cell doesn't resolve against the drive, before trusting the
+rest of that report.
+
+```bash
+# see what it would propose, without prompting or writing anything
+python ia_bulk.py reconcile-files --project sarasoldphotos --dry-run
+
+# work through the mismatches interactively
+python ia_bulk.py reconcile-files --project sarasoldphotos
+```
+
+It reads the Sheet live, finds every row that *named* a file which
+doesn't resolve, and proposes a correction for the ones it can — one row
+at a time, nothing written until you press `[y]` or type one at `[e]`. A
+row whose filename cell is blank is not yet catalogued rather than broken:
+it is reported as a single count and never prompted about, so a run on the
+full Sheet asks about the couple of hundred rows an operator can act on
+rather than the ~2,900 that have no filename to correct. See
+[`README.md`](../README.md#reconcile-files-correct-a-filename-cell-that-doesnt-match-the-drive)
+for the prompt keys and exactly what it does and does not touch.
+
+**Why before validate.** "Why this is a hard rule" below walks through the
+real case this project already hit: of three rows that failed file
+resolution in a nine-row rehearsal, two were real, unnoticed mismatches —
+of two different kinds. `Finnis Meat Market.jpg` vs `Finnish Meat
+Market.jpg` is a plain human typo. `Roy's Shell.jpg` vs ` Roy_s  Shell.jpg`
+is not a typo at all: apostrophes and doubled spaces get mangled when
+files are copied off source media, so a volunteer's transcription of that
+one, correct by eye, still doesn't match the disk — no amount of care
+would have caught it. `reconcile-files` needs both of its matching passes
+because of that split: an exact match after normalization catches the
+`Roy_s` kind, edit distance catches the `Finnis` kind. `validate`'s error
+list and not-ready breakdown are only a useful signal if a row reported
+broken is actually broken rather than mismatched in one of these two
+ways, so working through both first is what makes the rest of
+`validate`'s report worth trusting. See
+[`docs/decisions/RECONCILIATION.md`](decisions/RECONCILIATION.md) for why
+reconciliation only ever proposes a correction rather than applying one,
+and why its exit code stays `0` while rows remain unresolved.
+
+Safe to run repeatedly — a Sheet with nothing left to reconcile prints
+`nothing to reconcile - every row with a filename resolves against the
+drive` and does nothing else.
+
 ## 1. Validate (no uploads, no writes)
 
 > **Run this before every `upload`, every time.** It is not optional and it is

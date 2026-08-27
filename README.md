@@ -339,6 +339,87 @@ field alone"; to actually delete an existing field on the IA item, put the
 literal value `REMOVE_TAG` in that cell (the same sentinel the official
 `ia` CLI's `--modify field:REMOVE_TAG` uses).
 
+### `reconcile-files` — correct a filename cell that doesn't match the drive
+
+```bash
+python ia_bulk.py reconcile-files --project sarasoldphotos --dry-run
+python ia_bulk.py reconcile-files --project sarasoldphotos
+```
+
+It reads the Sheet live and resolves every row's file the same way
+`validate`/`upload` do. Rows that resolve are left alone entirely — never
+prompted about, never written to. So are rows nobody has catalogued yet:
+a row whose filename cell is blank asserted no file, so there is nothing
+to be wrong and nothing to propose — they are counted in one line
+(`2,914 rows not yet catalogued - no filename to reconcile, skipped`) and
+never prompted about, the same not-ready-versus-broken split
+[`docs/decisions/READINESS.md`](docs/decisions/READINESS.md) draws for
+`validate` and `upload`. For each row that named a file and does **not**
+resolve,
+it looks for a single best match among the files still unclaimed in that
+row's own folder and asks before touching the Sheet:
+
+```
+row 7  'CD 1 01 53 34 2 Finnis Meat Market.jpg'  does not resolve in 'SOP CD 1'
+       proposed: 'CD 1 01 53 34 2 Finnish Meat Market.jpg'   (edit distance 1)
+       [y] accept   [n] not this one   [e] type it   [l] list unclaimed   [q] stop
+       >
+```
+
+Prompt keys: `[y]` accept the proposal (only offered when there is one);
+`[n]` leave this row alone and move on; `[e]` type a filename yourself — it
+is resolved against disk the same way a proposal is, so a typo here is
+caught and re-asked rather than written; `[l]` list every unclaimed file in
+the row's folder; `[q]` stop the run — whatever was already accepted before
+`[q]` has already been written, so it's safe to rerun later and pick up
+where this left off. When more than one file matches equally well,
+reconciliation asks nothing and leaves the row alone, naming every match on
+screen — the same "never guess between two" rule `resolve_file()` follows
+everywhere else; see
+[`docs/decisions/RECONCILIATION.md`](docs/decisions/RECONCILIATION.md).
+
+A header defect — two Sheet columns whose names normalize to the same IA
+field, or one that normalizes to nothing — stops the run before anything is
+proposed, because it corrupts every row identically and would send the
+correction to a different column than the one the value was read from. A
+single *data* row longer than the header is skipped and named instead; the
+rest of the run proceeds.
+
+It writes only the `file_name` column — whichever Sheet column
+`file_template`'s last segment names — never `folder_on_lacie_drive`, and
+never anything else on the row. A wrong folder cell is left for a human;
+reconciliation only ever searches inside the folder a row already names.
+
+A file accepted for one row is removed from the pool offered to every row
+still to come in the same run, so two misspelled rows in one folder can
+never both be pointed at the same photograph.
+
+Before each batch of accepted corrections is written, the Sheet is read
+again and any correction whose row no longer holds the filename it was
+matched against is dropped and reported rather than written — a session can
+run for an hour on a Sheet other volunteers are editing, and one row
+inserted in that time would otherwise shift every later write onto the
+wrong photograph.
+
+Exits `0` whether or not every row ends up resolved — rows left for later
+are the normal state of a ~10,000-row backlog worked over many sessions,
+not a failure; see
+[`docs/decisions/RECONCILIATION.md`](docs/decisions/RECONCILIATION.md#exit-code-is-0-while-work-remains).
+Unless `--dry-run` is passed, it writes a timestamped log to `--log-dir`
+(default `logs/`), one line per row considered, recording what was
+proposed and what was decided.
+
+Which files on disk even count as photographs — and so can ever be
+proposed — is the project's `photo_extensions` in
+`projects_registry.json`: optional, defaulting to `.jpg`/`.jpeg`/`.tif`/
+`.tiff`/`.png` when a project doesn't set one. That default is what keeps
+the contact-sheet PDFs already sitting alongside the photos on the drive
+from ever being offered as a match.
+
+`--live` reads and writes the real Sheet instead of the test one, same as
+every other command. There is no `--csv` path — reconciliation only makes
+sense against the live Sheet it is correcting.
+
 ## Safety rail
 
 By default every command targets IA's `test_collection` sandbox. The Sheet's
