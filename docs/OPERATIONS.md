@@ -129,7 +129,29 @@ Safe to run repeatedly — a Sheet with nothing left to reconcile prints
 `nothing to reconcile - every row with a filename resolves against the
 drive` and does nothing else.
 
-## 1. Validate (no uploads, no writes)
+## 0b. Append rows for files that have no row (after reconciling)
+
+The other half of the same job: once every row that names a file resolves,
+files still unclaimed are genuinely uncatalogued, and this appends a
+skeleton row — folder and filename cells only — for each of them.
+
+```bash
+# see what would be appended, grouped by folder
+python ia_bulk.py append-rows --project sarasoldphotos --dry-run
+
+# append for real
+python ia_bulk.py append-rows --project sarasoldphotos
+```
+
+The order is not optional, and the tool enforces it: `append-rows` refuses
+to run while any row names a file that does not resolve, because a typo'd
+row and a missing row both present as "unclaimed file" — appending first
+would create a duplicate row for every photograph a typo'd row already
+means. Work through `reconcile-files` (§0) until it has nothing left, then
+append. Safe to re-run: a second pass over an unchanged drive appends
+nothing. See
+[`README.md`](../README.md#append-rows--add-skeleton-rows-for-files-that-have-no-row)
+for exactly what it writes and refuses.
 
 > **Run this before every `upload`, every time.** It is not optional and it is
 > not a first-run-only step. `validate` performs the *same* file resolution

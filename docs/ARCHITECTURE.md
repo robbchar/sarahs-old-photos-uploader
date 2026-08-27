@@ -384,6 +384,45 @@ identifier upload", but "what did a human decide about this row, and
 why". `--dry-run` opens no log at all — nothing here was decided, only
 printed.
 
+## Appending skeleton rows
+
+`append-rows` is reconciliation's other half: once every row that names a
+file resolves, files still unclaimed are genuinely uncatalogued, and
+`cmd_append_rows` appends one row per such file — values in the
+`file_template` columns only, placed by the real header's column indexes
+and padded to its width, every other cell blank for the cataloguer.
+
+It does **not** reuse `survey_files()`'s `unclaimed` map, and the
+difference is the point: that map only lists folders some catalogued row
+already names (reconcile can only prompt about rows that exist), while
+`scan_unclaimed_files()` walks every subdirectory of `files_dir` — a
+brand-new donor folder with zero rows is exactly what append exists to
+pick up. Both sides key through `claim_key()`. Photo files at the top of
+`files_dir`, outside any folder, are reported rather than silently
+skipped: a folder/name template cannot express a row for them.
+
+Two gates are stricter than reconcile's. Any unresolved row is fatal (see
+[`DECISIONS.md`](decisions/RECONCILIATION.md), "Reconciliation ships
+before append") — a typo'd row and a missing row both present as an
+unclaimed file, so appending past one duplicates a photograph's row. And a
+structurally shifted data row, which reconcile merely skips, is fatal
+here: reconcile's operator approves rows one at a time, but append trusts
+the whole survey at once, and a misread row can make the file it really
+means look unclaimed.
+
+The write is `SheetClient.append_rows()` — a single `values.append` call
+with `RAW` (a filename starting with `=` must land as text, the same
+reason `write_cells` uses it) and `INSERT_ROWS` (add rows, never overwrite
+whatever sits below the table). The API finds the end of the data itself,
+so no row index is computed — or raced over — on this side; there is no
+moved-row window to guard the way reconcile's `flush()` must. Idempotence
+comes from the drive and the Sheet, not from any state the command keeps:
+appended rows resolve on the next survey, so their files are claimed and a
+rerun over an unchanged drive appends nothing. The run log
+(`append-rows-<timestamp>.jsonl`, `{folder, name, status, timestamp}`) is
+written only after the append call succeeds — it records what happened,
+not what was attempted.
+
 ## Logging and resume
 Every `upload`/`sync-metadata` run writes a timestamped JSONL log to
 `logs/<command>-<timestamp>.jsonl`, one line per row:
