@@ -214,10 +214,11 @@ when the fix is the command line, or the reverse.
 
 `project_id` is a **required** parameter all the way down
 (`check_identifier`, `validate_rows`, `validate_csv_rows`,
-`validate_sheet_rows`, `validate_identifiers`) rather than one defaulting to
-anything. A default is how a future call site silently re-acquires this bug,
-and it costs nothing to spell out: the Sheet paths already hold
-`config.project_id`, and the CSV paths already hold `args.project`.
+`validate_sheet_rows`, `validate_identifiers`, `plan_sync_targets`) rather
+than one defaulting to anything. A default is how a future call site
+silently re-acquires this bug, and it costs nothing to spell out: the Sheet
+paths already hold `config.project_id`, and the CSV paths already hold
+`args.project`.
 
 ### The `--csv` paths gained an unknown-project guard with it
 
@@ -231,3 +232,19 @@ and repeated once per row, naming the wrong file to go fix. So all three
 `--csv` entry points now refuse an unregistered `--project` up front, with
 the same wording the Sheet paths already used (`unregistered_project_error`
 in `project_config.py`).
+
+### `sync-metadata` on the Sheet path checks the item, not a column
+
+The Sheet path never runs `validate_identifiers`: it corrects rows that
+already uploaded, and the item it sends to is whatever `ia_url` records, not
+whatever an identifier column says. So the check is made against that item
+instead, in `plan_sync_targets` — a row whose `ia_url` was pasted from
+another project (or copied in with the row) is reported as a problem and
+skipped rather than corrected.
+
+This is the highest-stakes instance of issue #2 and the reason the check
+could not simply be left to the row-validation helpers: everywhere else a
+wrong-project identifier misfiles *this* project's item, but here it
+overwrites *another* project's metadata. Test items are read through their
+stamp (`item_project_id`), since `ia_url` in test mode records
+`zztest-<stamp>-<identifier>`.

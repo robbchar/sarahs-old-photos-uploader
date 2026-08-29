@@ -2380,6 +2380,20 @@ def identifier_from_url(url: str) -> str | None:
     return url[len(ITEM_URL_PREFIX):].strip("/") or None
 
 
+def item_project_id(uploaded_as: str, live: bool) -> str | None:
+    """The PROJECTID of the item `uploaded_as` names, or None if it cannot be
+    read as one of this tool's identifiers.
+
+    A test item is `zztest-<stamp>-<identifier>` (see effective_identifier),
+    so the real identifier is whatever follows the stamp - the stamp itself is
+    dropped rather than parsed, since it is only ever the run's timestamp."""
+    real = uploaded_as.strip()
+    if not live and real.startswith(TEST_IDENTIFIER_PREFIX):
+        _stamp, _sep, real = real[len(TEST_IDENTIFIER_PREFIX):].partition("-")
+    parsed = parse_identifier(real)
+    return parsed[1] if parsed else None
+
+
 def sheet_upload_metadata(
     target: UploadTarget, uploadable: frozenset[str], mediatype: str
 ) -> dict[str, str]:
@@ -3294,9 +3308,16 @@ class SyncTarget:
 
 
 def plan_sync_targets(
-    rows: list[dict[str, str]], column_map: ColumnMap, live: bool
+    rows: list[dict[str, str]], column_map: ColumnMap, live: bool, project_id: str
 ) -> tuple[list[SyncTarget], list[RowValidation]]:
     """Decides which rows this run will correct, and what it will send.
+
+    project_id is the run's own --project, required here for the same reason
+    check_identifier requires it (issue #2). This path targets whatever item
+    `ia_url` names, so a cell pointing at another project's item does not
+    merely misfile this project's row - it overwrites that project's
+    metadata. The --csv path gets this check from validate_identifiers; the
+    Sheet path never runs that, so it is made here.
 
     Scope is RowState.DONE and nothing else. An UNASSIGNED row has no item to
     correct, and a RESERVED row's upload never confirmed - correcting metadata
@@ -3373,6 +3394,20 @@ def plan_sync_targets(
                         f"test mode, but '{IA_URL_COLUMN}' points at the real item "
                         f"'{uploaded_as}'. Refusing to send a rehearsal correction to a "
                         "permanent item - pass --live if that is what you meant"
+                    ],
+                )
+            )
+            continue
+
+        if item_project_id(uploaded_as, live) != project_id:
+            problems.append(
+                RowValidation(
+                    row_number=row_number,
+                    identifier=identifier,
+                    errors=[
+                        f"'{IA_URL_COLUMN}' points at item '{uploaded_as}', which does not "
+                        f"belong to this run's --project {project_id}. Refusing to send this "
+                        "project's metadata to another project's item"
                     ],
                 )
             )
@@ -3511,7 +3546,7 @@ def sync_from_sheet(args) -> int:
         )
         return 1
 
-    targets, problems = plan_sync_targets(rows, column_map, live)
+    targets, problems = plan_sync_targets(rows, column_map, live, config.project_id)
 
     if problems:
         print("\n".join(_format_result_lines(problems)))

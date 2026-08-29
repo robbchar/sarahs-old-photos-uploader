@@ -7433,6 +7433,43 @@ def test_sync_from_sheet_refuses_to_send_a_test_correction_to_a_real_item(
     assert exit_code == 1
 
 
+def test_sync_from_sheet_refuses_an_item_belonging_to_another_project(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #2 on the Sheet path. This command sends metadata to whatever
+    item ia_url names, so a cell pointing at another project's item does not
+    misfile this row - it overwrites that project's item."""
+    from ia_bulk import cmd_sync_metadata
+
+    grid = _synced_grid([
+        ["Somebody else's item", "photo1.jpg", "lcps-astoriaphotos-00001",
+         "2026-08-23T16:13:31Z",
+         f"https://archive.org/details/zztest-{SYNC_STAMP}-lcps-otherproject-00099",
+         "photo1.jpg"],
+    ])
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "does not belong to this run's --project astoriaphotos" in out
+    assert exit_code == 1
+
+
+def test_item_project_id_reads_through_a_test_stamp():
+    """The stamp is dropped, not parsed - a test item's project is the one in
+    the real identifier it wraps."""
+    from ia_bulk import item_project_id
+
+    assert item_project_id(f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001", live=False) == (
+        "astoriaphotos"
+    )
+    assert item_project_id("lcps-astoriaphotos-00001", live=True) == "astoriaphotos"
+    assert item_project_id("something-a-human-pasted", live=True) is None
+
+
 def test_sync_from_sheet_counts_an_unchanged_item_as_unchanged_not_a_failure(
     tmp_path, monkeypatch, capsys
 ):
