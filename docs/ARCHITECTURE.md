@@ -174,7 +174,15 @@ Classification happens at that point, in `resolve_sheet_files`, because it is
 the last point the raw candidate still exists: afterward, a row nobody
 touched and a row with a typo'd filename are both `row["file"] == ""` and
 indistinguishable. A non-blank candidate that fails to resolve is recorded in
-`FileOutcomes.errors` instead — a real error, not a readiness fact.
+`FileOutcomes.errors` instead — a real error, not a readiness fact. So are
+ALL rows of a group resolving to the same disk file (keyed through
+`claim_key()`, like the reconcile survey): two rows cannot claim one
+photograph, and identical `file_template` cells would also blind the
+mid-run-edit guard's fingerprint. Only the remedy differs between them — a
+group holding exactly one already-uploaded row names that row as the one to
+keep, since its identifier is permanent and its row is the only link to that
+identifier's metadata. See
+[`SHEET-PROTOCOL.md`](decisions/SHEET-PROTOCOL.md#a-fingerprint-only-proves-identity-while-it-is-unique).
 
 **`required_for_upload` is a registry key, not a code constant.** It has no
 default (a missing key is a hard `ConfigError` from `load_project_config`),
@@ -196,8 +204,14 @@ title).
 Per chunk, `SheetUploadRun.execute()` does four things in this order:
 
 1. **verify** — re-reads the Sheet and checks, per target, that its
-   `file_template` columns still fingerprint the same photograph and that
-   `ia_identifier` is still blank or already ours (see
+   `file_template` columns still fingerprint the same photograph, that —
+   before the reserve write only — no OTHER row in the fresh read carries
+   the same fingerprint (a duplicated fingerprint proves nothing about which
+   physical row is underneath; after reserve the row's own proven-unique
+   number is the stronger proof, and vetoing there would withhold the
+   confirm write for edits that shifted nothing — see
+   [`SHEET-PROTOCOL.md`](decisions/SHEET-PROTOCOL.md#a-fingerprint-only-proves-identity-while-it-is-unique)),
+   and that `ia_identifier` is still blank or already ours (see
    [`DECISIONS.md`](decisions/SHEET-PROTOCOL.md#a-rows-identity-is-its-file_template-columns-not-its-ia_identifier)
    for why the fingerprint, not `ia_identifier`, is what makes this check
    meaningful). Targets that moved are reported and skipped, never written to.

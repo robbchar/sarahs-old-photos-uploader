@@ -203,12 +203,21 @@ If the Sheet becomes unreadable mid-run, or one of the four `ia_` columns is
 renamed or deleted, the run stops cleanly with the reason on stderr, still
 prints its summary and log path, and exits non-zero.
 
-That said, the check is a safety net, not a licence. It cannot distinguish two
-rows whose `file_template` columns are identical — if a shift moves one onto
-the other, the guard passes and the identifier and URL are written to the
-wrong row (the file itself still uploads correctly, and rows already marked
-uploaded cannot be touched). So: **avoid editing the Sheet while a run is in
-progress.**
+Two rows resolving to the same file would defeat that fingerprint — identical
+`file_template` cells are identical fingerprints — so they are refused
+outright: `validate` and `upload` flag both rows of such a pair as errors
+(two rows cannot claim one photograph; that would mint it two permanent
+identifiers) — and if one of them has already uploaded, it is named as the
+row to keep rather than offered for deletion. If a duplicate appears before
+a run reserves its numbers, the guard treats the now ambiguous fingerprint
+as unable to prove anything and skips the row like any other moved one; once
+a row holds the run's own number, that number is the proof instead, so a
+duplicate appearing later cannot withhold the write that records the upload.
+See
+[`SHEET-PROTOCOL.md`](docs/decisions/SHEET-PROTOCOL.md#a-fingerprint-only-proves-identity-while-it-is-unique).
+
+That said, the check is a safety net, not a licence. So: **avoid editing the
+Sheet while a run is in progress.**
 
 **A failing row is skipped, not fatal.** One unresolvable file in row 9,000
 does not block the other 9,999; the failures are listed with their errors, the

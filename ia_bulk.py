@@ -1472,10 +1472,26 @@ def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> Fi
 
     Shared by `validate` and `upload` deliberately: the value `upload` records
     in `ia_identifier_bib` has to be the same resolved name `validate` showed
-    the operator, and two copies of this loop would eventually disagree."""
+    the operator, and two copies of this loop would eventually disagree.
+
+    Rows resolving to the SAME file are all errors - every row in the group,
+    not just the ones after the first, because the tool usually cannot know
+    which row is the wrong one and flagging all but one silently elects a
+    winner. The exception is a group holding exactly one row that has already
+    uploaded: that row's identifier is permanent and its row is the only link
+    between the identifier and its metadata, so it is named as the one to
+    keep rather than offered for deletion alongside the others. Two
+    rows claiming one photograph would mint two permanent identifiers for it,
+    and - issue #1 - identical file_template cells are identical fingerprints,
+    which is exactly when the mid-run-edit guard stops being able to tell the
+    rows apart. Keyed on claim_key() of the RESOLVED path, not the raw cells:
+    the resolver is deliberately forgiving (case, extension), so two rows can
+    spell one disk file differently, and the raw cells would miss them."""
     listing_cache: dict[Path, list[str]] = {}
     errors: dict[int, str] = {}
     blank: dict[int, list[str]] = {}
+    resolved_rows: dict[int, str] = {}
+    claims: dict[str, list[int]] = {}
     fields = template_fields(config.file_template)
 
     for offset, row in enumerate(rows):
@@ -1505,6 +1521,52 @@ def resolve_sheet_files(rows: list[dict[str, str]], config: ProjectConfig) -> Fi
             continue
         row["file"] = resolved
         row[IA_IDENTIFIER_BIB_COLUMN] = resolved
+        resolved_rows[row_number] = resolved
+        claims.setdefault(claim_key(resolved), []).append(row_number)
+
+    # Second pass, because the FIRST row of a duplicate group is already
+    # resolved and recorded by the time the second one reveals the conflict.
+    for claimants in claims.values():
+        if len(claimants) < 2:
+            continue
+        # "The tool cannot know which row is the wrong one" stops being true
+        # the moment exactly one claimant has already uploaded: its identifier
+        # is permanent, and its Sheet row is the only thing tying that
+        # identifier to its metadata - including the ia_url `sync-metadata`
+        # reads to find its targets. Left symmetrical, the message invited
+        # deleting precisely that row. So the DONE claimant is named as the
+        # one to keep, and only the others are offered for deletion. Two DONE
+        # claimants is a worse problem than this function can adjudicate (one
+        # photograph already holds two permanent identifiers), so it falls
+        # back to the symmetrical wording rather than electing a winner.
+        uploaded = [n for n in claimants if classify_row(rows[n - 2]) is RowState.DONE]
+        keeper = uploaded[0] if len(uploaded) == 1 else None
+        for row_number in claimants:
+            others = [n for n in claimants if n != row_number]
+            label = "row" if len(others) == 1 else "rows"
+            listed = ", ".join(str(n) for n in others)
+            if keeper == row_number:
+                remedy = (
+                    f"this row has already uploaded, so it is the one to keep - fix or "
+                    f"delete {label} {listed} instead"
+                )
+            elif keeper is not None:
+                remedy = (
+                    f"row {keeper} has already uploaded and must be kept, so delete this "
+                    "row, or point it at the right file"
+                )
+            else:
+                remedy = "delete the duplicate row, or point it at the right file"
+            errors[row_number] = (
+                f"resolves to '{resolved_rows[row_number]}' - the same file as {label} "
+                f"{listed}. Two rows cannot claim one photograph: {remedy}"
+            )
+            # The same invariant as the failure paths above: a row filed in
+            # `errors` keeps no 'file' (or resolved bib) that a later disk
+            # check or an upload could coincidentally use.
+            row = rows[row_number - 2]
+            row["file"] = ""
+            row[IA_IDENTIFIER_BIB_COLUMN] = ""
 
     return FileOutcomes(errors=errors, blank=blank)
 
@@ -2168,7 +2230,36 @@ def split_moved_targets(
     `ia_identifier` says nobody else has claimed it: blank for a row about to
     be reserved, and equal to ours once reserved. Checking the identifier alone
     would be tautological after reserve; checking the fingerprint alone would
-    miss a row someone else assigned a number to in the meantime."""
+    miss a row someone else assigned a number to in the meantime.
+
+    And the fingerprint only proves anything while exactly one row in the
+    fresh read carries it (issue #1). With two rows resolving to one file, a
+    shift leaves a MATCHING fingerprint at the target's position with a
+    different physical row underneath, and the write lands on the wrong row -
+    misattributing the item and leaving the planned row to be minted again
+    next run. resolve_sheet_files() refuses duplicates present at the initial
+    read, so a duplicated fingerprint here means one appeared mid-run; the
+    target is filed as moved, the safe direction, and goes out on a rerun
+    once the Sheet is untangled.
+
+    That ambiguity check runs on the RESERVE leg only. After reserve, this
+    run's own number is in the target's row and check_claimed_identifiers has
+    already proved it unique across the whole Sheet, so the identifier
+    comparison below is a complete proof of identity by itself: a shift puts a
+    row that does NOT carry our number underneath. Vetoing a duplicated
+    fingerprint there would withhold the confirm write for an edit that cannot
+    have moved anything - an appended duplicate row shifts nothing - and the
+    cost of that false positive is the worst outcome this tool has short of a
+    wrong write: an item live on Internet Archive with no record in the
+    Sheet."""
+    duplicated: set[str] = set()
+    if not reserved_already:
+        seen: set[str] = set()
+        for fingerprint in snapshot.fingerprints.values():
+            if fingerprint in seen:
+                duplicated.add(fingerprint)
+            seen.add(fingerprint)
+
     still_there: list[UploadTarget] = []
     moved: list[UploadTarget] = []
     for target in targets:
@@ -2178,6 +2269,7 @@ def split_moved_targets(
         fingerprint_now = snapshot.fingerprints.get(target.row_number, "")
         matches = (
             bool(fingerprint_now)
+            and fingerprint_now not in duplicated
             and fingerprint_now == target.source_fingerprint
             and cell_value(snapshot.grid, target.row_number, snapshot.columns.ia_identifier)
             == expected_identifier
