@@ -51,6 +51,25 @@ class ProjectConfig:
         return self.sheet_id if live else self.test_sheet_id
 
 
+def unregistered_project_error(registry: dict, project_id: str) -> str | None:
+    """The message for "that --project is not in this registry", or None if
+    it is. Shared with the --csv paths in ia_bulk.py, which need the same
+    guard without needing a whole ProjectConfig: since issue #2 every path
+    checks row identifiers against --project, and checking them against an
+    unregistered project id fails every row with a message blaming the
+    identifier rather than the flag.
+
+    A non-dict `projects` is left to load_project_config's own check, which
+    reports the shape problem in its own words and must stay ahead of this
+    one.
+    """
+    projects = registry.get("projects", {})
+    if not isinstance(projects, dict) or project_id in projects:
+        return None
+    known = ", ".join(sorted(projects)) or "(none registered)"
+    return f"unknown project '{project_id}'; registry knows: {known}"
+
+
 def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
     # Validate collection_key at registry root
     if "collection_key" not in registry:
@@ -69,9 +88,9 @@ def load_project_config(registry: dict, project_id: str) -> ProjectConfig:
             f"registry 'projects' must be an object mapping project ids to their "
             f"configuration, got {type(projects).__name__!r}"
         )
-    if project_id not in projects:
-        known = ", ".join(sorted(projects)) or "(none registered)"
-        raise ConfigError(f"unknown project '{project_id}'; registry knows: {known}")
+    unregistered = unregistered_project_error(registry, project_id)
+    if unregistered:
+        raise ConfigError(unregistered)
 
     block = projects[project_id]
     # Checked before the first block.get() below. Without this, a hand-edited

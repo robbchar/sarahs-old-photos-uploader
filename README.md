@@ -126,7 +126,10 @@ Then, per row:
 - `file` exists on disk (resolved against `--files-dir`)
 - `identifier` is unique in the CSV and matches the
   `COLLECTIONKEY-PROJECTID-NUMBER` scheme (lowercase, 5-digit zero-padded
-  NUMBER), with the prefix registered in `projects_registry.json`
+  NUMBER), with the prefix registered in `projects_registry.json` **and its
+  `PROJECTID` equal to the run's own `--project`** — another registered
+  project's identifier is refused, not accepted (issue #2). A `--project`
+  that isn't in the registry stops the run before any row is reported.
 - `mediatype`, `title` are present and non-empty; `date` is optional —
   `upload` fills a blank `date` with `[n.d.]` rather than omitting it
 

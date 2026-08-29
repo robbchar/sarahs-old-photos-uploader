@@ -182,3 +182,52 @@ from one place.
 Note this is *not* necessarily the path used to open the file on disk. In the
 real Sheet, 225 of 234 filenames carry no extension, so the recorded reference
 and the resolvable path differ. See `file_template` for the latter.
+
+## An identifier is checked against the run's project, not the whole registry
+
+*Decided 2026-08-29, closing issue #2.*
+
+`check_identifier` verified that an identifier's `COLLECTIONKEY-PROJECTID`
+half named *some* project in `projects_registry.json`. It never compared
+`PROJECTID` against the `--project` the run was invoked with, so a row
+holding `lcps-otherproject-00099` validated clean and would have uploaded
+under that identifier on a `--project sarasoldphotos` run.
+
+The bug was latent only because one project is registered. The registry
+exists precisely to support a second — and the failure it would produce is
+the worst shape this tool has: quiet, and permanent. An item filed under
+another project's numbering cannot be renamed afterwards, and nothing
+downstream would have flagged it.
+
+The prefix is now checked twice, and the two failures are reported
+differently on purpose:
+
+- prefix names no registered project → `prefix 'lcps-nosuchproj' not found
+  in project registry`. The identifier is wrong.
+- prefix names a *different* registered project → `identifier
+  'lcps-otherproject-00099' belongs to project 'otherproject', but this run
+  is --project sarasoldphotos`. The `--project` flag may be the thing that
+  is wrong.
+
+Collapsing those into one message would send an operator to edit the Sheet
+when the fix is the command line, or the reverse.
+
+`project_id` is a **required** parameter all the way down
+(`check_identifier`, `validate_rows`, `validate_csv_rows`,
+`validate_sheet_rows`, `validate_identifiers`) rather than one defaulting to
+anything. A default is how a future call site silently re-acquires this bug,
+and it costs nothing to spell out: the Sheet paths already hold
+`config.project_id`, and the CSV paths already hold `args.project`.
+
+### The `--csv` paths gained an unknown-project guard with it
+
+`--project` is `required=True` on every subcommand, but the `--csv` paths
+never built a `ProjectConfig`, so they never inherited
+`load_project_config`'s check that the named project actually exists. That
+cost nothing while `--project` went unread there. Once every row is compared
+against it, a typo'd `--project` fails *every row* with "belongs to project
+'astoriaphotos', but this run is --project astoriaphoto" — true, useless,
+and repeated once per row, naming the wrong file to go fix. So all three
+`--csv` entry points now refuse an unregistered `--project` up front, with
+the same wording the Sheet paths already used (`unregistered_project_error`
+in `project_config.py`).

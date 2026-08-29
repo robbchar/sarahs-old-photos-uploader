@@ -142,7 +142,10 @@ See `.claude/CLAUDE.md` for the full identifier scheme and project
 registry rationale. `projects_registry.json` holds each project's
 `ia_collection`, Sheet IDs, `file_template`, and `required_for_upload` list,
 plus the shared `collection_key`; `validate` and `sync-metadata` reject any
-identifier whose prefix isn't registered there.
+identifier whose prefix isn't registered there — and, since issue #2, any
+whose `PROJECTID` names a registered project other than the run's own
+`--project`. See
+[`DECISIONS.md`](decisions/IDENTIFIERS.md#an-identifier-is-checked-against-the-runs-project-not-the-whole-registry).
 
 The permanent identifier always holds the real, permanent value — `check_identifier`
 only accepts the registry's actual `collection_key` as the first segment.

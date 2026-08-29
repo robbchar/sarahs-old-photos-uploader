@@ -312,7 +312,8 @@ files in the wrong place under a permanent identifier.
 - [ ] `projects_registry.json` → `collection_key` (currently `"lcps"`) is the
       first segment of every identifier this tool mints
       (`lcps-sarasoldphotos-00001`). `check_identifier` already refuses any
-      row whose identifier prefix doesn't match this value — but the value
+      row whose identifier prefix doesn't match this value, and any whose
+      `PROJECTID` belongs to a different registered project — but the value
       itself has **never been confirmed** against how LCPS actually names its
       collection. This is a different thing from the IA collection uploads
       land in; see the next item.

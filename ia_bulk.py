@@ -38,7 +38,7 @@ from column_map import (
 )
 from ia_fields import PIPELINE_OWNED_FIELDS, suggest_standard_fields
 from identifiers import RowState, classify_row, next_identifiers, parse_identifier
-from project_config import ProjectConfig, load_project_config
+from project_config import ProjectConfig, load_project_config, unregistered_project_error
 from reconcile import AmbiguousMatch, Proposal, propose_match
 from sheet_client import CellUpdate, SheetClient, column_letter
 
@@ -164,10 +164,19 @@ def check_identifier(
     identifier: str,
     row_number: int,
     registry: dict,
+    project_id: str,
     seen_identifiers: dict[str, int],
     column_name: str = "identifier",
 ) -> list[str]:
-    """column_name defaults to "identifier" (the CSV path, unchanged) and
+    """project_id is the run's own --project, and it has no default on
+    purpose. This function used to ask only whether a prefix belonged to
+    SOME project in the registry, which accepted `lcps-otherproject-00099`
+    on a `--project astoriaphotos` run (issue #2) - an item filed under
+    another project's numbering, quietly, under a name that can never be
+    renamed. A default here would let the next call site re-introduce
+    exactly that, so every caller has to say which project it means.
+
+    column_name defaults to "identifier" (the CSV path, unchanged) and
     names the column being checked in every message. The Sheet path passes
     "ia_identifier" - on a Sheet that has BOTH its own `Identifier` column
     (donor metadata, untouched by this tool) and `ia_identifier` (the
@@ -188,13 +197,23 @@ def check_identifier(
             f"{column_name} '{identifier}' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
         )
     else:
-        collection_key, project_id, _number = parsed
-        known_prefix = collection_key == registry.get("collection_key") and project_id in registry.get(
-            "projects", {}
-        )
-        if not known_prefix:
+        collection_key, identifier_project, _number = parsed
+        collection_matches = collection_key == registry.get("collection_key")
+        project_registered = identifier_project in registry.get("projects", {})
+        if not (collection_matches and project_registered):
             errors.append(
-                f"{column_name} prefix '{collection_key}-{project_id}' not found in project registry"
+                f"{column_name} prefix '{collection_key}-{identifier_project}' not found in "
+                "project registry"
+            )
+        elif identifier_project != project_id:
+            # Kept distinct from the "not found" message above because the
+            # two are different mistakes with different fixes: an
+            # unregistered prefix means the identifier is wrong, while a
+            # registered-but-other prefix means --project may be the thing
+            # that is wrong. Both are named so the operator can tell which.
+            errors.append(
+                f"{column_name} '{identifier}' belongs to project "
+                f"'{identifier_project}', but this run is --project {project_id}"
             )
 
     if identifier in seen_identifiers:
@@ -203,6 +222,23 @@ def check_identifier(
         seen_identifiers[identifier] = row_number
 
     return errors
+
+
+def refuse_unregistered_project(registry: dict, project_id: str) -> bool:
+    """True if the run must stop. The --csv paths never build a
+    ProjectConfig, so they never inherited load_project_config's
+    unknown-project guard - which cost nothing while --project went unread
+    there, and started costing the moment check_identifier began comparing
+    every row against it (issue #2). Without this, a mistyped --project
+    fails every single row with "belongs to project 'astoriaphotos', but
+    this run is --project astoriaphoto": true, useless, and repeated once
+    per row, with the flag that is actually wrong named only in passing.
+    """
+    message = unregistered_project_error(registry, project_id)
+    if message is None:
+        return False
+    print(message, file=sys.stderr)
+    return True
 
 
 def check_header(fieldnames: list[str] | None) -> list[str]:
@@ -314,13 +350,18 @@ def validate_rows(
     rows: list[dict[str, str]],
     files_dir: str | Path,
     registry: dict,
+    project_id: str,
     skip_identifiers: frozenset[str] = frozenset(),
     required_columns: tuple[str, ...] = REQUIRED_UPLOAD_COLUMNS,
     check_file_exists: bool = True,
     identifier_column: str = "identifier",
     required_for_upload: tuple[str, ...] = (),
 ) -> list[RowValidation]:
-    """skip_identifiers lets a --resume-from run skip re-validating rows a
+    """project_id is the run's own --project. It is threaded through to
+    check_identifier and used nowhere else here - see that function for why
+    it is required rather than defaulted (issue #2).
+
+    skip_identifiers lets a --resume-from run skip re-validating rows a
     prior run already validated and uploaded successfully - the identifier
     is still tracked for duplicate detection, just without redoing the
     regex/registry/disk-stat checks.
@@ -376,7 +417,12 @@ def validate_rows(
         if identifier:
             errors.extend(
                 check_identifier(
-                    identifier, row_number, registry, seen_identifiers, identifier_column
+                    identifier,
+                    row_number,
+                    registry,
+                    project_id,
+                    seen_identifiers,
+                    identifier_column,
                 )
             )
 
@@ -407,6 +453,7 @@ def validate_csv_rows(
     rows: list[dict[str, str]],
     files_dir: str | Path,
     registry: dict,
+    project_id: str,
     skip_identifiers: frozenset[str] = frozenset(),
 ) -> list[RowValidation]:
     """The CSV path's answer, named. `identifier`, `file`, `mediatype` and
@@ -417,6 +464,7 @@ def validate_csv_rows(
         rows,
         files_dir,
         registry,
+        project_id,
         skip_identifiers=skip_identifiers,
         required_columns=REQUIRED_UPLOAD_COLUMNS,
         check_file_exists=True,
@@ -428,6 +476,7 @@ def validate_sheet_rows(
     rows: list[dict[str, str]],
     files_dir: str | Path,
     registry: dict,
+    project_id: str,
     skip_identifiers: frozenset[str] = frozenset(),
     required_for_upload: tuple[str, ...] = (),
 ) -> list[RowValidation]:
@@ -448,6 +497,7 @@ def validate_sheet_rows(
         rows,
         files_dir,
         registry,
+        project_id,
         skip_identifiers=skip_identifiers,
         required_columns=SHEET_REQUIRED_COLUMNS,
         check_file_exists=True,
@@ -1194,8 +1244,14 @@ def update_metadata_row(row: dict, target_identifier: str) -> None:
 def validate_identifiers(
     rows: list[dict[str, str]],
     registry: dict,
+    project_id: str,
     skip_identifiers: frozenset[str] = frozenset(),
 ) -> list[RowValidation]:
+    """project_id is the run's own --project - see check_identifier for why
+    it is required. It matters more here than anywhere else: sync-metadata
+    writes metadata to whatever identifier the row names, so a wrong-project
+    identifier does not merely misfile this project's item, it overwrites
+    another project's."""
     seen_identifiers: dict[str, int] = {}
     results: list[RowValidation] = []
 
@@ -1208,7 +1264,7 @@ def validate_identifiers(
             results.append(RowValidation(row_number=row_number, identifier=identifier))
             continue
 
-        errors = check_identifier(identifier, row_number, registry, seen_identifiers)
+        errors = check_identifier(identifier, row_number, registry, project_id, seen_identifiers)
         results.append(RowValidation(row_number=row_number, identifier=identifier, errors=errors))
 
     return results
@@ -1616,7 +1672,11 @@ def validate_sheet_grid(
     the bounds check is load-bearing, not defensive: a bare row_number - 2
     would quietly fold row 1 into the LAST data row via negative indexing."""
     row_results = validate_sheet_rows(
-        rows, config.files_dir, registry, required_for_upload=config.required_for_upload
+        rows,
+        config.files_dir,
+        registry,
+        config.project_id,
+        required_for_upload=config.required_for_upload,
     )
 
     for row_number, message in outcomes.errors.items():
@@ -1862,8 +1922,10 @@ def cmd_validate(args) -> int:
     if csv_path is not None:
         data = read_csv(csv_path)
         registry = load_registry(args.registry)
+        if refuse_unregistered_project(registry, args.project):
+            return 1
         results = header_validation(data.fieldnames) + validate_csv_rows(
-            data.rows, args.files_dir, registry
+            data.rows, args.files_dir, registry, args.project
         )
         print(format_report(results))
         return 0 if all(r.is_valid for r in results) else 1
@@ -2897,6 +2959,8 @@ def upload_from_csv(args, csv_path: str) -> int:
     data = read_csv(csv_path)
     rows = data.rows
     registry = load_registry(args.registry)
+    if refuse_unregistered_project(registry, args.project):
+        return 1
 
     skip_identifiers: set[str] = set()
     if args.resume_from:
@@ -2905,7 +2969,7 @@ def upload_from_csv(args, csv_path: str) -> int:
     to_upload = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
     validation_results = header_validation(data.fieldnames) + validate_csv_rows(
-        rows, files_dir, registry, frozenset(skip_identifiers)
+        rows, files_dir, registry, args.project, frozenset(skip_identifiers)
     )
     if not all(r.is_valid for r in validation_results):
         print(format_report(validation_results))
@@ -3494,6 +3558,8 @@ def sync_from_csv(args) -> int:
     data = read_csv(args.csv)
     rows = data.rows
     registry = load_registry(args.registry)
+    if refuse_unregistered_project(registry, args.project):
+        return 1
     live = bool(args.live)
     from_log = getattr(args, "from_log", None)
 
@@ -3527,7 +3593,7 @@ def sync_from_csv(args) -> int:
     to_sync = [row for row in rows if (row.get("identifier") or "").strip() not in skip_identifiers]
 
     validation_results = header_validation(data.fieldnames) + validate_identifiers(
-        rows, registry, frozenset(skip_identifiers)
+        rows, registry, args.project, frozenset(skip_identifiers)
     )
     if targets is not None:
         validation_results += check_uploaded_as(
