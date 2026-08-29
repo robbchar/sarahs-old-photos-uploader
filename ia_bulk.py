@@ -1428,6 +1428,42 @@ def survey_files(rows: list[dict[str, str]], config: ProjectConfig) -> FileSurve
     )
 
 
+def scan_unclaimed_files(
+    claimed: set[str], config: ProjectConfig
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Every photo file under files_dir that no row claims, by folder.
+
+    NOT the same map as survey_files' `unclaimed`, and the difference is the
+    point: that one only lists folders some catalogued row already names,
+    because reconcile can only prompt about rows that exist. Append is the
+    opposite case - a brand-new donor folder with zero rows is exactly what
+    it exists to pick up - so this walks every subdirectory of files_dir.
+
+    The second return value names photo files sitting at the top of
+    files_dir, outside any folder. A folder/name template cannot represent
+    them, so no row can be appended for them - but they must be COUNTED,
+    not silently invisible, or a stray file at the drive root never gets
+    catalogued and nobody is ever told. Folders with nothing unclaimed are
+    omitted entirely: an empty list would still render a folder heading."""
+    unclaimed: dict[str, list[str]] = {}
+    outside: list[str] = []
+    for entry in sorted(Path(config.files_dir).iterdir(), key=lambda e: e.name):
+        if entry.is_file():
+            if entry.suffix.lower() in config.photo_extensions:
+                outside.append(entry.name)
+            continue
+        names = sorted(
+            child.name
+            for child in entry.iterdir()
+            if child.is_file()
+            and child.suffix.lower() in config.photo_extensions
+            and claim_key(f"{entry.name}/{child.name}") not in claimed
+        )
+        if names:
+            unclaimed[entry.name] = names
+    return unclaimed, outside
+
+
 @dataclass(frozen=True)
 class Decision:
     action: str          # "accept" | "reject" | "stop"
@@ -3925,6 +3961,177 @@ def cmd_reconcile_files(args) -> int:
     return 0
 
 
+def cmd_append_rows(args) -> int:
+    """Append a skeleton row for every photo file no row claims.
+
+    Writes ONLY the file_template columns - folder and filename. Every other
+    column is the cataloguer's: this removes the transcription work, not the
+    cataloguing work (issue #11's hard constraint). Appended rows resolve on
+    the next survey, so their files are claimed and a rerun over an
+    unchanged drive appends nothing - idempotence comes from the drive and
+    the Sheet, not from any state this command keeps."""
+    registry = load_registry(args.registry)
+    config = load_project_config(registry, args.project)
+    live = bool(args.live)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    print(sheet_banner(config, live))
+    if dry_run:
+        print("--dry-run: nothing is appended to the Sheet")
+    print()
+
+    try:
+        sheet = read_sheet(args, registry, config, live, "append-rows")
+    except SheetSetupFailed:
+        return 1
+
+    header_defects, structural_rows = split_structure_results(
+        sheet.structure_results, len(sheet.rows)
+    )
+    if header_defects:
+        print("\n".join(_format_result_lines(header_defects)))
+        print()
+        print(
+            "the Sheet's header row has problems that affect every row - refusing to "
+            "append anything until they are fixed",
+            file=sys.stderr,
+        )
+        return 1
+    if structural_rows:
+        print("\n".join(_format_result_lines(structural_rows)))
+        print()
+        print(
+            f"{_pluralize(len(structural_rows), 'row')} above may have cells shifted "
+            "against the header. Reconcile can skip a suspect row because an operator "
+            "approves its rows one at a time - but append trusts the whole survey at "
+            "once, and a misread row can make the file it really means look unclaimed, "
+            "which would append a second row for a photograph that already has one. Fix "
+            "these rows in the Sheet, then rerun.",
+            file=sys.stderr,
+        )
+        return 1
+
+    fields = template_fields(config.file_template)
+    if len(fields) < 2:
+        print(
+            f"file_template {config.file_template!r} has no folder part - append-rows "
+            "builds rows from a <folder>/<name> layout and cannot express this "
+            "project's files as rows.",
+            file=sys.stderr,
+        )
+        return 1
+    columns: dict[str, int] = {}
+    for field in fields:
+        try:
+            columns[field] = next(
+                index for index, header in enumerate(sheet.column_map.headers)
+                if sheet.column_map.field_names[header] == field
+            )
+        except StopIteration:
+            print(
+                f"the Sheet has no '{field}' column, which file_template names - "
+                f"fix 'file_template' in {args.registry} or add the column.",
+                file=sys.stderr,
+            )
+            return 1
+
+    survey = survey_files(sheet.rows, config)
+    if survey.not_ready:
+        print(f"{_pluralize(len(survey.not_ready), 'row')} not yet catalogued - "
+              "they claim no file, left alone")
+    if survey.unresolved:
+        # The hard gate, with no override flag: to the survey, a typo'd row
+        # and a missing row both look like an unclaimed file, so appending
+        # past this would add a second row for a photograph one of these
+        # rows already means - see docs/decisions/RECONCILIATION.md,
+        # "Reconciliation ships before append".
+        for row_number in sorted(survey.unresolved):
+            print(f"row {row_number}  '{survey.wanted[row_number]}'  does not resolve "
+                  f"in '{survey.unresolved[row_number]}'")
+        print(
+            f"{_pluralize(len(survey.unresolved), 'row')} named a file that does not "
+            "resolve, and an unresolved row is indistinguishable from a missing row - "
+            "appending now could add a second row for a photograph one of these rows "
+            "already means. Run reconcile-files until every row above is fixed, or "
+            "blank the filename cell of one that cannot be, to mark its row "
+            "not-yet-catalogued.",
+            file=sys.stderr,
+        )
+        return 1
+
+    unclaimed, outside = scan_unclaimed_files(survey.claimed, config)
+    if outside:
+        print(f"{_pluralize(len(outside), 'photo file')} at the top of "
+              f"'{config.files_dir}', outside any folder - file_template cannot express "
+              f"a row for them, skipped: {', '.join(outside)}")
+
+    to_append = [(folder, name) for folder, names in unclaimed.items() for name in names]
+    if not to_append:
+        print("nothing to append - every photo file in a folder is claimed by a row")
+        return 0
+
+    for folder, names in unclaimed.items():
+        print(f"{folder}: {_pluralize(len(names), 'file')} with no row")
+
+    folder_field, name_field = fields[0], fields[-1]
+    if dry_run:
+        # Shown as the two cells the real run would write, under the Sheet's
+        # own header spellings - not a joined folder/name string the reader
+        # has to mentally re-split. The dry run's whole job is confidence
+        # about the exact write.
+        folder_header = sheet.column_map.headers[columns[folder_field]]
+        name_header = sheet.column_map.headers[columns[name_field]]
+        quoted = [(f"'{folder}'", f"'{name}'") for folder, name in to_append]
+        folder_width = max(len(folder_header), max(len(q) for q, _ in quoted))
+        print()
+        print("each row would carry exactly these two cells - every other column "
+              "is left blank for the cataloguer:")
+        print()
+        print(f"  {folder_header.ljust(folder_width)}  {name_header}")
+        for quoted_folder, quoted_name in quoted:
+            print(f"  {quoted_folder.ljust(folder_width)}  {quoted_name}")
+        print()
+        print(f"--dry-run: {_pluralize(len(to_append), 'row')} would be appended")
+        return 0
+
+    width = len(sheet.column_map.headers)
+    new_rows = []
+    for folder, name in to_append:
+        # Full header width with values at the template's own columns -
+        # "first two cells" would write a folder name into whatever column
+        # happens to come first.
+        row = [""] * width
+        row[columns[folder_field]] = folder
+        row[columns[name_field]] = name
+        new_rows.append(row)
+
+    try:
+        sheet.client.append_rows(new_rows)
+    except Exception as exc:
+        print(
+            f"the Sheet append failed: {exc}. Nothing was logged as appended - rerun "
+            "to try again; a rerun never duplicates rows that did land.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Logged only after the append succeeded: the log records what happened,
+    # not what was attempted.
+    log_path = open_log(args.log_dir, "append-rows")
+    with open(log_path, "a", encoding="utf-8") as f:
+        for folder, name in to_append:
+            f.write(json.dumps({
+                "folder": folder, "name": name, "status": "appended",
+                "timestamp": utc_timestamp(),
+            }) + "\n")
+
+    print()
+    print(f"{_pluralize(len(new_rows), 'row')} appended - folder and filename only; "
+          "every other column is the cataloguer's")
+    print(f"log written to {log_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ia_bulk",
@@ -4067,6 +4274,16 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--dry-run", action="store_true", help="Print what would be proposed; prompt for nothing and write nothing")
     reconcile_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
 
+    append_parser = subparsers.add_parser(
+        "append-rows",
+        help="Append a skeleton row for every photo file on the drive that no row claims",
+    )
+    append_parser.add_argument("--project", required=True, help="Project ID from the registry")
+    append_parser.add_argument("--registry", default="projects_registry.json", help="Path to the project registry JSON")
+    append_parser.add_argument("--live", action="store_true", help="Read and write the project's real Sheet instead of its test Sheet")
+    append_parser.add_argument("--dry-run", action="store_true", help="Print the rows that would be appended and write nothing")
+    append_parser.add_argument("--log-dir", default="logs", help="Directory to write the timestamped run log to")
+
     return parser
 
 
@@ -4082,6 +4299,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_sync_metadata(args)
     if args.command == "reconcile-files":
         return cmd_reconcile_files(args)
+    if args.command == "append-rows":
+        return cmd_append_rows(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2

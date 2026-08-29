@@ -70,3 +70,22 @@ class SheetClient:
         self._service.spreadsheets().values().batchUpdate(
             spreadsheetId=self._spreadsheet_id, body=body
         ).execute()
+
+    def append_rows(self, rows: list[list[str]]) -> None:
+        """One append request per call - the API finds the end of the tab's
+        data and adds every row after it, so no row index is computed (or
+        raced over) on this side. RAW for the same reason write_cells uses
+        it: a filename starting with "=" must land as text, never be
+        interpreted as a formula. INSERT_ROWS so the append adds rows rather
+        than overwriting whatever happens to sit in the grid below the
+        table."""
+        if not rows:
+            return
+
+        self._service.spreadsheets().values().append(
+            spreadsheetId=self._spreadsheet_id,
+            range=quote_tab(self._tab),
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()

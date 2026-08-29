@@ -9,8 +9,10 @@ class FakeValues:
     def __init__(self, grid, get_response=None):
         self.grid = grid
         self.batch_update_calls = []
+        self.append_calls = []
         self.get_spreadsheet_id = None
         self.batch_update_spreadsheet_id = None
+        self.append_spreadsheet_id = None
         self._get_response = get_response if get_response is not None else {"values": grid}
 
     def get(self, spreadsheetId, range):
@@ -22,6 +24,18 @@ class FakeValues:
         self.batch_update_spreadsheet_id = spreadsheetId
         self.batch_update_calls.append(body)
         return _Executable({"totalUpdatedCells": len(body["data"])})
+
+    def append(self, spreadsheetId, range, valueInputOption, insertDataOption, body):
+        self.append_spreadsheet_id = spreadsheetId
+        self.append_calls.append(
+            {
+                "range": range,
+                "valueInputOption": valueInputOption,
+                "insertDataOption": insertDataOption,
+                "body": body,
+            }
+        )
+        return _Executable({"updates": {"updatedRows": len(body["values"])}})
 
 
 class _Executable:
@@ -90,6 +104,43 @@ def test_read_grid_with_empty_sheet_returns_empty_list():
 
     assert result == []
     assert service.values_api.get_spreadsheet_id == "SHEET_ID"
+
+
+def test_append_rows_issues_a_single_append_request():
+    service = FakeService([["Title"]])
+    client = SheetClient(service, "SHEET_ID", "Donor Photos")
+
+    client.append_rows([["SOP CD 1", "a.jpg", ""], ["SOP CD 1", "b.jpg", ""]])
+
+    assert len(service.values_api.append_calls) == 1
+    call = service.values_api.append_calls[0]
+    assert call["range"] == "'Donor Photos'"
+    # RAW for the same reason write_cells uses it: a filename starting with
+    # "=" must land as text, never be interpreted as a formula.
+    assert call["valueInputOption"] == "RAW"
+    # INSERT_ROWS so the append adds rows rather than overwriting whatever
+    # happens to sit in the grid below the table.
+    assert call["insertDataOption"] == "INSERT_ROWS"
+    assert call["body"] == {"values": [["SOP CD 1", "a.jpg", ""], ["SOP CD 1", "b.jpg", ""]]}
+    assert service.values_api.append_spreadsheet_id == "SHEET_ID"
+
+
+def test_append_rows_with_nothing_to_append_makes_no_request():
+    service = FakeService([["Title"]])
+    client = SheetClient(service, "SHEET_ID", "Donor Photos")
+
+    client.append_rows([])
+
+    assert service.values_api.append_calls == []
+
+
+def test_append_rows_quotes_a_tab_name_containing_an_apostrophe():
+    service = FakeService([["Title"]])
+    client = SheetClient(service, "SHEET_ID", "Sara's Photos")
+
+    client.append_rows([["x"]])
+
+    assert service.values_api.append_calls[0]["range"] == "'Sara''s Photos'"
 
 
 @pytest.mark.parametrize(

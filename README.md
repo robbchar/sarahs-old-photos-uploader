@@ -432,6 +432,43 @@ from ever being offered as a match.
 every other command. There is no `--csv` path — reconciliation only makes
 sense against the live Sheet it is correcting.
 
+### `append-rows` — add skeleton rows for files that have no row
+
+```bash
+python ia_bulk.py append-rows --project sarasoldphotos --dry-run
+python ia_bulk.py append-rows --project sarasoldphotos
+```
+
+Walks every folder under `files_dir` — including folders no row names,
+which is the point — and appends one row per photo file that no row
+claims: the folder and filename cells only, every other column left blank
+for the cataloguer. It removes the transcription work, never the
+cataloguing work. New rows land at the bottom of the Sheet grouped by
+folder A–Z, filenames A–Z within, and `photo_extensions` decides what
+counts as a photo, so the contact-sheet PDFs on the drive never get rows.
+
+It **refuses to run while any row names a file that does not resolve**,
+with no override flag: to the survey, a typo'd row and a missing row both
+look like an unclaimed file, so appending past one could add a second row
+for a photograph the typo'd row already means. Run `reconcile-files` until
+every such row is fixed — or blank the filename cell of one that cannot
+be, which marks the row not-yet-catalogued (see
+[`docs/decisions/RECONCILIATION.md`](docs/decisions/RECONCILIATION.md),
+"Reconciliation ships before append"). Rows nobody has catalogued yet are
+counted in one line and never block anything. A data row longer than the
+header is *fatal* here, not skipped as in `reconcile-files` — a misread
+row can make the file it really means look unclaimed, and append trusts
+the whole survey at once.
+
+Photo files sitting at the top of `files_dir`, outside any folder, cannot
+be expressed as rows by a folder/name `file_template`; they are named on
+screen rather than silently ignored.
+
+Safe to re-run: appended rows resolve, so their files are claimed and a
+second run over an unchanged drive appends nothing. Unless `--dry-run` is
+passed, each run writes a timestamped log to `--log-dir` (default
+`logs/`), one line per appended row.
+
 ## Safety rail
 
 By default every command targets IA's `test_collection` sandbox. The Sheet's

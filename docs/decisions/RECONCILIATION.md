@@ -130,6 +130,38 @@ free: reconciliation only ever edits a cell that already exists on a row
 that already exists, so nothing about it depends on append existing yet, or
 ever.
 
+## Append's gate is hard, with no override flag
+
+*Decided 2026-08-27, when the deferred append step above was built as
+`append-rows`.*
+
+The ordering the previous section argues for is enforced by the tool, not
+left as advice: `append-rows` refuses outright while any row names a file
+that does not resolve. "Explicitly leaving alone" a row at reconcile's
+`[n]` prompt therefore does not clear the way — the row still asserts a
+filename the drive contradicts, and its intended file still sits in
+`unclaimed` where append would give it a second row. The operator's
+remedies are the honest ones: fix the cell (at `[y]`/`[e]`, or by hand),
+or blank it, which reclassifies the row as not-yet-catalogued — a row
+that asserts no file cannot be hiding a typo, so blank rows never block
+append.
+
+No `--force`-style override exists on purpose. The failure it would
+permit is a duplicate row for a photograph, which mints a second permanent
+identifier for one image at upload time — the exact misattribution the
+rest of this tool refuses everywhere else. An override that is ever safe
+to use is one the guard should have allowed; one that is never safe to
+use is one the flag should not offer.
+
+Two smaller decisions ride along. A structurally shifted data row —
+which `reconcile-files` merely skips — is *fatal* to append: reconcile's
+operator approves rows one at a time, so one suspect row only costs that
+row, but append trusts the whole survey at once, and a misread row can
+make the file it really means look unclaimed. And append writes only the
+`file_template` columns, padded to the header's width by column index:
+every other cell is the cataloguer's, because this step removes the
+transcription work, never the cataloguing work.
+
 ## Exit code is 0 while work remains
 
 *Decided 2026-08-23, reapplying an existing judgment about `validate` and

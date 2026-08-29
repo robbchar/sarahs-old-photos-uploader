@@ -580,6 +580,74 @@ def test_claim_key_folds_case_on_macos_where_normcase_is_the_identity(monkeypatc
     assert claim_key("SOP CD 1/Photo.JPG") == claim_key("sop cd 1/photo.jpg")
 
 
+def test_scan_unclaimed_files_covers_folders_no_row_names(tmp_path):
+    """The whole reason append cannot reuse survey_files' unclaimed: that
+    map only lists folders some catalogued row already names, but a brand-new
+    donor folder with zero rows is exactly what append exists to pick up."""
+    from ia_bulk import scan_unclaimed_files
+
+    folder = tmp_path / "SOP CD 2 COE"
+    folder.mkdir()
+    (folder / "002_westport_tunnel.JPG").write_bytes(b"x")
+    (folder / "001_seaside_beach.JPG").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    unclaimed, outside = scan_unclaimed_files(set(), config)
+
+    assert unclaimed == {"SOP CD 2 COE": ["001_seaside_beach.JPG", "002_westport_tunnel.JPG"]}
+    assert outside == []
+
+
+def test_scan_unclaimed_files_excludes_claimed_files_and_non_photos(tmp_path):
+    from ia_bulk import scan_unclaimed_files
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Taken.jpg").write_bytes(b"x")
+    (folder / "Free.jpg").write_bytes(b"x")
+    (folder / "contact sheet.pdf").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    unclaimed, _ = scan_unclaimed_files({claim_key("SOP CD 1/Taken.jpg")}, config)
+
+    assert unclaimed == {"SOP CD 1": ["Free.jpg"]}
+
+
+def test_scan_unclaimed_files_omits_a_folder_with_nothing_unclaimed(tmp_path):
+    """No empty entries: a folder whose every photo is claimed has nothing
+    to append, and an empty list would still render a folder heading."""
+    from ia_bulk import scan_unclaimed_files
+
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Taken.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    unclaimed, _ = scan_unclaimed_files({claim_key("SOP CD 1/Taken.jpg")}, config)
+
+    assert unclaimed == {}
+
+
+def test_scan_unclaimed_files_reports_photos_outside_any_folder(tmp_path):
+    """A photo at the top of files_dir cannot be represented by a
+    folder/name template, so it cannot get a row - but it must be COUNTED,
+    not silently invisible, or a stray file at the drive root never gets
+    catalogued and nobody is ever told."""
+    from ia_bulk import scan_unclaimed_files
+
+    (tmp_path / "stray.jpg").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_bytes(b"x")
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Good.jpg").write_bytes(b"x")
+    config = _sheet_config(files_dir=str(tmp_path))
+
+    unclaimed, outside = scan_unclaimed_files(set(), config)
+
+    assert unclaimed == {"SOP CD 1": ["Good.jpg"]}
+    assert outside == ["stray.jpg"]
+
+
 def test_survey_files_files_a_blank_filename_cell_as_not_ready_not_unresolved(tmp_path):
     """A row that asserted no file is not-ready, not broken - the same split
     resolve_sheet_files() draws between `errors` and `blank`. Filed as
@@ -8678,3 +8746,367 @@ def test_cmd_reconcile_files_does_not_reoffer_a_file_claimed_earlier_this_run(tm
 
     assert written == [CellUpdate("B2", "Finnish Meat Market.jpg")]
     assert exit_code == 0
+
+
+# --- append-rows: skeleton rows for files no row claims ---
+
+def _setup_append(tmp_path, monkeypatch, sheet_rows, disk, header=None):
+    """An append world: files on disk, a registry, and a client that records
+    every appended batch."""
+    for folder, names in disk.items():
+        (tmp_path / folder).mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (tmp_path / folder / name).write_bytes(b"x")
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            make_sheet_registry(
+                files_dir=str(tmp_path),
+                file_template="{folder_on_lacie_drive}/{file_name}",
+                required_for_upload=["title"],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    appended = []
+
+    class RecordingClient:
+        def __init__(self, grid):
+            self._grid = grid
+
+        def read_grid(self):
+            return self._grid
+
+        def append_rows(self, rows):
+            appended.extend(rows)
+
+    grid = [header or RECONCILE_HEADER] + sheet_rows
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: RecordingClient(grid))
+    return registry_path, appended
+
+
+def _append_args(tmp_path, registry_path, **overrides):
+    args = Namespace(
+        project="astoriaphotos",
+        registry=str(registry_path),
+        live=False,
+        dry_run=False,
+        log_dir=str(tmp_path / "logs"),
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def test_parser_append_rows_defaults():
+    args = build_parser().parse_args(["append-rows", "--project", "astoriaphotos"])
+    assert args.command == "append-rows"
+    assert args.registry == "projects_registry.json"
+    assert args.live is False
+    assert args.dry_run is False
+    assert args.log_dir == "logs"
+
+
+def test_cmd_append_rows_appends_a_row_per_unclaimed_file_in_folder_then_name_order(
+    tmp_path, monkeypatch, capsys
+):
+    """Files in folders no row names are exactly the point - see
+    scan_unclaimed_files. Rows land grouped by folder A-Z, names A-Z within,
+    padded to the header's width."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {
+            "SOP CD 2 COE": ["002_westport.JPG", "001_seaside.JPG"],
+            "SOP CD 1": ["Good.jpg", "Extra.jpg"],
+        },
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert appended == [
+        ["SOP CD 1", "Extra.jpg", ""],
+        ["SOP CD 2 COE", "001_seaside.JPG", ""],
+        ["SOP CD 2 COE", "002_westport.JPG", ""],
+    ]
+    assert "3 rows appended" in out
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_places_values_by_the_real_header_not_by_position(tmp_path, monkeypatch):
+    """The two file columns can sit anywhere in the header. The appended row
+    must carry its values at those columns - 'first two cells' would write a
+    folder name into Title."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["A title", "SOP CD 1", "Good.jpg"]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+        header=["Title", "Folder on LaCie Drive", "File Name"],
+    )
+
+    cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == [["", "SOP CD 1", "Extra.jpg"]]
+
+
+def test_cmd_append_rows_refuses_while_any_row_fails_to_resolve(tmp_path, monkeypatch, capsys):
+    """To the tool, "no row yet" and "row with a typo" both look like an
+    unclaimed file (docs/decisions/RECONCILIATION.md, "Reconciliation ships
+    before append"). Appending while any row is unresolved would add a
+    second row for a photograph the typo'd row already means - so the guard
+    is hard, with no override flag."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Finnis Meat Market.jpg", "A title"]],
+        {"SOP CD 1": ["Finnish Meat Market.jpg"]},
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    assert appended == []
+    assert "row 2" in captured.out
+    assert "reconcile-files" in captured.err
+    assert exit_code == 1
+
+
+def test_cmd_append_rows_is_not_blocked_by_uncatalogued_rows(tmp_path, monkeypatch, capsys):
+    """A row with blank file cells asserted no file - it cannot be hiding a
+    typo, so it must not hold the append hostage. Counted in one line, the
+    same split reconcile draws."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"], ["", "", ""]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert appended == [["SOP CD 1", "Extra.jpg", ""]]
+    assert "1 row not yet catalogued" in out
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_appends_nothing_when_every_file_is_claimed(tmp_path, monkeypatch, capsys):
+    """Safe to re-run: rows a previous run appended resolve, so their files
+    are claimed and a second run over an unchanged drive is a no-op."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == []
+    assert "nothing to append" in capsys.readouterr().out
+    assert not (tmp_path / "logs").exists()
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_dry_run_appends_nothing_and_writes_no_log(tmp_path, monkeypatch, capsys):
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert appended == []
+    assert not (tmp_path / "logs").exists()
+    assert "Extra.jpg" in out
+    assert "would be appended" in out
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_dry_run_shows_the_two_target_cells_by_their_sheet_names(
+    tmp_path, monkeypatch, capsys
+):
+    """The dry run's job is confidence about the real write: name the two
+    Sheet columns as the header actually spells them and show which value
+    lands in each, rather than a joined folder/name string a reader must
+    mentally re-split. The header here is reordered so the test also fails
+    if the display hardcodes column names instead of reading the Sheet's."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, _ = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["A title", "SOP CD 1", "Good.jpg"]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+        header=["Title", "Folder on LaCie Drive", "File Name"],
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path, dry_run=True))
+    out = capsys.readouterr().out
+
+    assert "Folder on LaCie Drive" in out
+    assert "File Name" in out
+    assert "'SOP CD 1'" in out
+    assert "'Extra.jpg'" in out
+    assert "SOP CD 1/Extra.jpg" not in out
+    assert "left blank" in out
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_logs_each_appended_row(tmp_path, monkeypatch):
+    from ia_bulk import cmd_append_rows
+
+    registry_path, _ = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg", "Extra.jpg"]},
+    )
+
+    cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    (log_file,) = (tmp_path / "logs").glob("append-rows-*.jsonl")
+    entries = [
+        json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(e["folder"], e["name"], e["status"]) for e in entries] == [
+        ("SOP CD 1", "Extra.jpg", "appended")
+    ]
+    assert entries[0]["timestamp"]
+
+
+def test_cmd_append_rows_counts_photos_outside_any_folder(tmp_path, monkeypatch, capsys):
+    """A photo at the top of files_dir cannot get a row from a folder/name
+    template - but silence would leave it uncatalogued with nobody told."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+    )
+    (tmp_path / "stray.jpg").write_bytes(b"x")
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert appended == []
+    assert "stray.jpg" in out
+    assert "outside any folder" in out
+    assert exit_code == 0
+
+
+def test_cmd_append_rows_refuses_a_sheet_whose_headers_collide(tmp_path, monkeypatch, capsys):
+    """Same reasoning as reconcile: a header defect corrupts every row
+    identically, so nothing read through it can be trusted."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "Good.jpg", "Good.jpg", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+        header=["Folder on LaCie Drive", "File Name", "File  name", "Title"],
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == []
+    assert "refusing to append" in capsys.readouterr().err
+    assert exit_code == 1
+
+
+def test_cmd_append_rows_refuses_when_any_row_may_be_shifted(tmp_path, monkeypatch, capsys):
+    """STRICTER than reconcile, which skips a shifted row: reconcile only
+    edits rows an operator approves one at a time, but append trusts the
+    whole survey at once. A shifted row's file claim may be misread, making
+    the file it really means look unclaimed - and appending that file is the
+    duplicate-row misattribution. One suspect row taints the set."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [
+            ["SOP CD 1", "Good.jpg", "A title", "an extra cell"],
+            ["SOP CD 1", "Fine.jpg", "Another"],
+        ],
+        {"SOP CD 1": ["Good.jpg", "Fine.jpg", "Extra.jpg"]},
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == []
+    assert "shifted" in capsys.readouterr().err
+    assert exit_code == 1
+
+
+def test_cmd_append_rows_refuses_a_template_with_no_folder_part(tmp_path, monkeypatch, capsys):
+    """scan_unclaimed_files assumes a <folder>/<name> drive layout. A
+    single-field template like {file} cannot express what the scan finds,
+    and writing a folder name into the one file column would be silently
+    wrong - refuse instead."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(make_sheet_registry(files_dir=str(tmp_path), file_template="{file}")),
+        encoding="utf-8",
+    )
+    appended = []
+
+    class RecordingClient:
+        def read_grid(self):
+            return [["File", "Title"], ["Good.jpg", "A title"]]
+
+        def append_rows(self, rows):
+            appended.extend(rows)
+
+    monkeypatch.setattr("ia_bulk.build_sheet_client", lambda config, live: RecordingClient())
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == []
+    assert "folder" in capsys.readouterr().err
+    assert exit_code == 1
+
+
+def test_cmd_append_rows_refuses_when_a_template_column_is_missing(tmp_path, monkeypatch, capsys):
+    """file_template names {file_name}; a Sheet with no such column has
+    nowhere to put the name half of a skeleton row."""
+    from ia_bulk import cmd_append_rows
+
+    registry_path, appended = _setup_append(
+        tmp_path,
+        monkeypatch,
+        [["SOP CD 1", "A title"]],
+        {"SOP CD 1": ["Good.jpg"]},
+        header=["Folder on LaCie Drive", "Title"],
+    )
+
+    exit_code = cmd_append_rows(_append_args(tmp_path, registry_path))
+
+    assert appended == []
+    assert "file_name" in capsys.readouterr().err
+    assert exit_code == 1
