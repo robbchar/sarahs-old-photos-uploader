@@ -4792,6 +4792,129 @@ def test_cmd_upload_catches_a_shift_that_an_identifier_check_alone_cannot_see(
     assert exit_code == 1
 
 
+def _guard_snapshot(fingerprints, grid):
+    """A SheetSnapshot shaped for split_moved_targets tests: real fingerprints
+    and grid, write-back columns at the SHEET_HEADER positions."""
+    from ia_bulk import SheetColumns, SheetSnapshot
+
+    return SheetSnapshot(
+        columns=SheetColumns(ia_identifier=2, ia_uploaded=3, ia_url=4, ia_identifier_bib=5),
+        grid=grid,
+        fingerprints=fingerprints,
+        claimed_identifiers=frozenset(),
+    )
+
+
+def test_split_moved_targets_cannot_trust_a_fingerprint_two_rows_share():
+    """Issue #1's guard-level half. A fingerprint proves 'still the same row'
+    only while exactly one row carries it: with two rows resolving to the
+    same file, a row shift leaves the SAME fingerprint sitting at the
+    target's position while the physical row underneath is a different one,
+    and the write lands on the wrong row. Duplicates present at the initial
+    read are refused by resolve_sheet_files(); this covers the duplicate that
+    APPEARS mid-run, which only the fresh read can see. A shared fingerprint
+    is treated as unable to prove anything - the target is filed as moved,
+    the safe direction."""
+    from ia_bulk import split_moved_targets
+
+    grid = [
+        SHEET_HEADER,
+        ["Photo one", "photo1.jpg", "", "", "", ""],
+        ["Inserted duplicate", "photo1.jpg", "", "", "", ""],
+    ]
+    target = _target("lcps-astoriaphotos-00001")
+
+    still_there, moved = split_moved_targets(
+        [target], _guard_snapshot({2: "photo1.jpg", 3: "photo1.jpg"}, grid), reserved_already=False
+    )
+
+    assert still_there == []
+    assert moved == [target]
+
+    # The contrast case: the same target passes once its fingerprint is
+    # unique again - proving the ambiguity check, not something else, is
+    # what filed it as moved above.
+    still_there, moved = split_moved_targets(
+        [target], _guard_snapshot({2: "photo1.jpg", 3: "photo2.jpg"}, grid), reserved_already=False
+    )
+    assert still_there == [target]
+    assert moved == []
+
+
+def test_cmd_upload_refuses_two_rows_resolving_to_the_same_file(tmp_path, monkeypatch, capsys):
+    """Issue #1's precondition, end to end: both duplicate rows are blocked
+    at validation, nothing is uploaded for either, and the run exits
+    non-zero. Without this refusal the run would mint two permanent
+    identifiers for one photograph - and hand the mid-run-edit guard two
+    rows it cannot tell apart."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Same photo again", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path, monkeypatch, grid, files=("photo1.jpg", "photo2.jpg")
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path))
+    captured = capsys.readouterr()
+
+    # Only the untangled row 4 uploads; the duplicate pair is skipped whole.
+    assert recorder.uploads == [f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"]
+    assert recorder.writes == []
+    assert "the same file as row 3" in captured.out
+    assert "the same file as row 2" in captured.out
+    assert exit_code == 1
+
+
+def test_cmd_upload_skips_the_write_when_a_duplicate_file_row_is_inserted_mid_run(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #1's actual failure sequence, replayed. The run plans row 2
+    (photo1) and row 3 (photo2); a human then inserts a new row AT row 2
+    naming photo1 again, shifting the planned rows down one. At the
+    pre-reserve read, row 2 still shows a matching fingerprint and a blank
+    ia_identifier - but the row underneath is the inserted one, and writing
+    there records the reservation against the wrong photograph while the
+    planned row stays unassigned, due to be minted AGAIN next run. The
+    fingerprint is duplicated in the fresh read, so the guard must refuse to
+    treat it as identity: nothing is written, nothing is uploaded."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+
+    def human_inserts_a_duplicate_at_row_two(live_grid, read_count):
+        if read_count == 2:
+            live_grid.insert(1, ["Same photo again", "photo1.jpg", "", "", "", ""])
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        before_read=human_inserts_a_duplicate_at_row_two,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    # The inserted row must NOT have received the reservation - that write
+    # landing is the misattribution this issue is about.
+    assert client.grid[1] == ["Same photo again", "photo1.jpg", "", "", "", ""]
+    assert recorder.writes == []
+    assert recorder.uploads == []
+    assert "row 2 is no longer the row this run planned for" in captured.err
+    assert "row 3 is no longer the row this run planned for" in captured.err
+    assert exit_code == 1
+
+
 def test_cmd_upload_aborts_the_whole_run_when_a_column_is_inserted_mid_run(
     tmp_path, monkeypatch, capsys
 ):
@@ -5701,6 +5824,94 @@ def test_a_broken_filename_stays_an_error_even_beside_a_genuinely_blank_row(tmp_
     # failing row, blank or broken - left in place it would resolve as a
     # literal path for the later disk check and mask the failure.
     assert [row["file"] for row in rows] == ["", "", ""]
+
+
+def _duplicate_claim_message(resolved: str, other_rows: list[int]) -> str:
+    """resolve_sheet_files()'s own wording for a duplicate-file row, rebuilt
+    here so the tests below assert it character-for-character - same rule as
+    _unresolved_message()."""
+    label = "row" if len(other_rows) == 1 else "rows"
+    listed = ", ".join(str(n) for n in other_rows)
+    return (
+        f"resolves to '{resolved}' - the same file as {label} {listed}. Two rows cannot "
+        "claim one photograph: delete the duplicate row, or point it at the right file"
+    )
+
+
+def test_two_rows_resolving_to_the_same_file_are_both_errors(tmp_path):
+    """Issue #1's precondition, refused at the source. Two rows claiming one
+    file is how the mid-run-edit guard's fingerprint stops proving identity -
+    and, guard aside, it is how one photograph gets two permanent
+    identifiers. BOTH rows are flagged, not just the second: the tool cannot
+    know which of the two is the wrong one, and flagging one of them silently
+    elects the other as correct.
+
+    The clean row 4 must keep its resolution: a duplicate pair is those two
+    rows' problem, not the run's."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    (folder / "Roy_s Shell.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Finnish Meat Market.jpg"},
+        {"folder": "SOP CD 1", "name": "Finnish Meat Market.jpg"},
+        {"folder": "SOP CD 1", "name": "Roy_s Shell.jpg"},
+    ]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.blank == {}
+    assert outcomes.errors == {
+        2: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [3]),
+        3: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2]),
+    }
+    # Same invariant the other error paths keep: a row filed in `errors`
+    # carries no 'file' value that later disk checks or an upload could
+    # coincidentally use - and no resolved bib either, since that value is
+    # only ever meant to record what actually uploaded.
+    assert [row["file"] for row in rows] == ["", "", "SOP CD 1/Roy_s Shell.jpg"]
+    assert [row.get("ia_identifier_bib", "") for row in rows[:2]] == ["", ""]
+
+
+def test_duplicate_file_detection_sees_through_spelling_differences(tmp_path):
+    """The resolver is deliberately forgiving - case-insensitive, extension
+    optional - so two rows can spell the SAME disk file differently and a
+    check on the raw cells would miss them. The claim is keyed on what the
+    rows RESOLVE to, the same claim_key() the reconcile survey uses, so
+    forgiveness in the resolver cannot reopen the duplicate hole."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {"folder": "SOP CD 1", "name": "Finnish Meat Market.jpg"},
+        {"folder": "SOP CD 1", "name": "finnish meat market"},
+    ]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.errors == {
+        2: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [3]),
+        3: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2]),
+    }
+    assert [row["file"] for row in rows] == ["", ""]
+
+
+def test_three_rows_claiming_one_file_each_name_both_of_the_others(tmp_path):
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [{"folder": "SOP CD 1", "name": "Finnish Meat Market.jpg"} for _ in range(3)]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.errors == {
+        2: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [3, 4]),
+        3: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2, 4]),
+        4: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2, 3]),
+    }
 
 
 def _sheet_row(**cells: str) -> dict[str, str]:

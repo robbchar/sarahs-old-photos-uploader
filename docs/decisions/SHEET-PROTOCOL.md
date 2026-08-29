@@ -56,18 +56,15 @@ writes. `ia_identifier` is still checked alongside it — blank for a row about
 to be reserved, ours once reserved — because it catches a different thing:
 somebody else claiming the row.
 
-The residual gap is two rows whose template columns are identical — the same
-latent "two rows resolving to the same photograph" case recorded in
-`KNOWN-ISSUES.md`. **Its consequence is a misattributed write, not a withheld
-one.** With two UNASSIGNED rows pointing at the same file and a row deleted
-above them, the fingerprints still match after the shift, so the guard passes:
-the item uploads carrying one row's metadata while the identifier, timestamp,
-URL and bib land on the *other* row, leaving the first unassigned and due to
-be re-minted next run. Bounded — the same bytes reach Internet Archive, and it
-cannot touch a DONE or RESERVED row, since those are excluded from the run
-before the guard ever sees them — but it is a wrong write, not a refusal, and
-the note should not be read as saying otherwise. Fixing it needs a row
-identity that does not depend on `file_template` being unique.
+The residual gap was two rows whose template columns are identical — the
+"two rows resolving to the same photograph" case tracked as issue #1. **Its
+consequence was a misattributed write, not a withheld one.** With two
+UNASSIGNED rows pointing at the same file and a row deleted above them, the
+fingerprints still matched after the shift, so the guard passed: the item
+uploaded carrying one row's metadata while the identifier, timestamp, URL
+and bib landed on the *other* row, leaving the first unassigned and due to
+be re-minted next run. Closed on 2026-08-29 — see "A fingerprint only proves
+identity while it is unique" below.
 
 ## The Sheet is the correction
 
@@ -168,3 +165,51 @@ report a successful live run that uploaded nothing.
 So `load_prior_successes()` matches on the log's `live` field. Log lines
 written before that field existed record no mode and match **neither**, so old
 logs simply never skip anything rather than skipping in the wrong direction.
+
+## A fingerprint only proves identity while it is unique
+
+*Decided 2026-08-29, closing issue #1 — the misattributed-write gap the
+"row's identity is its `file_template` columns" note above deferred.*
+
+The guard's fingerprint says "the row at this position still describes the
+same photograph". That inference silently assumes no *other* row carries the
+same fingerprint: with two rows resolving to one file, a row shift leaves a
+matching fingerprint at the target's position while the physical row
+underneath is a different one, and the write-back lands on the wrong row —
+the item uploads under one row's metadata, the identifier and URL are
+recorded on the other, and the first row stays unassigned and is minted a
+*second* permanent identifier next run.
+
+Issue #1's fix direction asked for a row identity that does not depend on
+`file_template` being unique. Every candidate for such a key fails the
+section-above constraint that identity must be something this tool never
+writes (a hidden key column is the tool's own write; a wider fingerprint
+over the metadata columns just moves the same collision one duplicate-row
+away). So instead of finding a key that survives duplicates, duplicates
+themselves are refused — which they deserve on their own merits, since two
+rows claiming one photograph is exactly the "duplicate row mints a second
+permanent identifier" case `reconcile-files` already refuses to create. Two
+layers, because duplicates have two ways in:
+
+- **Present at the initial read: refused by `resolve_sheet_files()`.** Rows
+  resolving to the same file are all errors — every row in the group, not
+  all-but-the-first, because the tool cannot know which row is the wrong one
+  and flagging the rest would silently elect a winner. Keyed on
+  `claim_key()` of the *resolved* path, the same key the reconcile survey
+  uses: the resolver is deliberately forgiving (case, extension), so two
+  rows can spell one disk file differently and a raw-cell comparison would
+  miss them. Shared by `validate` and `upload`, so the pair shows up as
+  blocked rows long before a live run.
+- **Introduced mid-run: the guard distrusts a duplicated fingerprint.**
+  `split_moved_targets()` counts each fingerprint across the fresh read; a
+  target whose fingerprint appears on more than one row is filed as moved —
+  the safe direction, skip and report — because position plus a non-unique
+  fingerprint proves nothing. It goes out on a rerun once the Sheet is
+  untangled.
+
+Together the original inference is made sound: a write proceeds only when
+the fingerprint at the target's position matches, is unique in the fresh
+read (guard), was unique in the initial read (validation — a duplicate
+there never becomes a target), and the `ia_identifier` cell holds exactly
+what the protocol step expects. A pure row shift can no longer satisfy all
+four against the wrong physical row.
