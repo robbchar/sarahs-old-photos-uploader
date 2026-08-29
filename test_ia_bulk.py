@@ -4915,6 +4915,57 @@ def test_cmd_upload_skips_the_write_when_a_duplicate_file_row_is_inserted_mid_ru
     assert exit_code == 1
 
 
+def test_cmd_upload_still_confirms_when_a_duplicate_row_is_appended_after_the_upload(
+    tmp_path, monkeypatch, capsys
+):
+    """The ambiguity check belongs to the reserve leg only. Here the duplicate
+    arrives AFTER both items are on Internet Archive, appended at the end of
+    the Sheet - an edit that shifts nothing, so both targets are still exactly
+    where the run planned them, and by now each carries this run's own
+    identifier (proved unique across the Sheet at reserve). Refusing the
+    confirm write here would leave a live item recorded nowhere, and next
+    run's duplicate refusal would block the very row that needs finishing."""
+    from ia_bulk import cmd_upload
+
+    grid = [
+        SHEET_HEADER,
+        ["First photo", "photo1.jpg", "", "", "", ""],
+        ["Second photo", "photo2.jpg", "", "", "", ""],
+    ]
+
+    def human_appends_a_duplicate_before_the_confirm_read(live_grid, read_count):
+        # 1 = initial, 2 = pre-reserve, 3 = pre-confirm.
+        if read_count == 3:
+            live_grid.append(["Same photo again", "photo1.jpg", "", "", "", ""])
+
+    recorder, client, registry_path, _ = setup_sheet_upload(
+        tmp_path,
+        monkeypatch,
+        grid,
+        files=("photo1.jpg", "photo2.jpg"),
+        before_read=human_appends_a_duplicate_before_the_confirm_read,
+    )
+
+    exit_code = cmd_upload(make_upload_args(tmp_path, registry_path, write_identifier=True))
+    captured = capsys.readouterr()
+
+    assert recorder.uploads == [
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001",
+        f"zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002",
+    ]
+    # Both rows are confirmed, not just the one whose file nothing duplicated.
+    assert recorder.writes[-1] == [
+        ("D2", FIXED_TIMESTAMP),
+        ("E2", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00001"),
+        ("F2", "photo1.jpg"),
+        ("D3", FIXED_TIMESTAMP),
+        ("E3", f"https://archive.org/details/zztest-{FIXED_STAMP}-lcps-astoriaphotos-00002"),
+        ("F3", "photo2.jpg"),
+    ]
+    assert "no longer the row this run planned for" not in captured.err
+    assert exit_code == 0
+
+
 def test_cmd_upload_aborts_the_whole_run_when_a_column_is_inserted_mid_run(
     tmp_path, monkeypatch, capsys
 ):
@@ -5911,6 +5962,72 @@ def test_three_rows_claiming_one_file_each_name_both_of_the_others(tmp_path):
         2: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [3, 4]),
         3: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2, 4]),
         4: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2, 3]),
+    }
+
+
+def test_an_already_uploaded_duplicate_row_is_named_as_the_one_to_keep(tmp_path):
+    """When exactly one claimant has already uploaded, "the tool cannot know
+    which row is the wrong one" no longer holds. That row's identifier is
+    permanent and its Sheet row is the only thing tying the identifier to its
+    metadata - including the ia_url `sync-metadata` reads to find its targets
+    - so the symmetrical "delete the duplicate row" wording was inviting the
+    one deletion that loses something irreplaceable. Both rows are still
+    errors; only the remedy differs."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {
+            "folder": "SOP CD 1",
+            "name": "Finnish Meat Market.jpg",
+            "ia_identifier": "lcps-astoriaphotos-00001",
+            "ia_uploaded": FIXED_TIMESTAMP,
+            "ia_url": "https://archive.org/details/lcps-astoriaphotos-00001",
+        },
+        {"folder": "SOP CD 1", "name": "Finnish Meat Market.jpg"},
+    ]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.errors == {
+        2: (
+            "resolves to 'SOP CD 1/Finnish Meat Market.jpg' - the same file as row 3. Two "
+            "rows cannot claim one photograph: this row has already uploaded, so it is the "
+            "one to keep - fix or delete row 3 instead"
+        ),
+        3: (
+            "resolves to 'SOP CD 1/Finnish Meat Market.jpg' - the same file as row 2. Two "
+            "rows cannot claim one photograph: row 2 has already uploaded and must be kept, "
+            "so delete this row, or point it at the right file"
+        ),
+    }
+
+
+def test_two_already_uploaded_duplicate_rows_get_the_symmetrical_wording(tmp_path):
+    """One photograph already holding two permanent identifiers is a worse
+    problem than this function can adjudicate - neither row can be deleted
+    without losing an identifier's only record - so it falls back to the
+    symmetrical wording rather than electing one of them as the keeper."""
+    folder = tmp_path / "SOP CD 1"
+    folder.mkdir()
+    (folder / "Finnish Meat Market.jpg").write_bytes(b"")
+    config = _sheet_config(files_dir=str(tmp_path), file_template="{folder}/{name}")
+    rows = [
+        {
+            "folder": "SOP CD 1",
+            "name": "Finnish Meat Market.jpg",
+            "ia_identifier": f"lcps-astoriaphotos-0000{number}",
+            "ia_uploaded": FIXED_TIMESTAMP,
+        }
+        for number in (1, 2)
+    ]
+
+    outcomes = resolve_sheet_files(rows, config)
+
+    assert outcomes.errors == {
+        2: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [3]),
+        3: _duplicate_claim_message("SOP CD 1/Finnish Meat Market.jpg", [2]),
     }
 
 

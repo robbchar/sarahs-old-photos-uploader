@@ -207,9 +207,13 @@ Two rows resolving to the same file would defeat that fingerprint — identical
 `file_template` cells are identical fingerprints — so they are refused
 outright: `validate` and `upload` flag both rows of such a pair as errors
 (two rows cannot claim one photograph; that would mint it two permanent
-identifiers), and if a duplicate appears mid-run, the guard treats the now
-ambiguous fingerprint as unable to prove anything and skips the row like any
-other moved one. See
+identifiers) — and if one of them has already uploaded, it is named as the
+row to keep rather than offered for deletion. If a duplicate appears before
+a run reserves its numbers, the guard treats the now ambiguous fingerprint
+as unable to prove anything and skips the row like any other moved one; once
+a row holds the run's own number, that number is the proof instead, so a
+duplicate appearing later cannot withhold the write that records the upload.
+See
 [`SHEET-PROTOCOL.md`](docs/decisions/SHEET-PROTOCOL.md#a-fingerprint-only-proves-identity-while-it-is-unique).
 
 That said, the check is a safety net, not a licence. So: **avoid editing the

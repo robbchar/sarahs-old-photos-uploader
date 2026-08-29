@@ -193,8 +193,15 @@ layers, because duplicates have two ways in:
 
 - **Present at the initial read: refused by `resolve_sheet_files()`.** Rows
   resolving to the same file are all errors — every row in the group, not
-  all-but-the-first, because the tool cannot know which row is the wrong one
-  and flagging the rest would silently elect a winner. Keyed on
+  all-but-the-first, because the tool usually cannot know which row is the
+  wrong one and flagging the rest would silently elect a winner. It *can*
+  know in one case: a group holding exactly one row that has already
+  uploaded. That row's identifier is permanent and its row is the only link
+  between the identifier and its metadata — including the `ia_url`
+  `sync-metadata` reads to find its targets — so it is named as the one to
+  keep and only the others are offered for deletion. (Two uploaded rows in
+  one group is a worse problem than this check can adjudicate, so it falls
+  back to the symmetrical wording.) Keyed on
   `claim_key()` of the *resolved* path, the same key the reconcile survey
   uses: the resolver is deliberately forgiving (case, extension), so two
   rows can spell one disk file differently and a raw-cell comparison would
@@ -207,9 +214,21 @@ layers, because duplicates have two ways in:
   fingerprint proves nothing. It goes out on a rerun once the Sheet is
   untangled.
 
+  **On the reserve leg only.** After reserve, the target's row carries this
+  run's own number, and `check_claimed_identifiers()` has already proved
+  that number unique across the whole Sheet — so the `ia_identifier`
+  comparison is by itself a complete proof of identity, since a shift puts a
+  row that does *not* carry our number underneath. Applying the ambiguity
+  veto to the confirm leg as well only produced false positives, and the
+  cheapest of them was expensive: a volunteer appending a duplicate row
+  (which shifts nothing) between the upload and the confirm write left a
+  live Internet Archive item recorded nowhere, with the next run's own
+  duplicate refusal then blocking the very row that needed finishing.
+
 Together the original inference is made sound: a write proceeds only when
-the fingerprint at the target's position matches, is unique in the fresh
-read (guard), was unique in the initial read (validation — a duplicate
-there never becomes a target), and the `ia_identifier` cell holds exactly
-what the protocol step expects. A pure row shift can no longer satisfy all
-four against the wrong physical row.
+the fingerprint at the target's position matches, was unique in the initial
+read (validation — a duplicate there never becomes a target), is unique in
+the fresh read *or* the row already holds this run's proven-unique number
+(guard), and the `ia_identifier` cell holds exactly what the protocol step
+expects. A pure row shift can no longer satisfy all of that against the
+wrong physical row.
