@@ -23,6 +23,9 @@ from ia_bulk import (
     claim_key,
     survey_files,
     validate_rows,
+    validate_csv_rows,
+    validate_sheet_rows,
+    validate_identifiers,
     validate_sheet_grid,
     RowValidation,
     Readiness,
@@ -108,7 +111,11 @@ def test_load_registry_reads_json(tmp_path):
 
 
 def make_registry():
-    return {"collection_key": "lcps", "projects": {"astoriaphotos": {}}}
+    """Two projects, deliberately. A single-project registry cannot express
+    the difference between "this prefix belongs to no project" and "this
+    prefix belongs to somebody else's project", which is the whole of issue
+    #2 - and it is what let that bug sit undetected."""
+    return {"collection_key": "lcps", "projects": {"astoriaphotos": {}, "otherproject": {}}}
 
 
 def make_sheet_registry(files_dir=".", **project_overrides):
@@ -206,14 +213,22 @@ def make_http_error(message="Unable to parse range: Sheet1", status=400):
 
 def test_check_identifier_accepts_valid_registered_identifier():
     errors = check_identifier(
-        "lcps-astoriaphotos-00001", row_number=2, registry=make_registry(), seen_identifiers={}
+        "lcps-astoriaphotos-00001",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
     )
     assert errors == []
 
 
 def test_check_identifier_rejects_bad_scheme():
     errors = check_identifier(
-        "LCPS_astoriaphotos_1", row_number=2, registry=make_registry(), seen_identifiers={}
+        "LCPS_astoriaphotos_1",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
     )
     assert len(errors) == 1
     assert "does not match scheme" in errors[0]
@@ -221,7 +236,11 @@ def test_check_identifier_rejects_bad_scheme():
 
 def test_check_identifier_rejects_unknown_prefix():
     errors = check_identifier(
-        "lcps-unknownproject-00001", row_number=2, registry=make_registry(), seen_identifiers={}
+        "lcps-unknownproject-00001",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
     )
     assert len(errors) == 1
     assert "not found in project registry" in errors[0]
@@ -232,7 +251,11 @@ def test_check_identifier_rejects_zztest_prefix_since_csv_always_holds_real_iden
     # identifier — "zztest-" prefixing is applied automatically by
     # effective_identifier() at network-call time, never authored in the CSV.
     errors = check_identifier(
-        "zztest-astoriaphotos-00001", row_number=2, registry=make_registry(), seen_identifiers={}
+        "zztest-astoriaphotos-00001",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
     )
     assert len(errors) == 1
     assert "not found in project registry" in errors[0]
@@ -241,14 +264,24 @@ def test_check_identifier_rejects_zztest_prefix_since_csv_always_holds_real_iden
 def test_check_identifier_rejects_duplicate():
     seen = {"lcps-astoriaphotos-00001": 2}
     errors = check_identifier(
-        "lcps-astoriaphotos-00001", row_number=5, registry=make_registry(), seen_identifiers=seen
+        "lcps-astoriaphotos-00001",
+        row_number=5,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers=seen,
     )
     assert len(errors) == 1
     assert "duplicates row 2" in errors[0]
 
 
 def test_check_identifier_rejects_empty():
-    errors = check_identifier("", row_number=2, registry=make_registry(), seen_identifiers={})
+    errors = check_identifier(
+        "",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+    )
     assert errors == ["missing required column 'identifier'"]
 
 
@@ -256,7 +289,11 @@ def test_check_identifier_column_name_defaults_to_identifier_for_the_csv_path():
     """Pins the CSV path's wording exactly - column_name existing as a
     parameter must not change what the CSV path's messages say."""
     errors = check_identifier(
-        "LCPS_astoriaphotos_1", row_number=2, registry=make_registry(), seen_identifiers={}
+        "LCPS_astoriaphotos_1",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
     )
     assert errors == [
         "identifier 'LCPS_astoriaphotos_1' does not match scheme COLLECTIONKEY-PROJECTID-NUMBER"
@@ -272,6 +309,7 @@ def test_check_identifier_names_the_column_it_checked():
         "lcps-astoriaphotos-00001",
         row_number=5,
         registry=make_registry(),
+        project_id="astoriaphotos",
         seen_identifiers={"lcps-astoriaphotos-00001": 2},
         column_name="ia_identifier",
     )
@@ -280,9 +318,130 @@ def test_check_identifier_names_the_column_it_checked():
 
 def test_check_identifier_names_the_column_for_a_blank_value_too():
     errors = check_identifier(
-        "", row_number=2, registry=make_registry(), seen_identifiers={}, column_name="ia_identifier"
+        "",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+        column_name="ia_identifier",
     )
     assert errors == ["missing required column 'ia_identifier'"]
+
+
+# --- issue #2: an identifier must belong to the run's OWN project ---------
+
+
+def test_check_identifier_rejects_another_registered_projects_identifier():
+    """Issue #2. 'lcps-otherproject-00099' is a perfectly well-formed
+    identifier of a project the registry knows - it is simply not THIS run's
+    project. Accepting it files an item under another project's numbering
+    under a name that can never be renamed."""
+    errors = check_identifier(
+        "lcps-otherproject-00099",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+    )
+    assert len(errors) == 1
+    assert "otherproject" in errors[0]
+    assert "astoriaphotos" in errors[0]
+
+
+def test_check_identifier_accepts_the_runs_own_project():
+    errors = check_identifier(
+        "lcps-astoriaphotos-00001",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+    )
+    assert errors == []
+
+
+def test_check_identifier_keeps_unknown_prefix_distinct_from_wrong_project():
+    """Two different mistakes needing two different fixes: an unregistered
+    prefix means the identifier is wrong, a wrong-project prefix means
+    --project may be the thing that is wrong. One message for both would
+    send the operator to the wrong file."""
+    unknown = check_identifier(
+        "lcps-nosuchproject-00001",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+    )
+    wrong_project = check_identifier(
+        "lcps-otherproject-00001",
+        row_number=3,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+    )
+    assert "not found in project registry" in unknown[0]
+    assert "not found in project registry" not in wrong_project[0]
+
+
+def test_check_identifier_names_the_column_for_a_wrong_project_too():
+    """The Sheet path's ia_identifier/identifier ambiguity applies to this
+    message exactly as it does to every other one."""
+    errors = check_identifier(
+        "lcps-otherproject-00099",
+        row_number=2,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        seen_identifiers={},
+        column_name="ia_identifier",
+    )
+    assert errors[0].startswith("ia_identifier ")
+
+
+def test_validate_csv_rows_rejects_another_projects_identifier(tmp_path):
+    """The leaf check is only useful if the run's project actually reaches
+    it - this pins the threading, not the comparison."""
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    rows = [
+        {
+            "identifier": "lcps-otherproject-00099",
+            "file": "a.jpg",
+            "mediatype": "image",
+            "title": "First",
+        }
+    ]
+
+    results = validate_csv_rows(rows, tmp_path, make_registry(), "astoriaphotos")
+
+    assert not results[0].is_valid
+    assert any("otherproject" in e for e in results[0].errors)
+
+
+def test_validate_sheet_rows_rejects_another_projects_identifier(tmp_path):
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    rows = [
+        {
+            "ia_identifier": "lcps-otherproject-00099",
+            "file": "a.jpg",
+            "mediatype": "image",
+            "title": "First",
+        }
+    ]
+
+    results = validate_sheet_rows(rows, tmp_path, make_registry(), "astoriaphotos")
+
+    assert not results[0].is_valid
+    assert any("otherproject" in e for e in results[0].errors)
+
+
+def test_validate_identifiers_rejects_another_projects_identifier():
+    """sync-metadata's own path. It writes metadata to whatever identifier
+    the row names, so a wrong-project identifier here overwrites another
+    project's item rather than merely misfiling this one."""
+    rows = [{"identifier": "lcps-otherproject-00099"}]
+
+    results = validate_identifiers(rows, make_registry(), "astoriaphotos")
+
+    assert not results[0].is_valid
+    assert any("otherproject" in e for e in results[0].errors)
 
 
 def test_validate_rows_passes_a_fully_valid_row(tmp_path):
@@ -297,7 +456,9 @@ def test_validate_rows_passes_a_fully_valid_row(tmp_path):
         }
     ]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert len(results) == 1
     assert results[0].is_valid
@@ -315,7 +476,9 @@ def test_validate_rows_flags_missing_file():
         }
     ]
 
-    results = validate_rows(rows, files_dir="/tmp", registry=make_registry())
+    results = validate_rows(
+        rows, files_dir="/tmp", registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert not results[0].is_valid
     assert any("file not found" in e for e in results[0].errors)
@@ -333,7 +496,9 @@ def test_validate_rows_flags_missing_required_metadata(tmp_path):
         }
     ]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert not results[0].is_valid
     assert "missing required column 'mediatype'" in results[0].errors
@@ -352,7 +517,9 @@ def test_validate_rows_does_not_require_date(tmp_path):
         }
     ]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert results[0].is_valid
 
@@ -368,7 +535,9 @@ def test_validate_rows_row_numbers_start_at_2_for_header():
         }
     ]
 
-    results = validate_rows(rows, files_dir="/tmp", registry=make_registry())
+    results = validate_rows(
+        rows, files_dir="/tmp", registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert results[0].row_number == 2
 
@@ -481,7 +650,11 @@ def test_validate_rows_skips_checks_but_keeps_row_numbers_for_skip_identifiers()
     ]
 
     results = validate_rows(
-        rows, files_dir="/tmp", registry=make_registry(), skip_identifiers=frozenset({"lcps-astoriaphotos-00001"})
+        rows,
+        files_dir="/tmp",
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        skip_identifiers=frozenset({"lcps-astoriaphotos-00001"}),
     )
 
     assert results[0].is_valid
@@ -509,7 +682,9 @@ def test_validate_rows_flags_a_row_with_more_fields_than_the_header(tmp_path):
     row = valid_row()
     row[None] = ["surplus value"]
 
-    results = validate_rows([row], files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        [row], files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert not results[0].is_valid
     assert any("more fields than the header" in e for e in results[0].errors)
@@ -522,7 +697,9 @@ def test_validate_rows_flags_a_row_with_fewer_fields_than_the_header(tmp_path):
     (tmp_path / "photo1.jpg").write_bytes(b"x")
     rows = [valid_row(addresses=None)]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert not results[0].is_valid
     assert any("fewer fields than the header" in e for e in results[0].errors)
@@ -532,7 +709,9 @@ def test_validate_rows_names_the_column_a_short_row_is_missing(tmp_path):
     (tmp_path / "photo1.jpg").write_bytes(b"x")
     rows = [valid_row(addresses=None)]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert any("addresses" in e for e in results[0].errors)
 
@@ -542,7 +721,9 @@ def test_validate_rows_accepts_a_row_whose_trailing_cell_is_merely_empty(tmp_pat
     (tmp_path / "photo1.jpg").write_bytes(b"x")
     rows = [valid_row(addresses="")]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert results[0].is_valid
 
@@ -566,7 +747,9 @@ def test_validate_rows_default_required_columns_still_requires_identifier_and_fi
         }
     ]
 
-    results = validate_rows(rows, files_dir=tmp_path, registry=make_registry())
+    results = validate_rows(
+        rows, files_dir=tmp_path, registry=make_registry(), project_id="astoriaphotos"
+    )
 
     assert not results[0].is_valid
     assert "missing required column 'identifier'" in results[0].errors
@@ -596,6 +779,7 @@ def test_validate_rows_identifier_column_lets_the_sheet_path_read_ia_identifier(
         rows,
         files_dir=tmp_path,
         registry=make_registry(),
+        project_id="astoriaphotos",
         required_columns=("mediatype", "title", "file"),
         identifier_column="ia_identifier",
     )
@@ -689,7 +873,12 @@ def test_cmd_validate_fails_on_a_header_with_a_capitalized_known_column(tmp_path
     from ia_bulk import cmd_validate
 
     exit_code = cmd_validate(
-        Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+        Namespace(
+            project="astoriaphotos",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+        )
     )
 
     assert exit_code == 1
@@ -712,7 +901,12 @@ def test_cmd_validate_fails_on_an_unquoted_comma_in_the_header(tmp_path, capsys)
     from ia_bulk import cmd_validate
 
     exit_code = cmd_validate(
-        Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+        Namespace(
+            project="astoriaphotos",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+        )
     )
 
     assert exit_code == 1
@@ -743,6 +937,7 @@ def test_cmd_upload_refuses_a_bad_header_before_touching_the_network(tmp_path, m
 
     exit_code = cmd_upload(
         Namespace(
+            project="astoriaphotos",
             csv=str(csv_path),
             files_dir=str(tmp_path),
             registry=str(registry_path),
@@ -777,6 +972,7 @@ def test_cmd_sync_metadata_refuses_a_bad_header_before_touching_the_network(tmp_
 
     exit_code = cmd_sync_metadata(
         Namespace(
+            project="astoriaphotos",
             csv=str(csv_path),
             registry=str(registry_path),
             live=False,
@@ -854,7 +1050,12 @@ def test_cmd_validate_returns_zero_when_all_rows_valid(tmp_path, capsys):
         json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
         encoding="utf-8",
     )
-    args = Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+    args = Namespace(
+            project="astoriaphotos",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+        )
 
     exit_code = cmd_validate(args)
 
@@ -884,7 +1085,12 @@ def test_cmd_validate_returns_one_when_a_row_fails(tmp_path, capsys):
         json.dumps({"collection_key": "lcps", "projects": {"astoriaphotos": {}}}),
         encoding="utf-8",
     )
-    args = Namespace(csv=str(csv_path), files_dir=str(tmp_path), registry=str(registry_path))
+    args = Namespace(
+            project="astoriaphotos",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+        )
 
     exit_code = cmd_validate(args)
 
@@ -1613,7 +1819,7 @@ def test_cmd_validate_resolves_a_filename_missing_its_extension_and_writes_ident
     (tmp_path / "Alderbrook Hall.jpg").write_bytes(b"x")
     captured_rows = []
 
-    def fake_validate_rows(rows, files_dir, registry, **kwargs):
+    def fake_validate_rows(rows, files_dir, registry, project_id, **kwargs):
         captured_rows.extend(rows)
         return [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
 
@@ -2109,7 +2315,7 @@ def test_cmd_validate_injects_mediatype_from_the_registry_not_a_hardcoded_value(
 
     captured_rows = []
 
-    def fake_validate_rows(rows, files_dir, registry, **kwargs):
+    def fake_validate_rows(rows, files_dir, registry, project_id, **kwargs):
         captured_rows.extend(rows)
         return [RowValidation(row_number=i + 2, identifier="") for i in range(len(rows))]
 
@@ -2307,11 +2513,111 @@ def test_cmd_validate_treats_an_empty_csv_flag_as_an_explicit_csv_path_not_the_s
     monkeypatch.setattr("ia_bulk.build_sheet_client", _must_not_reach_the_sheet_path)
 
     args = Namespace(
-        csv="", files_dir=".", registry="projects_registry.json", project="astoriaphotos", live=False
+        csv="",
+        files_dir=".",
+        registry="projects_registry.json",
+        project="astoriaphotos",
+        live=False,
     )
 
     with pytest.raises(FileNotFoundError):
         cmd_validate(args)
+
+
+def test_cmd_validate_csv_refuses_an_unregistered_project(tmp_path, capsys):
+    """The --csv paths never build a ProjectConfig, so they never got
+    load_project_config's unknown-project guard. That did not matter while
+    --project went unread there; since issue #2 every row is checked against
+    it, and an unregistered value would fail every row with a message
+    blaming the identifier instead of the flag."""
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title"],
+        [{"identifier": "lcps-astoriaphotos-00001", "file": "a.jpg", "mediatype": "image", "title": "First"}],
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    from ia_bulk import cmd_validate
+
+    exit_code = cmd_validate(
+        Namespace(
+            project="astoriaphoto",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "unknown project 'astoriaphoto'" in captured.err
+    assert "astoriaphotos" in captured.err
+    # The rows were never reported on - the run stopped at the flag.
+    assert "lcps-astoriaphotos-00001" not in captured.out
+
+
+def test_cmd_upload_csv_refuses_an_unregistered_project_before_the_network(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "a.jpg").write_bytes(b"x")
+    csv_path = tmp_path / "items.csv"
+    write_csv(
+        csv_path,
+        ["identifier", "file", "mediatype", "title"],
+        [{"identifier": "lcps-astoriaphotos-00001", "file": "a.jpg", "mediatype": "image", "title": "First"}],
+    )
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(internetarchive, "upload", lambda *a, **k: calls.append(a) or [])
+
+    from ia_bulk import cmd_upload
+
+    exit_code = cmd_upload(
+        Namespace(
+            project="astoriaphoto",
+            csv=str(csv_path),
+            files_dir=str(tmp_path),
+            registry=str(registry_path),
+            live=False,
+            collection=None,
+            log_dir=str(tmp_path / "logs"),
+            resume_from=None,
+        )
+    )
+
+    assert exit_code == 1
+    assert calls == []
+    assert "unknown project 'astoriaphoto'" in capsys.readouterr().err
+
+
+def test_cmd_sync_metadata_csv_refuses_an_unregistered_project(tmp_path, capsys):
+    csv_path = tmp_path / "updates.csv"
+    write_csv(csv_path, ["identifier", "title"], [{"identifier": "lcps-astoriaphotos-00001", "title": "New"}])
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(make_registry()), encoding="utf-8")
+
+    from ia_bulk import cmd_sync_metadata
+
+    exit_code = cmd_sync_metadata(
+        Namespace(
+            project="astoriaphoto",
+            csv=str(csv_path),
+            registry=str(registry_path),
+            live=True,
+            log_dir=str(tmp_path / "logs"),
+            resume_from=None,
+            from_log=None,
+            dry_run=False,
+        )
+    )
+
+    assert exit_code == 1
+    assert "unknown project 'astoriaphoto'" in capsys.readouterr().err
 
 
 def test_chunk_rows_splits_into_groups_of_chunk_size():
@@ -2922,7 +3228,7 @@ def test_validate_identifiers_passes_valid_unique_identifiers():
         {"identifier": "lcps-astoriaphotos-00002", "title": "Another title"},
     ]
 
-    results = validate_identifiers(rows, registry=make_registry())
+    results = validate_identifiers(rows, registry=make_registry(), project_id="astoriaphotos")
 
     assert all(r.is_valid for r in results)
 
@@ -2936,7 +3242,10 @@ def test_validate_identifiers_skips_checks_but_keeps_row_numbers_for_skip_identi
     ]
 
     results = validate_identifiers(
-        rows, registry=make_registry(), skip_identifiers=frozenset({"lcps-unregisteredproject-00001"})
+        rows,
+        registry=make_registry(),
+        project_id="astoriaphotos",
+        skip_identifiers=frozenset({"lcps-unregisteredproject-00001"}),
     )
 
     assert results[0].is_valid
@@ -2950,7 +3259,7 @@ def test_validate_identifiers_does_not_require_file_or_mediatype():
 
     rows = [{"identifier": "lcps-astoriaphotos-00001", "title": "New title"}]
 
-    results = validate_identifiers(rows, registry=make_registry())
+    results = validate_identifiers(rows, registry=make_registry(), project_id="astoriaphotos")
 
     assert results[0].is_valid
 
@@ -2960,7 +3269,7 @@ def test_validate_identifiers_flags_bad_scheme():
 
     rows = [{"identifier": "not-a-valid-id", "title": "New title"}]
 
-    results = validate_identifiers(rows, registry=make_registry())
+    results = validate_identifiers(rows, registry=make_registry(), project_id="astoriaphotos")
 
     assert not results[0].is_valid
 
@@ -3005,6 +3314,7 @@ def test_cmd_upload_prints_per_row_progress_and_summary(tmp_path, monkeypatch, c
     monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3052,6 +3362,7 @@ def test_cmd_upload_writes_success_log_with_test_prefixed_target_when_not_live(t
     monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3124,6 +3435,7 @@ def test_cmd_upload_csv_path_stamps_every_row_with_one_run_stamp_not_a_fresh_one
     monkeypatch.setattr("ia_bulk.run_stamp", fake_run_stamp)
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3178,6 +3490,7 @@ def test_cmd_upload_uses_real_identifier_as_target_when_live(tmp_path, monkeypat
     monkeypatch.setattr("ia_bulk.run_stamp", lambda: "shouldneverappear")
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3223,6 +3536,7 @@ def test_cmd_upload_fails_validation_before_touching_network(tmp_path, monkeypat
     )
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3279,6 +3593,7 @@ def test_cmd_upload_resume_from_skips_prior_successes(tmp_path, monkeypatch):
     )
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3352,6 +3667,7 @@ def test_cmd_upload_resume_from_skips_a_row_whose_prior_log_entry_carries_a_diff
     monkeypatch.setattr("ia_bulk.run_stamp", lambda: FIXED_STAMP)
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3404,6 +3720,7 @@ def test_cmd_upload_resume_from_a_test_mode_log_does_not_skip_a_live_run(tmp_pat
     )
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -3467,6 +3784,7 @@ def test_cmd_sync_metadata_writes_success_log_with_test_prefixed_target_when_not
     upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"])
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(registry_path),
         live=False,
@@ -3519,6 +3837,7 @@ def test_cmd_sync_metadata_treats_no_changes_as_unchanged_not_failure(tmp_path, 
     )
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(registry_path),
         live=False,
@@ -3557,6 +3876,7 @@ def test_cmd_sync_metadata_does_not_require_file_or_mediatype_columns(tmp_path, 
     upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"])
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(registry_path),
         live=False,
@@ -3589,6 +3909,7 @@ def test_cmd_sync_metadata_fails_identifier_validation_before_touching_network(t
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target_identifier: update_calls.append(row))
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(registry_path),
         live=False,
@@ -4646,6 +4967,7 @@ def test_cmd_upload_csv_path_refuses_live_without_an_explicit_collection(tmp_pat
     )
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         files_dir=str(tmp_path),
         registry=str(registry_path),
@@ -5721,8 +6043,8 @@ def test_validate_sheet_rows_and_validate_csv_rows_keep_their_two_different_answ
         "title": "T",
     }
 
-    sheet_results = validate_sheet_rows([dict(row)], tmp_path, make_registry())
-    csv_results = validate_csv_rows([dict(row)], tmp_path, make_registry())
+    sheet_results = validate_sheet_rows([dict(row)], tmp_path, make_registry(), "astoriaphotos")
+    csv_results = validate_csv_rows([dict(row)], tmp_path, make_registry(), "astoriaphotos")
 
     assert sheet_results[0].errors == []
     assert csv_results[0].errors == ["missing required column 'identifier'"]
@@ -6786,6 +7108,7 @@ def test_cmd_sync_metadata_refuses_test_mode_without_from_log(tmp_path, capsys):
     write_csv(csv_path, ["identifier", "title"], [{"identifier": "lcps-astoriaphotos-00001", "title": "T"}])
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(_sync_registry(tmp_path)),
         live=False,
@@ -6813,6 +7136,7 @@ def test_cmd_sync_metadata_allows_live_without_from_log(tmp_path, monkeypatch):
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target: seen.append(target))
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(_sync_registry(tmp_path)),
         live=True,
@@ -6845,6 +7169,7 @@ def test_cmd_sync_metadata_rejects_a_row_the_upload_log_never_uploaded(tmp_path,
     monkeypatch.setattr("ia_bulk.update_metadata_row", lambda row, target: seen.append(target))
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(_sync_registry(tmp_path)),
         live=False,
@@ -6877,6 +7202,7 @@ def test_cmd_sync_metadata_ignores_an_upload_log_from_the_other_mode(tmp_path, c
     upload_log = write_upload_log(tmp_path / "upload.jsonl", ["lcps-astoriaphotos-00001"], live=True)
 
     args = Namespace(
+        project="astoriaphotos",
         csv=str(csv_path),
         registry=str(_sync_registry(tmp_path)),
         live=False,
@@ -7105,6 +7431,43 @@ def test_sync_from_sheet_refuses_to_send_a_test_correction_to_a_real_item(
     assert sent == []
     assert "Refusing to send a rehearsal correction to a permanent item" in out
     assert exit_code == 1
+
+
+def test_sync_from_sheet_refuses_an_item_belonging_to_another_project(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #2 on the Sheet path. This command sends metadata to whatever
+    item ia_url names, so a cell pointing at another project's item does not
+    misfile this row - it overwrites that project's item."""
+    from ia_bulk import cmd_sync_metadata
+
+    grid = _synced_grid([
+        ["Somebody else's item", "photo1.jpg", "lcps-astoriaphotos-00001",
+         "2026-08-23T16:13:31Z",
+         f"https://archive.org/details/zztest-{SYNC_STAMP}-lcps-otherproject-00099",
+         "photo1.jpg"],
+    ])
+    sent = []
+    registry_path = _setup_sync_sheet(tmp_path, monkeypatch, grid, sent)
+
+    exit_code = cmd_sync_metadata(_sync_sheet_args(tmp_path, registry_path))
+    out = capsys.readouterr().out
+
+    assert sent == []
+    assert "does not belong to this run's --project astoriaphotos" in out
+    assert exit_code == 1
+
+
+def test_item_project_id_reads_through_a_test_stamp():
+    """The stamp is dropped, not parsed - a test item's project is the one in
+    the real identifier it wraps."""
+    from ia_bulk import item_project_id
+
+    assert item_project_id(f"zztest-{SYNC_STAMP}-lcps-astoriaphotos-00001", live=False) == (
+        "astoriaphotos"
+    )
+    assert item_project_id("lcps-astoriaphotos-00001", live=True) == "astoriaphotos"
+    assert item_project_id("something-a-human-pasted", live=True) is None
 
 
 def test_sync_from_sheet_counts_an_unchanged_item_as_unchanged_not_a_failure(
