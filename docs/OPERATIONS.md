@@ -396,7 +396,7 @@ python ia_bulk.py sync-metadata data/update-metadata.csv --project sarasoldphoto
 Decoupled from upload and safe to re-run. Needs only `identifier` plus the
 columns that changed. Blank cell = leave alone; literal `REMOVE_TAG` = delete
 that field. `noindex` cannot be changed this way —
-see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#3-no-retry-on-transient-network-failures).
+see [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md#1-noindex-cannot-be-changed-by-sync-metadata).
 
 Both of the above are the `--csv` fallback. Normally the Sheet **is** the
 correction — edit the cell, then:
@@ -508,12 +508,26 @@ Re-uploading is also cheap on its own: `upload_row` passes `checksum=True`, so
 a file already present with a matching MD5 is skipped rather than re-uploaded
 and re-derived.
 
-### Transient network failures are expected
+### Transient network failures are expected, and mostly absorbed
 
 Real test runs hit `SSLEOFError` / `MaxRetryError` against
-`s3.us.archive.org`. There is no retry or backoff in the tool — the row is
-logged as `failure` and the run moves on. This is normal for a long run; use
-`--resume-from` and expect to run more than once.
+`s3.us.archive.org`, and read timeouts against `archive.org`. Each upload and
+each metadata update now gets **three attempts**, backing off about 2s then 4s
+with jitter, and prints a line each time it retries:
+
+```
+    - upload of 'lcps-sarasoldphotos-00042': attempt 1 of 3 failed (read timeout=12); retrying in 1.6s
+```
+
+A run that pauses for a few seconds mid-row is doing this, not hanging. A row
+that fails all three attempts is logged as `failure` and the run moves on —
+use `--resume-from` and expect a long run to need more than one pass.
+
+Retries are for the network only. A refusal — `Access Denied`, a rejected
+metadata field, any 4xx — fails on the first attempt, because a second one
+gets the same answer. `429`/`503` also skip retry: they mean Internet Archive
+is rate-limiting, which stops the run entirely ("Pacing and batch limits"
+above) rather than being waited out row by row.
 
 ## Reading a run
 

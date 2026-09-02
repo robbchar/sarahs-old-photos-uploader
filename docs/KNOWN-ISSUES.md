@@ -51,18 +51,7 @@ still has neither `--limit` nor `--chunk-size` (see `DECISIONS.md`, "`--limit`
 counts planned targets...") — size those CSVs by hand, though a file over
 5,000 rows is now refused rather than attempted.
 
-## 3. No retry on transient network failures
-
-**Severity: low — expected, and `--resume-from` covers it.**
-
-Uploads to `s3.us.archive.org` intermittently fail with
-`SSLEOFError` / `MaxRetryError`. There is no backoff or retry; the row is
-logged as `failure` and skipped. Over 10,000 items this will happen regularly.
-
-**Mitigation today:** re-run with `--resume-from`. `checksum=True` means
-already-uploaded files are skipped rather than re-sent.
-
-## 4. `--collection` is unvalidated on `--live`
+## 3. `--collection` is unvalidated on `--live`
 
 **Severity: high if wrong, but requires operator error.**
 
@@ -80,7 +69,7 @@ before real uploads can pass.
 **Possible fix:** cross-check `--collection` against the registry's
 `collection_key` and refuse to run `--live` when they disagree.
 
-## 5. `--files-dir` does not constrain path resolution — **`--csv` path only**
+## 4. `--files-dir` does not constrain path resolution — **`--csv` path only**
 
 **Severity: low — trusted-input tool. Narrowed 2026-08-23: no longer true of
 the Sheet path.**
@@ -103,7 +92,7 @@ It also refuses a candidate whose folder segment is empty (a blank folder cell,
 which would otherwise turn a missing required cell into a search of
 `files_dir`'s own root) rather than treating that as "look in the top level".
 
-## 6. `check_file_exists`'s `is_file()` catch has no test for the case it exists for
+## 5. `check_file_exists`'s `is_file()` catch has no test for the case it exists for
 
 *Found 2026-08-22, during the row-readiness effort — pre-existing, not
 introduced by it. Reasons corrected 2026-08-22 after the claims below were
@@ -168,6 +157,32 @@ is itself part of why no test exists yet.
 change. Recorded here so it is not lost the next time this file is reviewed.
 
 ## Fixed
+
+### No retry or backoff on transient network failures
+
+*Fixed 2026-09-02, closing issue #5.* A transient failure talking to
+archive.org failed that row for the whole run — a `ReadTimeout` with nothing
+wrong with the data, the Sheet or the file. Recovery was correct but manual:
+the row was never marked done, so the operator re-ran to chase a flake.
+
+`retry_ia_call()` now wraps the network call inside `upload_row()` and
+`update_metadata_row()`: three attempts, backing off ~2s then ~4s with jitter.
+It retries connection errors, timeouts and 500/502/504, and does **not** retry
+refusals (403, 400, any 4xx) or 429/503 — those still stop the run so the
+operator resumes tomorrow. Reading `internetarchive` 5.10.1's source showed
+the real gap was the S3 file transfer, which had no retry of any kind, rather
+than the metadata read, which already had three. See
+[`DECISIONS.md`](decisions/QUOTA-AND-RUNS.md#retry-covers-transport-failures-never-refusals).
+
+The same change closed a second, quieter gap: a rate limit arriving on the
+metadata GET *inside* `internetarchive.upload()` used to reach the tool with
+no status at all, so it read as an ordinary failure and the run ground on
+repeating it. `IA_RETRY` and a `__context__` walk recover the real status
+without reading message text. See
+[`DECISIONS.md`](decisions/QUOTA-AND-RUNS.md#a-status-the-metadata-call-strips-is-recovered-still-without-reading-text).
+
+Re-running with `--resume-from` is still the recovery for a row that fails all
+three attempts.
 
 ### `validate` passed CSVs whose metadata was silently misaligned
 

@@ -10,17 +10,19 @@ import csv
 import functools
 import json
 import os
+import random
 import re
 import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, TypeVar
+from typing import Callable, Iterator, TypeVar
 
 import googleapiclient.discovery
 import internetarchive
 import requests
+from urllib3.util.retry import Retry
 from googleapiclient.errors import HttpError
 
 import google_auth
@@ -1121,14 +1123,97 @@ def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
 # ordinary failure and the run continues - --limit remains the
 # operator-controlled backstop either way. See docs/DECISIONS.md,
 # "Rate-limit detection uses a parsed status code, never message text".
+#
+# That "neither reachable exception" claim had one hole until 2026-09-02: the
+# metadata GET inside internetarchive.upload(), whose status the library
+# stripped before it ever reached here. Closed structurally - see IA_RETRY
+# just below and the __context__ walk in parsed_status_code() - rather than by
+# relaxing the no-message-text rule.
 RATE_LIMIT_STATUS_CODES = (429, 503)
+
+# internetarchive builds its own retrying HTTP adapter for archive.org, with
+# urllib3's default `raise_on_status=True`. That default is why a rate limit
+# on the metadata endpoint used to be invisible here. Verified against a local
+# server answering real status codes, not reasoned about:
+#
+#   raise_on_status=True  (library default) - 429/500/503 exhaust urllib3's
+#     three attempts and surface as requests.exceptions.RetryError. No
+#     Response object is ever produced, so there is no status to read
+#     anywhere, in the exception or its chain.
+#   raise_on_status=False (this policy)     - the same three attempts happen,
+#     but the final Response is RETURNED rather than raised through. It then
+#     meets get_metadata()'s own resp.raise_for_status(), which produces a
+#     normal HTTPError carrying that Response - and with it the real status.
+#
+# The retrying itself is unchanged: same total, same forcelist, same backoff.
+# Only how the give-up is reported changes. Everything else is copied from
+# internetarchive 5.10.1's session.mount_http_adapter() so that replacing the
+# library's policy does not silently alter what it retries or how often - and
+# a test pins that equality against a session the library builds itself, so
+# a future version changing its defaults fails loudly rather than quietly.
+IA_RETRY = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    redirect=False,
+    allowed_methods=["POST", "HEAD", "GET", "OPTIONS"],
+    status_forcelist=[429, 500, 501, 502, 503, 504],
+    backoff_factor=1,
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+
+# Passed to every internetarchive entry point this file calls. They all accept
+# it through their `**get_item_kwargs`, which reaches get_session().
+IA_HTTP_ADAPTER_KWARGS = {"max_retries": IA_RETRY}
+
+
+def parsed_status_code(exc: Exception) -> int | None:
+    """The HTTP status Internet Archive really returned, as the integer some
+    layer already parsed - or None when the exception carries no status at
+    all (a connection reset, a read timeout, or one of this file's own
+    guards).
+
+    Both callers below - is_rate_limit_error() and is_retryable_ia_error() -
+    read the status through here rather than each reaching for the
+    attributes themselves, so the rule that neither may fall back to
+    `str(exc)` is stated in exactly one place. The two sources are
+    UploadFailed.status_code (set in this file) and `.response.status_code`
+    on a requests exception; the long comment above RATE_LIMIT_STATUS_CODES
+    explains why both are trustworthy and why message text is not.
+
+    The chain is walked because internetarchive's session.get_metadata()
+    re-raises every failure as `type(exc)(error_msg)` - a fresh exception of
+    the same class, built from the message alone - which drops `.response`.
+    `internetarchive.upload()` reads an item's metadata before transferring
+    anything, so that is a live path to a real rate limit, and stripped of
+    its status a 503 read as an ordinary failure while the run ground on
+    through the rest of the chunk. Python's implicit chaining still holds the
+    ORIGINAL exception, `.response` and all, as the stripped copy's
+    `__context__` - so the status is recoverable structurally, and this
+    function never has to fall back to reading the message text that
+    `type(exc)(error_msg)` did preserve.
+
+    The outermost status wins: an exception raised while handling an older
+    one reports its own failure, not the one underneath it."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    # __context__ can form a cycle - CPython only breaks the one it can see
+    # when setting the context, and one can also be assigned directly - and an
+    # unguarded walk would hang the run rather than fail a row.
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if status_code is None:
+            status_code = getattr(getattr(current, "response", None), "status_code", None)
+        if status_code is not None:
+            return status_code
+        current = current.__context__
+    return None
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
-    status_code = getattr(exc, "status_code", None)
-    if status_code is None:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-    return status_code in RATE_LIMIT_STATUS_CODES
+    return parsed_status_code(exc) in RATE_LIMIT_STATUS_CODES
 
 
 class UploadFailed(RuntimeError):
@@ -1150,6 +1235,109 @@ class UploadFailed(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None):
         super().__init__(message)
         self.status_code = status_code
+
+
+# Retry exists for one specific gap. The installed internetarchive 5.10.1
+# mounts a retrying HTTP adapter - urllib3 Retry(total=3, connect=3, read=3,
+# backoff_factor=1) - in ArchiveSession.__init__, but ONLY on archive.org,
+# and deliberately not on s3.us.archive.org (session.py: "Don't mount on
+# s3.us.archive.org, only archive.org! IA-S3 requires a more complicated
+# retry workflow"). So metadata reads and modify_metadata POSTs already get
+# three transport-level attempts, while the S3 file transfer - the slowest
+# call this tool makes, minutes long for a 10 MB photograph on a domestic
+# link - gets none. Item.upload_file()'s own `retries` argument would not
+# close that gap either: it defaults to `retries or 0` and only ever fires
+# on a 503, never on a timeout. See docs/decisions/QUOTA-AND-RUNS.md,
+# "Retry covers transport failures, never refusals".
+#
+# 5xx statuses worth repeating. 503 and 429 are deliberately ABSENT: they
+# are Internet Archive saying "slow down", and this tool already answers
+# that with something stronger than a retry - is_rate_limit_error() stops
+# the whole run after the current chunk's confirm write so the operator
+# resumes tomorrow. Retrying them here would delay that stop for every
+# rate-limited row while making the overload marginally worse.
+RETRYABLE_STATUS_CODES = (500, 502, 504)
+
+# Transport failures, which arrive as an exception with no status at all
+# because no HTTP response was ever completed. requests.exceptions.Timeout
+# covers both ConnectTimeout and ReadTimeout - the latter is the failure
+# reported in the issue this was written for.
+RETRYABLE_EXCEPTIONS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+
+# Three attempts, not more. A row that fails all three is logged as an
+# ordinary failure and picked up by the next run - re-running is already the
+# supported recovery, and an identifier is never burned by a failed attempt
+# (see docs/decisions/QUOTA-AND-RUNS.md). Deeper retries would mostly buy
+# longer waits before reaching that same outcome.
+RETRY_ATTEMPTS = 3
+RETRY_BASE_SECONDS = 2.0
+RETRY_MAX_SECONDS = 30.0
+
+# Whatever the retried operation returns, returned unchanged to its caller.
+_RetryResult = TypeVar("_RetryResult")
+
+
+def is_retryable_ia_error(exc: Exception) -> bool:
+    """Whether repeating this call could plausibly succeed.
+
+    A parsed status decides on its own when there is one: a server that
+    answered 403 Access Denied, or rejected a metadata field with a 400,
+    will answer identically to an identical request, so retrying only
+    lengthens the walk to the same refusal. Only when no status exists at
+    all does the exception's type get a say, and then only for the transport
+    failures listed above.
+
+    Anything unrecognized is NOT retryable. This file's own guards -
+    upload_row()'s blank-filename ValueError, the unprepared-Request
+    RuntimeError, MetadataUnchanged - land here, and so would a bug; none of
+    them is made truer by a second attempt."""
+    status_code = parsed_status_code(exc)
+    if status_code is not None:
+        return status_code in RETRYABLE_STATUS_CODES
+    return isinstance(exc, RETRYABLE_EXCEPTIONS)
+
+
+def retry_delay(attempt: int) -> float:
+    """Seconds to wait before attempt number `attempt + 1`, counting from 0.
+
+    Equal jitter: half of a ceiling that doubles each time, plus a random
+    share of the other half. The randomness matters because a chunk's rows
+    fail in lockstep when archive.org is briefly unwell, and a fixed backoff
+    would send them all back at the same instant. The fixed half matters
+    because full jitter can draw a delay near zero, and a wait that does not
+    wait cannot outlast the slowdown it exists for."""
+    ceiling = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2**attempt))
+    return ceiling / 2 + random.uniform(0, ceiling / 2)
+
+
+def retry_ia_call(operation: Callable[[], _RetryResult], describe: str) -> _RetryResult:
+    """Run `operation`, repeating it through transient failures.
+
+    The exception from the final attempt is re-raised UNCHANGED rather than
+    wrapped: every caller's `except Exception` branch logs `str(exc)` and
+    hands the object to is_rate_limit_error(), so wrapping it would both
+    change what the log records and hide the parsed status the run-stopping
+    decision reads.
+
+    Each retry prints a line, because the alternative is a run that appears
+    hung for seconds at a time with no indication that anything is being
+    handled. `describe` names the call so the message stands on its own in
+    sync-metadata's output, which has no per-row progress line above it."""
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except Exception as exc:
+            is_last_attempt = attempt == RETRY_ATTEMPTS - 1
+            if is_last_attempt or not is_retryable_ia_error(exc):
+                raise
+            delay = retry_delay(attempt)
+            print(
+                f"    - {describe}: attempt {attempt + 1} of {RETRY_ATTEMPTS} failed "
+                f"({format_row_error(exc)}); retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+    # Unreachable: the loop either returns or raises on its last attempt.
+    raise AssertionError(f"{describe} exhausted its retries without raising")
 
 
 def upload_row(row: dict, target_identifier: str, collection: str, files_dir: str | Path) -> None:
@@ -1178,28 +1366,42 @@ def upload_row(row: dict, target_identifier: str, collection: str, files_dir: st
     metadata["date"] = (row.get("date") or "").strip() or UNDATED_PLACEHOLDER
     metadata["collection"] = collection
 
-    responses = internetarchive.upload(
-        target_identifier,
-        files=[str(file_path)],
-        metadata=metadata,
-        verbose=True,
-        checksum=True,
-    )
-    for response in responses:
-        # internetarchive.upload() is typed to return Request | Response;
-        # a Request is only ever returned when debug=True, which we never
-        # pass, so this always holds at runtime. Narrowing it explicitly
-        # keeps response.ok/.status_code/.text type-checker-clean.
-        if isinstance(response, requests.Request):
-            raise RuntimeError(
-                f"upload of '{target_identifier}' returned an unprepared Request instead of "
-                "a Response - this should be unreachable since debug is never passed"
-            )
-        if not response.ok:
-            raise UploadFailed(
-                f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}",
-                status_code=response.status_code,
-            )
+    def send() -> None:
+        """The retried unit. It covers the not-ok-Response check as well as
+        the call, so a 500 that arrives as a Response is retried on the same
+        terms as one that arrives as an exception.
+
+        Repeating the transfer is safe because `checksum=True` makes
+        Internet Archive skip a file whose MD5 already matches the item's -
+        so a retry after a timeout that had in fact landed re-sends nothing
+        and creates no duplicate. Nor can a retry burn an identifier: the
+        target identifier is chosen before this function is reached and is
+        the same on every attempt."""
+        responses = internetarchive.upload(
+            target_identifier,
+            files=[str(file_path)],
+            metadata=metadata,
+            verbose=True,
+            checksum=True,
+            http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS,
+        )
+        for response in responses:
+            # internetarchive.upload() is typed to return Request | Response;
+            # a Request is only ever returned when debug=True, which we never
+            # pass, so this always holds at runtime. Narrowing it explicitly
+            # keeps response.ok/.status_code/.text type-checker-clean.
+            if isinstance(response, requests.Request):
+                raise RuntimeError(
+                    f"upload of '{target_identifier}' returned an unprepared Request instead of "
+                    "a Response - this should be unreachable since debug is never passed"
+                )
+            if not response.ok:
+                raise UploadFailed(
+                    f"upload of '{target_identifier}' failed with status {response.status_code}: {response.text}",
+                    status_code=response.status_code,
+                )
+
+    retry_ia_call(send, f"upload of '{target_identifier}'")
 
 
 class MetadataUnchanged(Exception):
@@ -1220,25 +1422,39 @@ def update_metadata_row(row: dict, target_identifier: str) -> None:
         if key != "identifier" and (value or "").strip()
     }
 
-    response = internetarchive.modify_metadata(target_identifier, metadata=metadata)
-    # See the matching narrowing comment in upload_row(): modify_metadata()
-    # is typed to return Request | Response, but a Request is only ever
-    # returned when debug=True, which we never pass.
-    if isinstance(response, requests.Request):
-        raise RuntimeError(
-            f"metadata update of '{target_identifier}' returned an unprepared Request instead of "
-            "a Response - this should be unreachable since debug is never passed"
+    def send() -> None:
+        """The retried unit, matching upload_row()'s. Repeating a metadata
+        update is safe because it is a full statement of the fields to set,
+        not an increment - applying it twice leaves the item exactly where
+        applying it once does.
+
+        MetadataUnchanged escapes on the first attempt rather than being
+        retried: is_retryable_ia_error() has no status to act on for it and
+        does not recognize the type, and it is in any case a normal outcome
+        the sync loop counts separately, not a failure."""
+        response = internetarchive.modify_metadata(
+            target_identifier, metadata=metadata, http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS
         )
-    if not response.ok:
-        try:
-            error_message = json.loads(response.text).get("error", "")
-        except (ValueError, AttributeError):
-            error_message = ""
-        if error_message == "no changes to _meta.xml":
-            raise MetadataUnchanged(target_identifier)
-        raise RuntimeError(
-            f"metadata update of '{target_identifier}' failed with status {response.status_code}: {response.text}"
-        )
+        # See the matching narrowing comment in upload_row(): modify_metadata()
+        # is typed to return Request | Response, but a Request is only ever
+        # returned when debug=True, which we never pass.
+        if isinstance(response, requests.Request):
+            raise RuntimeError(
+                f"metadata update of '{target_identifier}' returned an unprepared Request instead of "
+                "a Response - this should be unreachable since debug is never passed"
+            )
+        if not response.ok:
+            try:
+                error_message = json.loads(response.text).get("error", "")
+            except (ValueError, AttributeError):
+                error_message = ""
+            if error_message == "no changes to _meta.xml":
+                raise MetadataUnchanged(target_identifier)
+            raise RuntimeError(
+                f"metadata update of '{target_identifier}' failed with status {response.status_code}: {response.text}"
+            )
+
+    retry_ia_call(send, f"metadata update of '{target_identifier}'")
 
 
 def validate_identifiers(
@@ -2815,7 +3031,11 @@ def fetch_current_metadata(identifier: str) -> dict | None:
     run that cannot reach one item should still report the other 9,999.
     """
     try:
-        return dict(internetarchive.get_item(identifier).metadata)
+        return dict(
+            internetarchive.get_item(
+                identifier, http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS
+            ).metadata
+        )
     except Exception:
         return None
 
