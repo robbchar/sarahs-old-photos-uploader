@@ -273,6 +273,11 @@ Other behavior, both paths:
   Archive's per-run batch limit), overridable via `--chunk-size`
 - Uploads each row via the `internetarchive` Python library (not the `ia`
   CLI), so per-row success/failure is captured directly
+- Retries a row through transient network failures — three attempts, backing
+  off about 2s then 4s, printing a line each time. A refusal (`Access Denied`,
+  a rejected field, any 4xx) is not retried, and a rate limit still stops the
+  run instead. See
+  [`docs/DECISIONS.md`](docs/decisions/QUOTA-AND-RUNS.md#retry-covers-transport-failures-never-refusals)
 - Writes a timestamped JSONL log to `logs/upload-<timestamp>.jsonl`, one
   line per row: `{identifier, file, status, error, uploaded_as, live, timestamp}`.
   Timestamps are ISO-8601 UTC with an explicit `Z`, as is the `ia_uploaded`

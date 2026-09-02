@@ -5719,6 +5719,331 @@ def test_is_rate_limit_error_reads_the_structured_status_from_requests_httperror
     assert is_rate_limit_error(exc) is True
 
 
+# --- retry with backoff (issue #5) ------------------------------------------
+#
+# The classification table below is the point of the feature: a transient
+# transport failure must be absorbed, and a real refusal must NOT be, because
+# retrying a refusal costs the operator time and tells them nothing new.
+# 429/503 are deliberately NOT retryable - they already have a stronger
+# response than retrying (stop the run, resume tomorrow); see
+# is_rate_limit_error() and docs/decisions/QUOTA-AND-RUNS.md.
+
+
+def http_error_with_status(status_code):
+    """A requests.HTTPError carrying a real, parsed status - the shape
+    is_retryable_ia_error() reads for anything that is not our own
+    UploadFailed. Uses a real requests.Response for the same reason
+    test_is_rate_limit_error_reads_the_structured_status_from_requests_httperror
+    does: HTTPError.__init__ is typed to accept `Response | None`."""
+    response = requests.Response()
+    response.status_code = status_code
+    return requests.exceptions.HTTPError("boom", response=response)
+
+
+@pytest.mark.parametrize(
+    "make_exc, expected, why",
+    [
+        (lambda: requests.exceptions.ReadTimeout("read timeout=12"), True,
+         "the exact failure issue #5 was filed about"),
+        (lambda: requests.exceptions.ConnectTimeout("connect timed out"), True, "transport"),
+        (lambda: requests.exceptions.ConnectionError("connection reset"), True, "transport"),
+        (lambda: http_error_with_status(500), True, "server-side; no reason a retry repeats it"),
+        (lambda: http_error_with_status(502), True, "bad gateway"),
+        (lambda: http_error_with_status(504), True, "gateway timeout"),
+        (lambda: UploadFailed("failed with status 500", status_code=500), True,
+         "same rule via our own parsed status_code"),
+        (lambda: UploadFailed("failed with status 503: SlowDown", status_code=503), False,
+         "rate limit - stops the run instead, never retried here"),
+        (lambda: UploadFailed("failed with status 429", status_code=429), False, "rate limit"),
+        (lambda: http_error_with_status(503), False, "rate limit, via .response.status_code"),
+        (lambda: http_error_with_status(403), False, "Access Denied is a real refusal"),
+        (lambda: http_error_with_status(400), False, "a rejected metadata field is rejected again"),
+        (lambda: UploadFailed("failed with status 404", status_code=404), False, "real refusal"),
+        (lambda: ValueError("the row has no 'file' value"), False,
+         "our own guard - a problem in the data, not the network"),
+        (lambda: RuntimeError("returned an unprepared Request"), False, "our own guard"),
+    ],
+)
+def test_is_retryable_ia_error(make_exc, expected, why):
+    from ia_bulk import is_retryable_ia_error
+
+    assert is_retryable_ia_error(make_exc()) is expected, why
+
+
+def test_is_retryable_ia_error_treats_an_unrecognized_exception_as_a_refusal():
+    """No parsed status and not a known transport failure means we cannot
+    tell that repeating the call is safe, so we do not. Failing the row costs
+    one re-run; repeating something unrecognized could cost more."""
+    from ia_bulk import is_retryable_ia_error
+
+    assert is_retryable_ia_error(Exception("something unrecognized")) is False
+
+
+def test_retry_ia_call_returns_the_first_attempts_value_without_sleeping(monkeypatch):
+    from ia_bulk import retry_ia_call
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on a success"))
+
+    assert retry_ia_call(lambda: "done", "uploading photo1.jpg") == "done"
+
+
+def test_retry_ia_call_absorbs_a_transient_failure_and_returns_the_retrys_value(
+    monkeypatch, capsys
+):
+    from ia_bulk import retry_ia_call
+
+    slept = []
+    monkeypatch.setattr("ia_bulk.time.sleep", slept.append)
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise requests.exceptions.ReadTimeout("read timeout=12")
+        return "done"
+
+    assert retry_ia_call(flaky, "uploading photo1.jpg") == "done"
+    assert len(attempts) == 2
+    assert len(slept) == 1
+    # The operator has to see that a flake was absorbed; silence here would
+    # make a slow run look like a hung one.
+    printed = capsys.readouterr().out
+    assert "attempt 1 of 3" in printed
+    assert "read timeout=12" in printed
+
+
+def test_retry_ia_call_reraises_the_last_failure_after_exhausting_attempts(monkeypatch):
+    """The exception that escapes must be the real one, unwrapped: the
+    callers' `except Exception` branches log str(exc) and hand the object to
+    is_rate_limit_error(), and both need the original."""
+    from ia_bulk import retry_ia_call, RETRY_ATTEMPTS
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: None)
+    attempts = []
+    final = requests.exceptions.ReadTimeout("read timeout=12")
+
+    def always_times_out():
+        attempts.append(1)
+        raise final
+
+    with pytest.raises(requests.exceptions.ReadTimeout) as caught:
+        retry_ia_call(always_times_out, "uploading photo1.jpg")
+
+    assert caught.value is final
+    assert len(attempts) == RETRY_ATTEMPTS
+
+
+def test_retry_ia_call_does_not_retry_a_refusal(monkeypatch):
+    from ia_bulk import retry_ia_call
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on a refusal"))
+    attempts = []
+
+    def refused():
+        attempts.append(1)
+        raise UploadFailed("failed with status 403: Access Denied", status_code=403)
+
+    with pytest.raises(UploadFailed):
+        retry_ia_call(refused, "uploading photo1.jpg")
+
+    assert len(attempts) == 1
+
+
+def test_retry_ia_call_does_not_retry_a_rate_limit(monkeypatch):
+    """A 503 must reach the caller on the FIRST attempt, still carrying its
+    status_code, so SheetUploadRun's is_rate_limit_error() branch stops the
+    run exactly as promptly as it did before retry existed."""
+    from ia_bulk import retry_ia_call
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on a rate limit"))
+    attempts = []
+
+    def rate_limited():
+        attempts.append(1)
+        raise UploadFailed("failed with status 503: SlowDown", status_code=503)
+
+    with pytest.raises(UploadFailed) as caught:
+        retry_ia_call(rate_limited, "uploading photo1.jpg")
+
+    assert len(attempts) == 1
+    assert is_rate_limit_error(caught.value) is True
+
+
+def test_retry_delay_grows_and_never_returns_zero():
+    """Equal jitter, not full jitter: every wait is at least half its
+    ceiling. A backoff that can randomly pick ~0s does not actually wait out
+    a slow archive.org, which is the only thing the wait is for."""
+    from ia_bulk import retry_delay, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS
+
+    first = [retry_delay(0) for _ in range(200)]
+    second = [retry_delay(1) for _ in range(200)]
+
+    assert min(first) >= RETRY_BASE_SECONDS / 2
+    assert max(first) <= RETRY_BASE_SECONDS
+    assert min(second) >= RETRY_BASE_SECONDS
+    assert max(second) <= RETRY_BASE_SECONDS * 2
+    # Jitter is real, not a constant dressed up as one.
+    assert len(set(first)) > 1
+    # Growth is capped rather than unbounded.
+    assert retry_delay(50) <= RETRY_MAX_SECONDS
+
+
+def test_upload_row_retries_a_transient_failure_from_the_library(tmp_path, monkeypatch):
+    """The S3 transfer is the one IA call with no retry of any kind
+    underneath it: internetarchive 5.10.1 deliberately does NOT mount its
+    retrying HTTP adapter on s3.us.archive.org (session.py: "IA-S3 requires a
+    more complicated retry workflow"), and upload_file()'s own `retries`
+    argument defaults to 0 and only ever fires on a 503. This is the case the
+    feature exists for."""
+    from ia_bulk import upload_row
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: None)
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {"identifier": "lcps-astoriaphotos-00001", "file": "photo1.jpg", "mediatype": "image"}
+    calls = []
+
+    def flaky_upload(identifier, files, metadata, **kwargs):
+        calls.append(identifier)
+        if len(calls) == 1:
+            raise requests.exceptions.ReadTimeout("read timeout=12")
+        return [FakeResponse(ok=True)]
+
+    monkeypatch.setattr(internetarchive, "upload", flaky_upload)
+
+    upload_row(
+        row,
+        target_identifier="zztest-lcps-astoriaphotos-00001",
+        collection="test_collection",
+        files_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+
+
+def test_upload_row_retries_a_not_ok_500_response(tmp_path, monkeypatch):
+    """A failed *Response* rather than a raised exception becomes
+    upload_row()'s own UploadFailed, and has to classify by the same rule."""
+    from ia_bulk import upload_row
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: None)
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {"identifier": "lcps-astoriaphotos-00001", "file": "photo1.jpg", "mediatype": "image"}
+    calls = []
+
+    def flaky_upload(identifier, files, metadata, **kwargs):
+        calls.append(identifier)
+        if len(calls) == 1:
+            return [FakeResponse(ok=False, status_code=500, text="Internal Server Error")]
+        return [FakeResponse(ok=True)]
+
+    monkeypatch.setattr(internetarchive, "upload", flaky_upload)
+
+    upload_row(
+        row,
+        target_identifier="zztest-lcps-astoriaphotos-00001",
+        collection="test_collection",
+        files_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+
+
+def test_upload_row_does_not_retry_a_503(tmp_path, monkeypatch):
+    """Guards the interaction retry could most easily break: 503 keeps its
+    old meaning - fail this row at once so the run can stop - instead of
+    being slowly retried first."""
+    from ia_bulk import upload_row
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on a rate limit"))
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    row = {"identifier": "lcps-astoriaphotos-00001", "file": "photo1.jpg", "mediatype": "image"}
+    calls = []
+
+    def rate_limited_upload(identifier, files, metadata, **kwargs):
+        calls.append(identifier)
+        return [FakeResponse(ok=False, status_code=503, text="SlowDown")]
+
+    monkeypatch.setattr(internetarchive, "upload", rate_limited_upload)
+
+    with pytest.raises(UploadFailed) as caught:
+        upload_row(
+            row,
+            target_identifier="zztest-lcps-astoriaphotos-00001",
+            collection="test_collection",
+            files_dir=tmp_path,
+        )
+
+    assert len(calls) == 1
+    assert is_rate_limit_error(caught.value) is True
+
+
+def test_upload_row_does_not_retry_a_blank_filename(tmp_path, monkeypatch):
+    """The blank-file guard is defence against sending the whole data tree
+    into one permanent item. Retrying it would be pointless and would triple
+    the time spent reaching the same refusal."""
+    from ia_bulk import upload_row
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on a data error"))
+    monkeypatch.setattr(
+        internetarchive, "upload", lambda *a, **k: pytest.fail("reached the network")
+    )
+
+    with pytest.raises(ValueError, match="no 'file' value"):
+        upload_row(
+            {"identifier": "lcps-astoriaphotos-00001", "file": "  "},
+            target_identifier="zztest-lcps-astoriaphotos-00001",
+            collection="test_collection",
+            files_dir=tmp_path,
+        )
+
+
+def test_update_metadata_row_retries_a_transient_failure(monkeypatch):
+    from ia_bulk import update_metadata_row
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: None)
+    calls = []
+
+    def flaky_modify(identifier, metadata):
+        calls.append(identifier)
+        if len(calls) == 1:
+            raise requests.exceptions.ConnectionError("connection reset by peer")
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", flaky_modify)
+
+    update_metadata_row(
+        {"identifier": "lcps-astoriaphotos-00001", "title": "New title"},
+        "zztest-lcps-astoriaphotos-00001",
+    )
+
+    assert len(calls) == 2
+
+
+def test_update_metadata_row_does_not_retry_metadata_unchanged(monkeypatch):
+    """MetadataUnchanged is a normal, expected outcome the sync loop counts
+    separately - not a failure, and not something to repeat three times."""
+    from ia_bulk import update_metadata_row, MetadataUnchanged
+
+    monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on an unchanged row"))
+    calls = []
+
+    def unchanged(identifier, metadata):
+        calls.append(identifier)
+        return FakeResponse(
+            ok=False, status_code=400, text=json.dumps({"error": "no changes to _meta.xml"})
+        )
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", unchanged)
+
+    with pytest.raises(MetadataUnchanged):
+        update_metadata_row(
+            {"identifier": "lcps-astoriaphotos-00001", "title": "New title"},
+            "zztest-lcps-astoriaphotos-00001",
+        )
+
+    assert len(calls) == 1
+
+
 def test_cmd_upload_limit_stops_after_n_planned_targets(tmp_path, monkeypatch, capsys):
     """--limit counts PLANNED upload targets (valid, ready, not already
     done) - not Sheet rows scanned. Five ready, unassigned rows with

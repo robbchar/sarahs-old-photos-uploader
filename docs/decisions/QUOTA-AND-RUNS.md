@@ -145,6 +145,96 @@ failure and the run continues, same as any other transient error, whereas a
 false match aborts a run mid-flight over an unrelated error. `--limit`
 (above) remains the operator-controlled fallback either way.
 
+## Retry covers transport failures, never refusals
+
+*Decided 2026-09-02, closing issue #5.*
+
+A transient failure talking to archive.org used to fail that row for the
+whole run — observed as a `ReadTimeout` on `archive.org/metadata/...` with
+nothing wrong with the data, the Sheet or the file. Across ~10,000 items, at
+least one such failure is close to certain, and the recovery was correct but
+manual: the row was never marked done, so the operator re-ran to chase a
+flake a retry would have absorbed.
+
+`retry_ia_call()` now wraps the network call inside `upload_row()` and
+`update_metadata_row()`. Both run loops — the Sheet path's `SheetUploadRun`
+and the CSV path's `run_rows()` — get it without knowing it exists.
+
+**The gap this actually closes is the S3 transfer, not the metadata read.**
+Reading the installed `internetarchive` 5.10.1's source rather than assuming:
+`ArchiveSession.__init__` mounts a retrying adapter — urllib3
+`Retry(total=3, connect=3, read=3, backoff_factor=1)` — but **only on
+`archive.org`**, and deliberately not on the S3 host (`session.py`: *"Don't
+mount on s3.us.archive.org, only archive.org! IA-S3 requires a more
+complicated retry workflow"*). So metadata reads and `modify_metadata` POSTs
+already had three transport attempts, and the timeout in the issue is what a
+run looks like *after* those. The file transfer — the slowest call this tool
+makes, minutes long for a 10 MB photograph on a domestic link — had none.
+`Item.upload_file()`'s own `retries` argument would not have closed it
+either: it defaults to `retries or 0` and only ever fires on a 503.
+
+**What is retryable is decided by a parsed status, never by message text** —
+the same rule, through the same `parsed_status_code()` helper, that
+["Rate-limit detection uses a parsed status code, never message text"](#rate-limit-detection-uses-a-parsed-status-code-never-message-text)
+established:
+
+| Failure | Retried | Why |
+| --- | --- | --- |
+| `ConnectionError`, `Timeout` (incl. `ReadTimeout`) | yes | No response completed; nothing says the next attempt fails too |
+| 500, 502, 504 | yes | Server-side and not a refusal of *this* request |
+| **429, 503** | **no** | Already answered by something stronger — see below |
+| 403, 400, 404, any other 4xx | no | A refusal is repeatable; retrying only lengthens the walk to the same answer |
+| `ValueError`, `RuntimeError`, `MetadataUnchanged`, anything unrecognized | no | This file's own guards, and a bug is not made truer by a second attempt |
+
+**429 and 503 are deliberately excluded.** They are Internet Archive saying
+"slow down", and this tool already answers that with more than a retry:
+`is_rate_limit_error()` stops the whole run after the current chunk's confirm
+write so the operator resumes tomorrow. Retrying them here would delay that
+stop for every rate-limited row while making the overload marginally worse.
+The alternative — a short backoff before falling through to the stop, which
+is what `ia upload --retries` does — was considered and rejected as
+re-litigating a decision already made and documented.
+
+Three attempts, with **equal jitter**: half of a ceiling that doubles each
+time (2s, then 4s, capped at 30s), plus a random share of the other half.
+The randomness matters because a chunk's rows fail in lockstep when
+archive.org is briefly unwell and a fixed backoff would send them all back at
+the same instant; the fixed half matters because full jitter can draw a delay
+near zero, and a wait that does not wait cannot outlast the slowdown it
+exists for. Three rather than more because a row that fails all three is
+logged as an ordinary failure and picked up by the next run — re-running is
+already the supported recovery, and a failed attempt never burns an
+identifier.
+
+**Retrying is safe for both wrapped calls.** `upload_row()` passes
+`checksum=True`, so Internet Archive skips a file whose MD5 already matches
+the item's: a retry after a timeout that had in fact landed re-sends nothing
+and creates no duplicate. A metadata update is a full statement of the fields
+to set, not an increment, so applying it twice lands where applying it once
+does. In neither case can a retry mint a second identifier — the target is
+chosen before the retried function is reached.
+
+The final attempt's exception is re-raised **unchanged**, not wrapped: every
+caller's `except Exception` branch logs `str(exc)` and hands the object to
+`is_rate_limit_error()`, so wrapping would both change what the log records
+and hide the parsed status the run-stopping decision reads.
+
+`fetch_current_metadata()` is deliberately **not** wrapped. It already sits
+behind the library's three retries, it already returns `None` rather than
+raising so that a dry run which cannot reach one item still reports the other
+9,999, and retrying it would make a 10,000-row dry run crawl.
+
+**Known gap, not fixed here:** `session.get_metadata()` re-raises as
+`type(exc)(error_msg)`, dropping `.response`. A 503 arriving on the metadata
+GET *inside* `internetarchive.upload()` therefore reaches us with no status,
+so neither `is_rate_limit_error()` nor `is_retryable_ia_error()` can see it
+and the row is logged as one ordinary failure. That predates this work and is
+the safe failure direction in both cases.
+
+There is no `--retries` flag. The constants are `RETRY_ATTEMPTS`,
+`RETRY_BASE_SECONDS` and `RETRY_MAX_SECONDS` in `ia_bulk.py`; a flag can be
+added if a real run on the LCPS link wants one.
+
 ## Every recorded timestamp is UTC
 
 *Decided 2026-08-23.*
