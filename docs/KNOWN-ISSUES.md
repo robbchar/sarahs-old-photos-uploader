@@ -174,6 +174,13 @@ the real gap was the S3 file transfer, which had no retry of any kind, rather
 than the metadata read, which already had three. See
 [`DECISIONS.md`](decisions/QUOTA-AND-RUNS.md#retry-covers-transport-failures-never-refusals).
 
+The same change closed a second, quieter gap: a rate limit arriving on the
+metadata GET *inside* `internetarchive.upload()` used to reach the tool with
+no status at all, so it read as an ordinary failure and the run ground on
+repeating it. `IA_RETRY` and a `__context__` walk recover the real status
+without reading message text. See
+[`DECISIONS.md`](decisions/QUOTA-AND-RUNS.md#a-status-the-metadata-call-strips-is-recovered-still-without-reading-text).
+
 Re-running with `--resume-from` is still the recovery for a row that fails all
 three attempts.
 

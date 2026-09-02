@@ -22,6 +22,7 @@ from typing import Callable, Iterator, TypeVar
 import googleapiclient.discovery
 import internetarchive
 import requests
+from urllib3.util.retry import Retry
 from googleapiclient.errors import HttpError
 
 import google_auth
@@ -1122,7 +1123,49 @@ def effective_identifier(identifier: str, live: bool, stamp: str) -> str:
 # ordinary failure and the run continues - --limit remains the
 # operator-controlled backstop either way. See docs/DECISIONS.md,
 # "Rate-limit detection uses a parsed status code, never message text".
+#
+# That "neither reachable exception" claim had one hole until 2026-09-02: the
+# metadata GET inside internetarchive.upload(), whose status the library
+# stripped before it ever reached here. Closed structurally - see IA_RETRY
+# just below and the __context__ walk in parsed_status_code() - rather than by
+# relaxing the no-message-text rule.
 RATE_LIMIT_STATUS_CODES = (429, 503)
+
+# internetarchive builds its own retrying HTTP adapter for archive.org, with
+# urllib3's default `raise_on_status=True`. That default is why a rate limit
+# on the metadata endpoint used to be invisible here. Verified against a local
+# server answering real status codes, not reasoned about:
+#
+#   raise_on_status=True  (library default) - 429/500/503 exhaust urllib3's
+#     three attempts and surface as requests.exceptions.RetryError. No
+#     Response object is ever produced, so there is no status to read
+#     anywhere, in the exception or its chain.
+#   raise_on_status=False (this policy)     - the same three attempts happen,
+#     but the final Response is RETURNED rather than raised through. It then
+#     meets get_metadata()'s own resp.raise_for_status(), which produces a
+#     normal HTTPError carrying that Response - and with it the real status.
+#
+# The retrying itself is unchanged: same total, same forcelist, same backoff.
+# Only how the give-up is reported changes. Everything else is copied from
+# internetarchive 5.10.1's session.mount_http_adapter() so that replacing the
+# library's policy does not silently alter what it retries or how often - and
+# a test pins that equality against a session the library builds itself, so
+# a future version changing its defaults fails loudly rather than quietly.
+IA_RETRY = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    redirect=False,
+    allowed_methods=["POST", "HEAD", "GET", "OPTIONS"],
+    status_forcelist=[429, 500, 501, 502, 503, 504],
+    backoff_factor=1,
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+
+# Passed to every internetarchive entry point this file calls. They all accept
+# it through their `**get_item_kwargs`, which reaches get_session().
+IA_HTTP_ADAPTER_KWARGS = {"max_retries": IA_RETRY}
 
 
 def parsed_status_code(exc: Exception) -> int | None:
@@ -1137,11 +1180,36 @@ def parsed_status_code(exc: Exception) -> int | None:
     `str(exc)` is stated in exactly one place. The two sources are
     UploadFailed.status_code (set in this file) and `.response.status_code`
     on a requests exception; the long comment above RATE_LIMIT_STATUS_CODES
-    explains why both are trustworthy and why message text is not."""
-    status_code = getattr(exc, "status_code", None)
-    if status_code is None:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-    return status_code
+    explains why both are trustworthy and why message text is not.
+
+    The chain is walked because internetarchive's session.get_metadata()
+    re-raises every failure as `type(exc)(error_msg)` - a fresh exception of
+    the same class, built from the message alone - which drops `.response`.
+    `internetarchive.upload()` reads an item's metadata before transferring
+    anything, so that is a live path to a real rate limit, and stripped of
+    its status a 503 read as an ordinary failure while the run ground on
+    through the rest of the chunk. Python's implicit chaining still holds the
+    ORIGINAL exception, `.response` and all, as the stripped copy's
+    `__context__` - so the status is recoverable structurally, and this
+    function never has to fall back to reading the message text that
+    `type(exc)(error_msg)` did preserve.
+
+    The outermost status wins: an exception raised while handling an older
+    one reports its own failure, not the one underneath it."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    # __context__ can form a cycle - CPython only breaks the one it can see
+    # when setting the context, and one can also be assigned directly - and an
+    # unguarded walk would hang the run rather than fail a row.
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if status_code is None:
+            status_code = getattr(getattr(current, "response", None), "status_code", None)
+        if status_code is not None:
+            return status_code
+        current = current.__context__
+    return None
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
@@ -1315,6 +1383,7 @@ def upload_row(row: dict, target_identifier: str, collection: str, files_dir: st
             metadata=metadata,
             verbose=True,
             checksum=True,
+            http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS,
         )
         for response in responses:
             # internetarchive.upload() is typed to return Request | Response;
@@ -1363,7 +1432,9 @@ def update_metadata_row(row: dict, target_identifier: str) -> None:
         retried: is_retryable_ia_error() has no status to act on for it and
         does not recognize the type, and it is in any case a normal outcome
         the sync loop counts separately, not a failure."""
-        response = internetarchive.modify_metadata(target_identifier, metadata=metadata)
+        response = internetarchive.modify_metadata(
+            target_identifier, metadata=metadata, http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS
+        )
         # See the matching narrowing comment in upload_row(): modify_metadata()
         # is typed to return Request | Response, but a Request is only ever
         # returned when debug=True, which we never pass.
@@ -2960,7 +3031,11 @@ def fetch_current_metadata(identifier: str) -> dict | None:
     run that cannot reach one item should still report the other 9,999.
     """
     try:
-        return dict(internetarchive.get_item(identifier).metadata)
+        return dict(
+            internetarchive.get_item(
+                identifier, http_adapter_kwargs=IA_HTTP_ADAPTER_KWARGS
+            ).metadata
+        )
     except Exception:
         return None
 

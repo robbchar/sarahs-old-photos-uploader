@@ -11,6 +11,7 @@ from pathlib import Path
 import internetarchive
 import pytest
 import requests
+from requests.adapters import HTTPAdapter
 from googleapiclient.errors import HttpError
 
 from column_map import build_column_map
@@ -6003,7 +6004,7 @@ def test_update_metadata_row_retries_a_transient_failure(monkeypatch):
     monkeypatch.setattr("ia_bulk.time.sleep", lambda _: None)
     calls = []
 
-    def flaky_modify(identifier, metadata):
+    def flaky_modify(identifier, metadata, **kwargs):
         calls.append(identifier)
         if len(calls) == 1:
             raise requests.exceptions.ConnectionError("connection reset by peer")
@@ -6027,7 +6028,7 @@ def test_update_metadata_row_does_not_retry_metadata_unchanged(monkeypatch):
     monkeypatch.setattr("ia_bulk.time.sleep", lambda _: pytest.fail("slept on an unchanged row"))
     calls = []
 
-    def unchanged(identifier, metadata):
+    def unchanged(identifier, metadata, **kwargs):
         calls.append(identifier)
         return FakeResponse(
             ok=False, status_code=400, text=json.dumps({"error": "no changes to _meta.xml"})
@@ -6042,6 +6043,194 @@ def test_update_metadata_row_does_not_retry_metadata_unchanged(monkeypatch):
         )
 
     assert len(calls) == 1
+
+
+# --- recovering a status the metadata call strips -----------------------------
+#
+# internetarchive's session.get_metadata() re-raises every failure as
+# `type(exc)(error_msg)` - a fresh exception of the same class built from the
+# message alone - which drops `.response` and with it the only structured
+# status this codebase is willing to read. Two changes recover it, both
+# verified against a local server answering real status codes rather than
+# reasoned about: IA_RETRY makes a retried status arrive as a real HTTPError
+# instead of an opaque RetryError, and parsed_status_code() walks the implicit
+# __context__ chain that still holds the original exception.
+
+
+def stripped_like_get_metadata(status_code) -> requests.exceptions.HTTPError:
+    """Reproduces exactly what session.get_metadata() does to an exception:
+    catches the real one and re-raises `type(exc)(error_msg)`, losing
+    `.response` but leaving the original as the new exception's implicit
+    __context__. Built by raising for real rather than by hand-assembling a
+    chain, so the test breaks if that chaining ever stops happening."""
+    response = requests.Response()
+    response.status_code = status_code
+    try:
+        try:
+            raise requests.exceptions.HTTPError(
+                f"{status_code} Server Error: for url: https://archive.org/metadata/x",
+                response=response,
+            )
+        except Exception as exc:
+            raise type(exc)(f"Error retrieving metadata from https://archive.org/metadata/x, {exc}")
+    except requests.exceptions.HTTPError as stripped:
+        return stripped
+    raise AssertionError("unreachable: the inner raise always fires")
+
+
+def test_parsed_status_code_reads_a_status_the_metadata_call_stripped():
+    from ia_bulk import parsed_status_code
+
+    exc = stripped_like_get_metadata(503)
+
+    # The premise: the exception itself really has lost it.
+    assert exc.response is None
+    assert parsed_status_code(exc) == 503
+
+
+def test_is_rate_limit_error_catches_a_503_the_metadata_call_stripped():
+    """The gap this closes. `internetarchive.upload()` fetches the item's
+    metadata before transferring anything, so a rate limit can surface from
+    that GET rather than from S3. Stripped of its status it read as an
+    ordinary failure, and the run ground on through 500 rows of the same
+    503 instead of stopping."""
+    assert is_rate_limit_error(stripped_like_get_metadata(503)) is True
+    assert is_rate_limit_error(stripped_like_get_metadata(429)) is True
+
+
+def test_is_retryable_ia_error_reads_a_chained_status_both_ways():
+    from ia_bulk import is_retryable_ia_error
+
+    assert is_retryable_ia_error(stripped_like_get_metadata(500)) is True
+    assert is_retryable_ia_error(stripped_like_get_metadata(403)) is False
+    # A stripped rate limit stays non-retryable, exactly as an unstripped one
+    # does - recovering the status must not quietly reclassify it.
+    assert is_retryable_ia_error(stripped_like_get_metadata(503)) is False
+
+
+def test_parsed_status_code_prefers_the_exceptions_own_status_over_a_chained_one():
+    """An UploadFailed raised while handling something else must report its
+    own status, not the older one further down the chain."""
+    from ia_bulk import parsed_status_code
+
+    try:
+        raise stripped_like_get_metadata(503)
+    except Exception:
+        outer = UploadFailed("failed with status 403: Access Denied", status_code=403)
+
+    outer.__context__ = stripped_like_get_metadata(503)
+    assert parsed_status_code(outer) == 403
+
+
+def test_parsed_status_code_returns_none_when_nothing_in_the_chain_has_a_status():
+    from ia_bulk import parsed_status_code
+
+    try:
+        try:
+            raise requests.exceptions.ReadTimeout("read timeout=12")
+        except Exception as exc:
+            raise type(exc)(f"Error retrieving metadata from https://archive.org/metadata/x, {exc}")
+    except Exception as stripped:
+        assert parsed_status_code(stripped) is None
+
+
+def test_parsed_status_code_terminates_on_a_self_referential_chain():
+    """A cycle in __context__ is possible - CPython only breaks the cycle it
+    can see when setting the context, and one can also be assigned by hand.
+    Walking it without a guard would hang the run rather than fail a row."""
+    from ia_bulk import parsed_status_code
+
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+    first.__context__ = second
+    second.__context__ = first
+
+    assert parsed_status_code(first) is None
+
+
+def test_ia_retry_matches_the_librarys_own_policy_except_for_raise_on_status():
+    """IA_RETRY replaces internetarchive's default adapter policy, so it must
+    match it in every respect but the one being changed - otherwise this
+    silently alters how often and on what the library retries. Compared
+    against a session the library built itself, so the test fails if a future
+    version changes those defaults out from under us."""
+    from ia_bulk import IA_RETRY
+
+    library_adapter = internetarchive.get_session().get_adapter("https://archive.org/metadata/x")
+    assert isinstance(library_adapter, HTTPAdapter)
+    library_default = library_adapter.max_retries
+
+    assert library_default.raise_on_status is True
+    assert IA_RETRY.raise_on_status is False
+
+    assert IA_RETRY.total == library_default.total
+    assert IA_RETRY.connect == library_default.connect
+    assert IA_RETRY.read == library_default.read
+    assert IA_RETRY.status_forcelist == library_default.status_forcelist
+    assert IA_RETRY.backoff_factor == library_default.backoff_factor
+    assert IA_RETRY.allowed_methods is not None
+    assert library_default.allowed_methods is not None
+    assert set(IA_RETRY.allowed_methods) == set(library_default.allowed_methods)
+    assert IA_RETRY.respect_retry_after_header == library_default.respect_retry_after_header
+
+
+def test_upload_row_asks_for_the_status_preserving_adapter(tmp_path, monkeypatch):
+    from ia_bulk import upload_row, IA_RETRY
+
+    (tmp_path / "photo1.jpg").write_bytes(b"data")
+    captured = {}
+
+    def fake_upload(identifier, files, metadata, **kwargs):
+        captured.update(kwargs)
+        return [FakeResponse(ok=True)]
+
+    monkeypatch.setattr(internetarchive, "upload", fake_upload)
+
+    upload_row(
+        {"identifier": "lcps-astoriaphotos-00001", "file": "photo1.jpg", "mediatype": "image"},
+        target_identifier="zztest-lcps-astoriaphotos-00001",
+        collection="test_collection",
+        files_dir=tmp_path,
+    )
+
+    assert captured["http_adapter_kwargs"] == {"max_retries": IA_RETRY}
+
+
+def test_update_metadata_row_asks_for_the_status_preserving_adapter(monkeypatch):
+    from ia_bulk import update_metadata_row, IA_RETRY
+
+    captured = {}
+
+    def fake_modify(identifier, metadata, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse(ok=True)
+
+    monkeypatch.setattr(internetarchive, "modify_metadata", fake_modify)
+
+    update_metadata_row({"identifier": "x", "title": "New title"}, "zztest-x")
+
+    assert captured["http_adapter_kwargs"] == {"max_retries": IA_RETRY}
+
+
+def test_fetch_current_metadata_asks_for_the_status_preserving_adapter(monkeypatch):
+    """The dry run is not retried, but it reads the same endpoint - and a
+    session built with a different policy is a second, divergent way of
+    talking to Internet Archive."""
+    from ia_bulk import fetch_current_metadata, IA_RETRY
+
+    captured = {}
+
+    class FakeItem:
+        metadata = {"title": "Existing"}
+
+    def fake_get_item(identifier, **kwargs):
+        captured.update(kwargs)
+        return FakeItem()
+
+    monkeypatch.setattr(internetarchive, "get_item", fake_get_item)
+
+    assert fetch_current_metadata("zztest-x") == {"title": "Existing"}
+    assert captured["http_adapter_kwargs"] == {"max_retries": IA_RETRY}
 
 
 def test_cmd_upload_limit_stops_after_n_planned_targets(tmp_path, monkeypatch, capsys):

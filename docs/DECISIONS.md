@@ -95,6 +95,7 @@ run writes down about itself.
 - [A run may not exceed Internet Archive's daily item cap](decisions/QUOTA-AND-RUNS.md#a-run-may-not-exceed-internet-archives-daily-item-cap)
 - [Rate-limit detection uses a parsed status code, never message text](decisions/QUOTA-AND-RUNS.md#rate-limit-detection-uses-a-parsed-status-code-never-message-text)
 - [Retry covers transport failures, never refusals](decisions/QUOTA-AND-RUNS.md#retry-covers-transport-failures-never-refusals)
+- [A status the metadata call strips is recovered, still without reading text](decisions/QUOTA-AND-RUNS.md#a-status-the-metadata-call-strips-is-recovered-still-without-reading-text)
 - [Every recorded timestamp is UTC](decisions/QUOTA-AND-RUNS.md#every-recorded-timestamp-is-utc)
 - ["Unchanged" is a third outcome, not a failure](decisions/QUOTA-AND-RUNS.md#unchanged-is-a-third-outcome-not-a-failure)
 
